@@ -199,10 +199,11 @@ function releaseTerminalOwnership(ws: WebSocket, groupJid: string): void {
 }
 
 // --- CORS Middleware ---
-// 默认放行所有 origin：自托管场景下 WebSocket upgrade 的 Origin 深度防御
-// 默认关闭（SameSite=Strict cookie 仍是主防御）。如需收紧，在 .env 配置
-// CORS_ALLOWED_ORIGINS 为逗号分隔的精确白名单（如 https://claw.example.com）。
-const CORS_ALLOWED_ORIGINS = process.env.CORS_ALLOWED_ORIGINS || '*';
+// 默认空（只放行 localhost / 127.0.0.1）。WebSocket upgrade 已对同源请求放行
+// （origin==Host，见 setupWebSocket），公网域名访问无需配置即可用且保留 CSWSH
+// 防御。如需放行跨站来源，在 .env 配置 CORS_ALLOWED_ORIGINS 为逗号分隔白名单
+// 或 '*'（关闭防御）。
+const CORS_ALLOWED_ORIGINS = process.env.CORS_ALLOWED_ORIGINS || '';
 const CORS_ALLOW_LOCALHOST = process.env.CORS_ALLOW_LOCALHOST !== 'false'; // default: true
 
 function isAllowedOrigin(origin: string | undefined): string | null {
@@ -947,6 +948,11 @@ app.use(
 
 // --- WebSocket ---
 
+// Origin 被 403 拒绝时，每个 origin 只 warn 一次，避免反复连接刷屏。
+// 反向代理 + 公网域名场景下，管理员只能通过日志定位"为什么 WS 连不上"
+// （前端只看到 onclose、后端默认静默 destroy socket），没有这行日志运维成本极高。
+const warnedRejectedOrigins = new Set<string>();
+
 function setupWebSocket(server: any): WebSocketServer {
   // 8 MiB 上限：覆盖单条消息含 10 张 5MB base64 image 的合法上限（~70MB 是
   // attachments 上限里的极端情形——通过 schema 上的 attachments.max(10) 控制
@@ -981,6 +987,16 @@ function setupWebSocket(server: any): WebSocketServer {
       if (!sameOrigin) {
         const allowed = isAllowedOrigin(origin);
         if (!allowed) {
+          if (!warnedRejectedOrigins.has(origin)) {
+            warnedRejectedOrigins.add(origin);
+            logger.warn(
+              {
+                origin,
+                hint: 'add this origin to CORS_ALLOWED_ORIGINS env var (comma-separated) or set it to "*" to allow all',
+              },
+              'WebSocket upgrade rejected: Origin not in allowlist (CSWSH defense)',
+            );
+          }
           socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
           socket.destroy();
           return;
