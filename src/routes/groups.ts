@@ -878,7 +878,7 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
   const deleteSiblingJids = getJidsByFolder(existing.folder);
   const deleteDescendantJids = Array.from(
     new Set(
-      deleteSiblingJids.flatMap((j) => deps.queue.listActiveDescendantJids(j)),
+      deleteSiblingJids.flatMap((j) => deps.queue.listDescendantJids(j)),
     ),
   );
   const deleteStopJids = Array.from(
@@ -1202,7 +1202,7 @@ groupRoutes.post('/:jid/clear-history', authMiddleware, async (c) => {
   //    behavior in container mode).
   const descendantJids = Array.from(
     new Set(
-      siblingJids.flatMap((j) => deps.queue.listActiveDescendantJids(j)),
+      siblingJids.flatMap((j) => deps.queue.listDescendantJids(j)),
     ),
   );
   const stopJids = [...siblingJids, ...descendantJids];

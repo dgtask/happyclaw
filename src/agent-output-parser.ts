@@ -163,25 +163,48 @@ export function attachStdoutHandler(
         }
         if (objStart >= state.parseBuffer.length) break; // only whitespace yet
 
-        // Resync past this START only if a *later* START proves this record is
-        // already fully delimited; otherwise the frame may just be incomplete,
-        // so wait for more data. Returns true if it resynced.
-        const resyncPastThisStart = (reason: string): boolean => {
-          const nextStart = state.parseBuffer.indexOf(
-            OUTPUT_START_MARKER,
-            contentStart,
-          );
-          if (nextStart === -1) return false;
+        // Resync past a broken/unparseable frame so the buffer never stalls
+        // until the size cap (the pre-refactor parser always advanced past a
+        // malformed frame). `knownEnd`, when given, is this frame's already
+        // located END index — used by the parse-failure path, whose object may
+        // legitimately contain literal END marker strings, so we must NOT
+        // re-scan for END from contentStart. Without it (non-object payload),
+        // skip past whichever boundary arrives first: this frame's END (frame
+        // fully delimited but malformed) or a later START. Returns false only
+        // when neither boundary exists yet, so the caller waits for more data.
+        const resyncPastBrokenFrame = (
+          reason: string,
+          knownEnd?: number,
+        ): boolean => {
+          let resyncTo = -1;
+          if (knownEnd !== undefined) {
+            resyncTo = knownEnd + OUTPUT_END_MARKER.length;
+          } else {
+            const nextStart = state.parseBuffer.indexOf(
+              OUTPUT_START_MARKER,
+              contentStart,
+            );
+            const endIdx = state.parseBuffer.indexOf(
+              OUTPUT_END_MARKER,
+              contentStart,
+            );
+            if (endIdx !== -1 && (nextStart === -1 || endIdx < nextStart)) {
+              resyncTo = endIdx + OUTPUT_END_MARKER.length;
+            } else if (nextStart !== -1) {
+              resyncTo = nextStart;
+            }
+          }
+          if (resyncTo === -1) return false;
           logger.warn({ group: opts.groupName }, reason);
-          state.parseBuffer = state.parseBuffer.slice(nextStart);
+          state.parseBuffer = state.parseBuffer.slice(resyncTo);
           return true;
         };
 
         if (state.parseBuffer[objStart] !== '{') {
           // Payload isn't a JSON object — framing is broken.
           if (
-            resyncPastThisStart(
-              'Framed payload is not a JSON object, resyncing to next START marker',
+            resyncPastBrokenFrame(
+              'Framed payload is not a JSON object, resyncing past broken frame',
             )
           ) {
             continue;
@@ -199,15 +222,14 @@ export function attachStdoutHandler(
         );
         if (!parsed) {
           // Balanced braces but not a valid ContainerOutput object (should not
-          // happen for well-formed output).
-          if (
-            resyncPastThisStart(
-              'Framed JSON object failed to parse, resyncing to next START marker',
-            )
-          ) {
-            continue;
-          }
-          break;
+          // happen for well-formed output). The frame is fully delimited (END
+          // already located at endIdx), so drop it and continue rather than
+          // stalling until the buffer cap — no later START is required.
+          resyncPastBrokenFrame(
+            'Framed JSON object failed to parse, skipping frame',
+            endIdx,
+          );
+          continue;
         }
 
         state.parseBuffer = state.parseBuffer.slice(

@@ -363,23 +363,35 @@ export class GroupQueue {
   }
 
   /**
-   * List all active virtual-JID runners that belong to the same folder family
-   * as `baseJid` (i.e. sub-agents `{...}#agent:{id}` and scheduled tasks
-   * `{...}#task:{id}`), excluding the base JID itself. Used by workspace-level
-   * operations (e.g. clear-history) that need to stop every descendant process
-   * before wiping the folder's filesystem.
+   * List every virtual-JID runner that belongs to the same folder family as
+   * `baseJid` (i.e. sub-agents `{...}#agent:{id}` and scheduled tasks
+   * `{...}#task:{id}`), excluding the base JID itself — whether it is actively
+   * running OR merely QUEUED (capacity-blocked: in pendingTasks / waitingGroups,
+   * not yet active). Used by workspace-level operations (delete / clear-history)
+   * that stop every descendant before wiping the folder's filesystem.
+   *
+   * Including queued descendants is essential: a capacity-blocked sub-agent left
+   * out of the stop set would be picked up by drainWaiting after a slot frees and
+   * launch against a folder/session dir that was already deleted (container/
+   * process leak + ENOENT). stopGroup() on a queued descendant clears its
+   * pendingTasks and removes it from waitingGroups, so it never launches.
    *
    * Matching is done via serializationKey (folder-based), so descendants
    * launched from any sibling JID sharing the same folder are all returned.
    */
-  listActiveDescendantJids(baseJid: string): string[] {
+  listDescendantJids(baseJid: string): string[] {
     const baseKey = this.getSerializationKey(baseJid);
     const prefix = baseKey + '#';
     const result: string[] = [];
     for (const [jid, state] of this.groups.entries()) {
-      if (!state.active) continue;
-      const key = this.getSerializationKey(jid);
-      if (key.startsWith(prefix)) result.push(jid);
+      if (!this.getSerializationKey(jid).startsWith(prefix)) continue;
+      if (
+        state.active ||
+        state.pendingTasks.length > 0 ||
+        this.waitingGroups.has(jid)
+      ) {
+        result.push(jid);
+      }
     }
     return result;
   }

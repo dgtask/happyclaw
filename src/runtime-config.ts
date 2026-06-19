@@ -425,11 +425,12 @@ function normalizeSecret(input: unknown, fieldName: string): string {
   }
   // eslint-disable-next-line no-control-regex
   const ascii = input.replace(/[^\x00-\x7F]/g, '').trim();
-  // ANTHROPIC_AUTH_TOKEN may intentionally be an Authorization header value
-  // such as "Bearer <token>"; preserve that separator while still normalizing
-  // accidental whitespace. API keys and OAuth tokens stay compact.
+  // An ANTHROPIC_AUTH_TOKEN may intentionally be an Authorization header value
+  // ("Bearer <token>"); collapse internal whitespace to a single space so the
+  // prefix survives. Every other secret — API keys, OAuth tokens, and bare
+  // auth tokens — stays compact so an accidental pasted space can't break auth.
   const value =
-    fieldName === 'anthropicAuthToken'
+    fieldName === 'anthropicAuthToken' && /^Bearer\s/i.test(ascii)
       ? ascii.replace(/\s+/g, ' ')
       : ascii.replace(/\s+/g, '');
   if (value.length > MAX_FIELD_LENGTH) {
@@ -2372,20 +2373,21 @@ export function buildClaudeEnvLines(
     );
   }
   if (config.anthropicAuthToken) {
-    if (
-      config.anthropicBaseUrl &&
-      !/^Bearer\s+/i.test(config.anthropicAuthToken)
-    ) {
+    const bearerMatch = /^Bearer\s+(.+)$/i.exec(config.anthropicAuthToken);
+    if (config.anthropicBaseUrl && !bearerMatch) {
       // Most third-party Anthropic-compatible endpoints expect API-key style
-      // auth. Explicit Bearer tokens are different: embedded-path proxies rely
-      // on ANTHROPIC_AUTH_TOKEN to produce Authorization: Bearer <value>.
+      // auth (the SDK sends a bare token as `X-Api-Key`). A plain token maps to
+      // ANTHROPIC_API_KEY so non-Anthropic endpoints don't 404 on the OAuth path.
       lines.push(
         `ANTHROPIC_API_KEY=${sanitizeEnvValue(config.anthropicAuthToken)}`,
       );
     } else {
-      lines.push(
-        `ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(config.anthropicAuthToken)}`,
-      );
+      // An explicit `Bearer <token>` (or first-party usage) goes to
+      // ANTHROPIC_AUTH_TOKEN so the SDK emits `Authorization: Bearer <token>`.
+      // The SDK adds the `Bearer ` prefix itself, so strip the user-supplied
+      // one to avoid a doubled `Authorization: Bearer Bearer <token>`.
+      const token = bearerMatch ? bearerMatch[1] : config.anthropicAuthToken;
+      lines.push(`ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(token)}`);
     }
   }
   if (config.anthropicModel) {
@@ -3694,6 +3696,14 @@ export interface SystemSettings {
   taskBackfillGraceMs: number;
 }
 
+// Upper bound for the login lockout window. auth.ts reclaims login-attempt
+// records on a fixed 24h TTL (its authoritative window check assumes the
+// configured lockout never exceeds this); a larger value would let the cleanup
+// timer drop a record mid-lockout, resetting the per-ip counter and letting an
+// attacker resume brute-forcing by pausing ~24h. Every read path clamps to it,
+// not just saveSystemSettings, so the env/file fallbacks can't bypass the cap.
+const MAX_LOGIN_LOCKOUT_MINUTES = 1440;
+
 const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   containerTimeout: 1800000,
   idleTimeout: 1800000,
@@ -3779,7 +3789,7 @@ function readSystemSettingsFromFile(): SystemSettings | null {
         : DEFAULT_SYSTEM_SETTINGS.maxLoginAttempts,
     loginLockoutMinutes:
       typeof raw.loginLockoutMinutes === 'number' && raw.loginLockoutMinutes > 0
-        ? raw.loginLockoutMinutes
+        ? Math.min(raw.loginLockoutMinutes, MAX_LOGIN_LOCKOUT_MINUTES)
         : DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
     maxConcurrentScripts:
       typeof raw.maxConcurrentScripts === 'number' &&
@@ -3859,9 +3869,12 @@ function buildEnvFallbackSettings(): SystemSettings {
       process.env.MAX_LOGIN_ATTEMPTS,
       DEFAULT_SYSTEM_SETTINGS.maxLoginAttempts,
     ),
-    loginLockoutMinutes: parseIntEnv(
-      process.env.LOGIN_LOCKOUT_MINUTES,
-      DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
+    loginLockoutMinutes: Math.min(
+      parseIntEnv(
+        process.env.LOGIN_LOCKOUT_MINUTES,
+        DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
+      ),
+      MAX_LOGIN_LOCKOUT_MINUTES,
     ),
     maxConcurrentScripts: parseIntEnv(
       process.env.MAX_CONCURRENT_SCRIPTS,
@@ -3976,7 +3989,8 @@ export function saveSystemSettings(
   if (merged.maxLoginAttempts < 1) merged.maxLoginAttempts = 1;
   if (merged.maxLoginAttempts > 100) merged.maxLoginAttempts = 100;
   if (merged.loginLockoutMinutes < 1) merged.loginLockoutMinutes = 1;
-  if (merged.loginLockoutMinutes > 1440) merged.loginLockoutMinutes = 1440; // max 24 hours
+  if (merged.loginLockoutMinutes > MAX_LOGIN_LOCKOUT_MINUTES)
+    merged.loginLockoutMinutes = MAX_LOGIN_LOCKOUT_MINUTES; // max 24 hours, see auth.ts reclaim TTL
   if (merged.maxConcurrentScripts < 1) merged.maxConcurrentScripts = 1;
   if (merged.maxConcurrentScripts > 50) merged.maxConcurrentScripts = 50;
   if (merged.scriptTimeout < 5000) merged.scriptTimeout = 5000; // min 5s

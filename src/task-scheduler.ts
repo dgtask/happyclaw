@@ -32,6 +32,7 @@ import {
   logTaskRun,
   logTaskRunStart,
   updateTaskRunLog,
+  pauseTaskAfterRun,
   setRegisteredGroup,
   updateChatName,
   updateTaskAfterRun,
@@ -167,29 +168,30 @@ function ensureTaskWorkspace(
 /**
  * Compute the queue JID for an isolated (non-group, non-script) task run.
  * Materializes the workspace BEFORE enqueueing so the queue JID matches the
- * effectiveJid runTaskInner derives from workspace.jid. Otherwise a first run
- * (workspace_jid still null) enqueues under `${targetGroupJid}#task:${id}` while
- * the container registers under `${web:newUuid}#task:${id}` — an orphaned
- * GroupState that closeStdin/stopGroup can never reach. Shared by the scheduler
- * loop and triggerTaskNow so both paths derive the JID identically.
+ * effectiveJid runTaskInner derives from workspace.jid (runTaskInner re-runs
+ * ensureTaskWorkspace, which reuses the now-persisted workspace_jid).
+ *
+ * Returns null if ensureTaskWorkspace throws (transient SQLITE_BUSY, ENOSPC,
+ * etc.): we MUST NOT fall back to a different base JID, because runTaskInner
+ * would then succeed and register under `${web:newUuid}#task:${id}` while the
+ * queue tracked `${...}#task:${id}` — an orphaned GroupState closeStdin/stopGroup
+ * can never reach (leaked slot). The caller skips this run instead; the task
+ * stays active and retries on the next tick. Shared by the scheduler loop and
+ * triggerTaskNow so both derive the JID identically.
  */
 function computeIsolatedTaskQueueJid(
   task: ScheduledTask,
   deps: SchedulerDependencies,
-  targetGroupJid: string,
-): string {
-  let baseJid = task.workspace_jid;
+): string | null {
   try {
-    baseJid = ensureTaskWorkspace(task, deps).jid;
+    return `${ensureTaskWorkspace(task, deps).jid}#task:${task.id}`;
   } catch (err) {
     logger.error(
       { taskId: task.id, err },
-      'Failed to ensure task workspace before enqueue',
+      'Failed to ensure task workspace before enqueue; skipping this run (retries next tick)',
     );
+    return null;
   }
-  return baseJid
-    ? `${baseJid}#task:${task.id}`
-    : `${targetGroupJid}#task:${task.id}`;
 }
 
 export interface SchedulerDependencies {
@@ -657,13 +659,13 @@ async function runTaskInner(
       // A recurring task that can't compute its next run (bad schedule_value,
       // transient cron parse failure) must NOT be silently marked completed by
       // updateTaskAfterRun(null) — that permanently disables it. Pause it so the
-      // owner can fix the schedule, preserving last_run/last_result.
+      // owner can fix the schedule, recording THIS run's last_run/last_result.
       logger.error(
         { taskId: task.id, scheduleType: task.schedule_type, scheduleValue: task.schedule_value },
         'Recurring task produced null next_run; pausing instead of completing',
       );
       try {
-        updateTask(task.id, { status: 'paused' });
+        pauseTaskAfterRun(task.id, resultSummary);
       } catch (err) {
         logger.error({ taskId: task.id, err }, 'Failed to pause task with null next_run');
       }
@@ -1132,6 +1134,26 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
             // intentional fall-through to normal run below
           } else {
             const advancedNextRun = safeComputeNextRun(currentTask);
+            if (advancedNextRun === null) {
+              // Corrupted recurring schedule: advanceSkippedTask(null) would
+              // silently flip status to 'completed', permanently disabling the
+              // task — the same trap runTaskInner pauses to avoid. Pause here too
+              // (don't touch last_run; this skip wasn't an actual run).
+              logger.error(
+                { taskId: currentTask.id, scheduleType: currentTask.schedule_type, scheduleValue: currentTask.schedule_value },
+                'Overdue recurring task has null next_run; pausing instead of completing',
+              );
+              updateTask(currentTask.id, { status: 'paused', next_run: null });
+              logTaskRun({
+                task_id: currentTask.id,
+                run_at: new Date().toISOString(),
+                duration_ms: 0,
+                status: 'error',
+                result: null,
+                error: 'Paused: schedule produces no next run (fix schedule_value to re-activate)',
+              });
+              continue;
+            }
             advanceSkippedTask(currentTask.id, advancedNextRun);
             logTaskRun({
               task_id: currentTask.id,
@@ -1203,11 +1225,11 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
           });
         } else {
           // Isolated mode (default): each agent task has a dedicated workspace.
-          const taskQueueJid = computeIsolatedTaskQueueJid(
-            currentTask,
-            deps,
-            targetGroupJid,
-          );
+          const taskQueueJid = computeIsolatedTaskQueueJid(currentTask, deps);
+          if (!taskQueueJid) {
+            // Workspace not ready (transient error); skip and retry next tick.
+            continue;
+          }
           deps.queue.enqueueTask(taskQueueJid, currentTask.id, () =>
             runTask(currentTask, deps, {
               taskRunId: currentTask.id,
@@ -1259,7 +1281,10 @@ export function triggerTaskNow(
     );
   } else {
     const opts: RunTaskOptions = { manualRun: true, taskRunId: task.id };
-    const taskQueueJid = computeIsolatedTaskQueueJid(task, deps, targetGroupJid);
+    const taskQueueJid = computeIsolatedTaskQueueJid(task, deps);
+    if (!taskQueueJid) {
+      return { success: false, error: 'Failed to prepare task workspace' };
+    }
     deps.queue.enqueueTask(taskQueueJid, task.id, () =>
       runTask(task, deps, opts),
     );

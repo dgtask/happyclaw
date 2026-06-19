@@ -18,7 +18,17 @@ echo "Image: ${IMAGE_NAME}:${TAG}"
 # GitHub fetch in the feishu-cli step. Host networking reuses the host's working
 # DNS resolver. Override with BUILD_NETWORK=default if your environment differs.
 BUILD_NETWORK="${BUILD_NETWORK:-host}"
-docker build --network="${BUILD_NETWORK}" --build-arg CACHEBUST="$(date +%s)" -t "${IMAGE_NAME}:${TAG}" .
+if ! docker build --network="${BUILD_NETWORK}" --build-arg CACHEBUST="$(date +%s)" -t "${IMAGE_NAME}:${TAG}" .; then
+  # Restricted/rootless BuildKit builders reject host networking (it's a gated
+  # entitlement) instead of falling back. Retry once on the default bridge so
+  # those environments still build — bridge DNS may need a working resolver.
+  if [ "${BUILD_NETWORK}" = "host" ]; then
+    echo "host-network build failed (restricted builder?); retrying with default bridge network..." >&2
+    docker build --build-arg CACHEBUST="$(date +%s)" -t "${IMAGE_NAME}:${TAG}" .
+  else
+    exit 1
+  fi
+fi
 
 echo ""
 echo "Build complete!"

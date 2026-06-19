@@ -20,23 +20,34 @@ function config(
   };
 }
 
+// Always pass an explicit (empty) profileCustomEnv so buildClaudeEnvLines does
+// NOT fall through to getActiveProfileCustomEnv() → readStoredStateV4(), which
+// reads (and may lazily migrate-write) the real on-disk claude-provider.json.
+// Keeping the test hermetic avoids leaking ambient config and disk mutation.
+const NO_CUSTOM_ENV: Record<string, string> = {};
+
 describe('buildClaudeEnvLines', () => {
   test('maps plain third-party auth tokens to ANTHROPIC_API_KEY', () => {
     const lines = buildClaudeEnvLines(
       config({ anthropicAuthToken: 'plain-token' }),
+      NO_CUSTOM_ENV,
     );
 
     expect(lines).toContain('ANTHROPIC_API_KEY=plain-token');
     expect(lines).not.toContain('ANTHROPIC_AUTH_TOKEN=plain-token');
   });
 
-  test('preserves explicit Bearer third-party auth tokens as ANTHROPIC_AUTH_TOKEN', () => {
+  test('routes explicit Bearer tokens to ANTHROPIC_AUTH_TOKEN without doubling the prefix', () => {
     const lines = buildClaudeEnvLines(
       config({ anthropicAuthToken: 'Bearer upstream-token' }),
+      NO_CUSTOM_ENV,
     );
 
-    expect(lines).toContain('ANTHROPIC_AUTH_TOKEN=Bearer upstream-token');
-    expect(lines).not.toContain('ANTHROPIC_API_KEY=Bearer upstream-token');
+    // The SDK emits `Authorization: Bearer <value>` itself, so the stored value
+    // must be the bare token — otherwise the header becomes `Bearer Bearer …`.
+    expect(lines).toContain('ANTHROPIC_AUTH_TOKEN=upstream-token');
+    expect(lines).not.toContain('ANTHROPIC_AUTH_TOKEN=Bearer upstream-token');
+    expect(lines).not.toContain('ANTHROPIC_API_KEY=upstream-token');
   });
 
   test('preserves newlines in ANTHROPIC_CUSTOM_HEADERS', () => {

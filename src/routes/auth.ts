@@ -815,20 +815,24 @@ authRoutes.post('/avatar', authMiddleware, async (c) => {
 
   const avatarUrl = `/api/auth/avatars/${filename}`;
 
-  // Reap this user's stale avatar files: everything prefixed with the user id
-  // EXCEPT the file we just wrote and the one the other avatar field still
-  // references. This both replaces the previous same-target avatar and reaps
-  // legacy `${user.id}-{hex}` files (uploaded before the user-/ai- split) once
-  // they are unreferenced — without ever deleting the other target's in-use
-  // avatar.
+  // Reap this user's stale avatar files: same-target leftovers plus legacy
+  // `${user.id}-{hex}` files (uploaded before the user-/ai- split), EXCEPT the
+  // file we just wrote and the one the other avatar field still references.
+  // The other target's files are skipped STRUCTURALLY (by prefix), not just via
+  // otherFilename: a concurrent upload of the other avatar may have already
+  // written its file, and that file's DB url isn't visible here yet (we read
+  // otherFilename before the async body), so a prefix skip is what prevents
+  // reaping a concurrent upload out from under its own dangling url (→ 404).
   try {
     const keep = new Set(
       [filename, otherFilename].filter((x): x is string => !!x),
     );
+    const otherPrefix =
+      target === 'user' ? `${user.id}-ai-` : `${user.id}-user-`;
     for (const f of fs.readdirSync(AVATARS_DIR)) {
-      if (f.startsWith(`${user.id}-`) && !keep.has(f)) {
-        fs.unlinkSync(path.join(AVATARS_DIR, f));
-      }
+      if (!f.startsWith(`${user.id}-`) || keep.has(f)) continue;
+      if (f.startsWith(otherPrefix)) continue;
+      fs.unlinkSync(path.join(AVATARS_DIR, f));
     }
   } catch {
     /* ignore */

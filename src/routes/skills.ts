@@ -883,7 +883,9 @@ skillsRoutes.post('/:id/reinstall', authMiddleware, async (c) => {
   type SkillBackup = {
     sid: string;
     dir: string;
-    backupDir: string;
+    // null when the sibling had a manifest entry but no on-disk dir (desync):
+    // there is nothing to rename back, only the manifest entry to restore.
+    backupDir: string | null;
     meta: SkillsManifest['skills'][string];
   };
   const backups: SkillBackup[] = [];
@@ -892,8 +894,10 @@ skillsRoutes.post('/:id/reinstall', authMiddleware, async (c) => {
   const restoreBackups = (): void => {
     for (const b of backups) {
       try {
-        fs.rmSync(b.dir, { recursive: true, force: true }); // clear partial install
-        fs.renameSync(b.backupDir, b.dir);
+        if (b.backupDir) {
+          fs.rmSync(b.dir, { recursive: true, force: true }); // clear partial install
+          fs.renameSync(b.backupDir, b.dir);
+        }
         const m = readSkillsManifest(authUser.id);
         m.skills[b.sid] = b.meta;
         writeSkillsManifest(authUser.id, m);
@@ -904,17 +908,22 @@ skillsRoutes.post('/:id/reinstall', authMiddleware, async (c) => {
   };
 
   // Back up each sibling dir (rename, don't delete) so a failed reinstall can
-  // roll back instead of permanently destroying the user's skills.
+  // roll back instead of permanently destroying the user's skills. The manifest
+  // entry is recorded for backup whenever it exists — even if its dir is already
+  // missing (manifest/dir desync) — so removeFromSkillsManifest below is always
+  // recoverable on a failed reinstall.
   try {
     for (const sid of siblingIds) {
       const entry = manifest.skills[sid];
       const dir = path.join(userDir, sid);
       const backupDir = `${dir}.reinstall-bak`;
+      let savedBackupDir: string | null = null;
       if (fs.existsSync(dir)) {
         fs.rmSync(backupDir, { recursive: true, force: true }); // clear stale backup
         fs.renameSync(dir, backupDir);
-        if (entry) backups.push({ sid, dir, backupDir, meta: entry });
+        savedBackupDir = backupDir;
       }
+      if (entry) backups.push({ sid, dir, backupDir: savedBackupDir, meta: entry });
       removeFromSkillsManifest(authUser.id, sid);
     }
   } catch (err) {
@@ -942,8 +951,9 @@ skillsRoutes.post('/:id/reinstall', authMiddleware, async (c) => {
     );
   }
 
-  // Success — drop all backups.
+  // Success — drop all backups (skip entries that had no on-disk dir to back up).
   for (const b of backups) {
+    if (!b.backupDir) continue;
     try {
       fs.rmSync(b.backupDir, { recursive: true, force: true });
     } catch {
