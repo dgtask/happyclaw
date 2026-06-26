@@ -125,7 +125,10 @@ RUN npm install
 # 单独 `pip install --index-url https://download.pytorch.org/whl/cpu torch`
 # 再 `pip install "headroom-ai[memory]"` 走 CPU 路径. PIP_BREAK_SYSTEM_PACKAGES
 # 已在 line 103 设置, 这里无需再传 --break-system-packages.
-RUN pip install "headroom-ai[code,mcp]" \
+# Pin 到 ~=0.27.0 (>=0.27.0,<0.28.0): headroom-ai 仍是 PyPI Beta, 且 extras 解析
+# 曾因 [memory]→torch 把镜像撑爆; `headroom --version` 自检只挡『装不上』挡不住
+# 体积/行为漂移, 故锁定已验证的 ~550MB footprint, 仅允许 0.27.x 补丁更新.
+RUN pip install "headroom-ai[code,mcp]~=0.27.0" \
     && headroom --version
 
 # Install feishu-cli (binary + builtin skills), 始终跟踪 latest release。
