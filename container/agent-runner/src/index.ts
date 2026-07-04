@@ -99,7 +99,7 @@ const MEMORY_FLUSH_ALLOWED_TOOLS = [
 // 避免后续新增 MCP 工具后再次遗漏屏蔽（如曾漏掉的 send_image/send_file/discord_*/*_skill）。
 const MEMORY_FLUSH_DISALLOWED_BUILTINS = [
   'Bash', 'Write', 'WebSearch', 'WebFetch', 'Glob', 'Grep',
-  'Task', 'TaskOutput', 'TaskStop',
+  'Task', 'TaskOutput', 'TaskStop', 'Agent',
   'TeamCreate', 'TeamDelete', 'SendMessage',
   'TodoWrite', 'ToolSearch', 'Skill', 'NotebookEdit',
 ];
@@ -783,23 +783,117 @@ function createPreCompactHook(
 }
 
 /**
- * Wrapper around the pure extractSessionHistory implementation in
- * session-history.ts. Resolves the SDK transcript directory using the
- * runtime CLAUDE_CONFIG_DIR + WORKSPACE_GROUP layout, then delegates.
+ * SDK transcript 目录推导。CLI 的 projects 目录编码把 cwd 中**所有非字母数字
+ * 字符**替换为 '-'（实测 `/a/enc_test.v1` → `-a-enc-test-v1`，`.` `_` 均被
+ * 替换）——不能只替换 '/'，否则含 `.`/`_` 的 customCwd 会推导出不存在的目录。
  */
-function extractSessionHistory(oldSessionId: string): string | null {
+function resolveTranscriptDir(): string {
   const configDir =
     process.env.CLAUDE_CONFIG_DIR ||
     path.join(process.env.HOME || '/home/node', '.claude');
-  // SDK stores transcripts at: <configDir>/projects/<encoded-cwd>/<sessionId>.jsonl
-  // where encoded-cwd replaces '/' with '-'
-  const encodedCwd = WORKSPACE_GROUP.replace(/\//g, '-');
-  const transcriptDir = path.join(configDir, 'projects', encodedCwd);
+  const encodedCwd = WORKSPACE_GROUP.replace(/[^a-zA-Z0-9]/g, '-');
+  return path.join(configDir, 'projects', encodedCwd);
+}
+
+function extractSessionHistory(oldSessionId: string): string | null {
   return extractSessionHistoryImpl({
-    transcriptDir,
+    transcriptDir: resolveTranscriptDir(),
     sessionId: oldSessionId,
     log,
   });
+}
+
+// Resume 重放防御的 uuid 增量缓存：transcript 是 append-only JSONL，同一
+// sessionId 的多次 runQuery（每条 warm 消息、memory flush、auto-continue）
+// 只需读上次之后新增的字节，避免每条消息全量重扫（长会话 O(M²) 阻塞 I/O）。
+// 文件被截断重写（trimSessionFile）时按文件粒度重建。
+let transcriptUuidCache: {
+  sessionId: string;
+  fileSizes: Map<string, number>;
+  uuids: Set<string>;
+} | null = null;
+
+const TRANSCRIPT_UUID_RE = /"uuid":"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/g;
+
+/**
+ * Resume 重放防御：SDK 的 `--resume` 可能把旧 transcript 的 assistant/user
+ * 消息重放给 for-await 消费者，且消息上没有 isReplay 标记（实测 string-prompt
+ * 模式下干净会话 resume 会重放上一轮 assistant + result；streaming 模式下
+ * 带孤儿后台任务的会话 resume 会合成 init/result 对）。收集旧 transcript
+ *（主会话 + subagents，含嵌套子目录）里已有消息的 uuid，for-await 中命中即
+ * 跳过——否则重放的旧 assistant 文本会混进 canonicalAssistantText 造成回复
+ * 重复历史内容。
+ * 注意：result 不写入 transcript（CLI 重放时现场合成、uuid 全新），无法用
+ * 本集合判别——调用方用 num_turns===0 指纹 + 活体信号双重判别，且该判别
+ * 不依赖本函数成功（本函数 fail 时重放 result 仍会被拦住）。
+ * 用正则提取 uuid 而非逐行 JSON.parse：只需要 uuid 字段，7 倍提速且免去
+ * 对超大行的对象树分配；多收的内嵌 uuid 只会进 skip 集合，新消息 uuid 是
+ * 全新随机 v4，不可能预先出现在旧文本中，无误伤。
+ * 错误处理为 per-file 容错：单个文件读失败只丢该文件，不整体 fail-open。
+ */
+function collectTranscriptUuids(oldSessionId: string): Set<string> | null {
+  try {
+    const transcriptDir = resolveTranscriptDir();
+    const files: string[] = [];
+    const mainFile = path.join(transcriptDir, `${oldSessionId}.jsonl`);
+    if (fs.existsSync(mainFile)) files.push(mainFile);
+    // subagents 下可能有嵌套子目录（如 workflows/wf_*/agent-*.jsonl），递归收集。
+    const subRoot = path.join(transcriptDir, oldSessionId, 'subagents');
+    if (fs.existsSync(subRoot)) {
+      const stack = [subRoot];
+      while (stack.length > 0) {
+        const dir = stack.pop()!;
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) stack.push(full);
+          else if (entry.name.endsWith('.jsonl')) files.push(full);
+        }
+      }
+    }
+    if (files.length === 0) {
+      log(`[replay-guard] WARNING: no transcript found for resumed session ${oldSessionId.slice(0, 8)} in ${transcriptDir} — uuid replay guard inactive for this query`);
+      return null;
+    }
+
+    if (transcriptUuidCache?.sessionId !== oldSessionId) {
+      transcriptUuidCache = { sessionId: oldSessionId, fileSizes: new Map(), uuids: new Set() };
+    }
+    const cache = transcriptUuidCache;
+    for (const file of files) {
+      try {
+        const size = fs.statSync(file).size;
+        const prevSize = cache.fileSizes.get(file) ?? 0;
+        if (size === prevSize) continue;
+        let chunk: string;
+        if (size > prevSize && prevSize > 0) {
+          // 增量读：从上次读到的位置继续。往回退 1KB 覆盖上次可能截断的半行。
+          const start = Math.max(0, prevSize - 1024);
+          const buf = Buffer.alloc(size - start);
+          const fd = fs.openSync(file, 'r');
+          try {
+            fs.readSync(fd, buf, 0, buf.length, start);
+          } finally {
+            fs.closeSync(fd);
+          }
+          chunk = buf.toString('utf-8');
+        } else {
+          // 首次读取或文件被截断重写：全量。
+          chunk = fs.readFileSync(file, 'utf-8');
+        }
+        for (const m of chunk.matchAll(TRANSCRIPT_UUID_RE)) {
+          cache.uuids.add(m[1]);
+        }
+        cache.fileSizes.set(file, size);
+      } catch (fileErr) {
+        log(`[replay-guard] skipping unreadable transcript file ${path.basename(file)}: ${fileErr instanceof Error ? fileErr.message : String(fileErr)}`);
+      }
+    }
+    log(`[replay-guard] ${cache.uuids.size} transcript uuid(s) across ${files.length} file(s) for resumed session ${oldSessionId.slice(0, 8)}`);
+    return cache.uuids;
+  } catch (err) {
+    log(`[replay-guard] failed to collect transcript uuids: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
 }
 
 function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | null): string {
@@ -1196,6 +1290,20 @@ async function runQuery(
   // SDK transport is not ready until system/init is received. Piping user messages
   // before init causes "ProcessTransport is not ready for writing" unhandled rejection.
   let sdkTransportReady = false;
+  // Resume 重放防御（见 collectTranscriptUuids 注释）。
+  // sawLiveTurnActivity：本次 query 是否已出现"活体"信号（stream_event / 非合成
+  // 非重放的 assistant/user）。重放严格发生在新 LLM 调用之前，因此活体信号出现
+  // 前收到的 success result 一定是重放合成的；此外重放合成 result 有内在指纹
+  // num_turns === 0（真实 success result 恒 ≥1），该指纹不依赖到达时序，也不
+  // 依赖 transcript 文件能否被找到。error result 永不跳过（新 turn 可能不产生
+  // 任何输出直接失败，误跳会让 runner 干等到容器超时）。
+  const isResumedQuery = !!sessionId;
+  const replayedUuids = isResumedQuery ? collectTranscriptUuids(sessionId!) : null;
+  let sawLiveTurnActivity = false;
+  // Usage delta 化基线：SDK result.usage 是 query 级累计值，单 query 多 result
+  // 时需做差上报，否则主进程按事件入账会重复计费。
+  let lastReportedUsage = { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0, durationMs: 0, numTurns: 0 };
+  const lastReportedModelUsage = new Map<string, { inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number; costUSD: number }>();
 
   // 收尾阶段中止挂起的工具调用：当 stream 准备关闭（_close/_drain/post-result-timeout）时，
   // SDK 可能仍卡在最终回复之后的某个工具调用上，光 stream.end() 不会让它退出。
@@ -1484,6 +1592,9 @@ async function runQuery(
     for await (const message of q) {
     // 流式事件处理
     if (message.type === 'stream_event') {
+      // 重放消息是完整消息、不产生 partial stream_event——见到 stream_event
+      // 即说明新 turn 的 LLM 调用已开始。
+      sawLiveTurnActivity = true;
       if (!suppressOutputAfterInterrupt) {
         visibleOutputStarted = true;
       }
@@ -1552,6 +1663,39 @@ async function runQuery(
       log(`[msg #${messageCount}] type=${msgType} parent_tool_use_id=${rawParent === undefined ? 'UNDEFINED' : rawParent === null ? 'NULL' : rawParent} content_types=[${contentTypes}] keys=[${Object.keys(message).join(',')}]`);
     } else {
       log(`[msg #${messageCount}] type=${msgType}${msgParentToolUseId ? ` parent=${msgParentToolUseId.slice(0, 12)}` : ''}`);
+    }
+
+    // ── Resume 重放消息防御 ──
+    // 1) uuid 命中旧 transcript 的 assistant/user → 完全跳过（不累积文本、不置
+    //    visibleOutputStarted、不触发 tool_result 处理）。init 等运行时事件
+    //    不入 transcript，uuid 不会命中，照常处理（幂等）。
+    // 2) resume 时 CLI 现场合成的 result（不入 transcript、uuid 全新）用双重
+    //    判别：num_turns === 0 内在指纹（真实 success result 恒 ≥1，不依赖到达
+    //    时序、也不依赖 transcript 文件能否找到），或活体信号出现之前到达。
+    //    error result 永不跳过（新 turn 可能不产生任何输出直接失败）。
+    //    检查必须在 visibleOutputStarted 置位之前——被跳过的合成 result 不得
+    //    影响 interrupt 抑制判定。
+    const incomingUuid = (message as { uuid?: string }).uuid;
+    if (replayedUuids && incomingUuid && replayedUuids.has(incomingUuid)) {
+      log(`[replay-skip] ${msgType} uuid=${incomingUuid.slice(0, 8)} (replayed from resumed session)`);
+      continue;
+    }
+    if (isResumedQuery && message.type === 'result' && message.subtype === 'success') {
+      const numTurns = (message as { num_turns?: number }).num_turns;
+      if (numTurns === 0 || !sawLiveTurnActivity) {
+        log(`[replay-skip] synthetic result (num_turns=${numTurns}, live=${sawLiveTurnActivity}) from resumed session`);
+        continue;
+      }
+    }
+    if (message.type === 'assistant') {
+      sawLiveTurnActivity = true;
+    } else if (message.type === 'user') {
+      // CLI 合成/注入的 user 消息（任务完成通知、重放回显）不代表新 LLM 调用
+      // 已开始，不得提前翻转活体信号——否则其后的重放合成 result 会漏判。
+      const um = message as { isReplay?: boolean; isSynthetic?: boolean; origin?: { kind?: string } };
+      if (!um.isReplay && !um.isSynthetic && um.origin?.kind !== 'task-notification') {
+        sawLiveTurnActivity = true;
+      }
     }
 
     if (message.type !== 'system') {
@@ -1716,31 +1860,52 @@ async function runQuery(
       canonicalAssistantText = undefined;
       canonicalAssistantUuid = undefined;
 
-      // Emit usage stream event with token counts and cost
+      // Emit usage stream event with token counts and cost.
+      // SDK result.usage / total_cost_usd 是 query 级累计值——单 query 多 result 时
+      //（mid-query follow-up、后台任务唤醒的汇总 turn）每条 result 都携带全量累计，
+      // 直接上报会让主进程按事件入账造成重复计费（实测 4 result 场景虚增 4 倍）。
+      // 这里对上次已上报的累计值做差，只上报本 turn 的增量。
       const resultMsg = message as Record<string, unknown>;
       const sdkUsage = resultMsg.usage as Record<string, number> | undefined;
       const sdkModelUsage = resultMsg.modelUsage as Record<string, Record<string, number>> | undefined;
       if (sdkUsage) {
+        const delta = (cur: number, prev: number) => Math.max(0, (cur || 0) - (prev || 0));
         const modelUsageSummary: Record<string, { inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number; costUSD: number }> = {};
         if (sdkModelUsage && Object.keys(sdkModelUsage).length > 0) {
           for (const [model, mu] of Object.entries(sdkModelUsage)) {
+            const prev = lastReportedModelUsage.get(model);
             modelUsageSummary[model] = {
+              inputTokens: delta(mu.inputTokens, prev?.inputTokens ?? 0),
+              outputTokens: delta(mu.outputTokens, prev?.outputTokens ?? 0),
+              cacheReadInputTokens: delta(mu.cacheReadInputTokens, prev?.cacheReadInputTokens ?? 0),
+              cacheCreationInputTokens: delta(mu.cacheCreationInputTokens, prev?.cacheCreationInputTokens ?? 0),
+              costUSD: delta(mu.costUSD, prev?.costUSD ?? 0),
+            };
+            lastReportedModelUsage.set(model, {
               inputTokens: mu.inputTokens || 0,
               outputTokens: mu.outputTokens || 0,
               cacheReadInputTokens: mu.cacheReadInputTokens || 0,
               cacheCreationInputTokens: mu.cacheCreationInputTokens || 0,
               costUSD: mu.costUSD || 0,
-            };
+            });
           }
         } else {
           // Fallback: use session-level model name when SDK doesn't provide per-model breakdown
+          const prev = lastReportedModelUsage.get(CLAUDE_MODEL);
           modelUsageSummary[CLAUDE_MODEL] = {
+            inputTokens: delta(sdkUsage.input_tokens, prev?.inputTokens ?? 0),
+            outputTokens: delta(sdkUsage.output_tokens, prev?.outputTokens ?? 0),
+            cacheReadInputTokens: delta(sdkUsage.cache_read_input_tokens, prev?.cacheReadInputTokens ?? 0),
+            cacheCreationInputTokens: delta(sdkUsage.cache_creation_input_tokens, prev?.cacheCreationInputTokens ?? 0),
+            costUSD: delta((resultMsg.total_cost_usd as number) || 0, prev?.costUSD ?? 0),
+          };
+          lastReportedModelUsage.set(CLAUDE_MODEL, {
             inputTokens: sdkUsage.input_tokens || 0,
             outputTokens: sdkUsage.output_tokens || 0,
             cacheReadInputTokens: sdkUsage.cache_read_input_tokens || 0,
             cacheCreationInputTokens: sdkUsage.cache_creation_input_tokens || 0,
             costUSD: (resultMsg.total_cost_usd as number) || 0,
-          };
+          });
         }
         emit({
           status: 'stream',
@@ -1748,24 +1913,62 @@ async function runQuery(
           streamEvent: {
             eventType: 'usage',
             usage: {
-              inputTokens: sdkUsage.input_tokens || 0,
-              outputTokens: sdkUsage.output_tokens || 0,
-              cacheReadInputTokens: sdkUsage.cache_read_input_tokens || 0,
-              cacheCreationInputTokens: sdkUsage.cache_creation_input_tokens || 0,
-              costUSD: (resultMsg.total_cost_usd as number) || 0,
-              durationMs: (resultMsg.duration_ms as number) || 0,
-              numTurns: (resultMsg.num_turns as number) || 0,
+              inputTokens: delta(sdkUsage.input_tokens, lastReportedUsage.inputTokens),
+              outputTokens: delta(sdkUsage.output_tokens, lastReportedUsage.outputTokens),
+              cacheReadInputTokens: delta(sdkUsage.cache_read_input_tokens, lastReportedUsage.cacheReadInputTokens),
+              cacheCreationInputTokens: delta(sdkUsage.cache_creation_input_tokens, lastReportedUsage.cacheCreationInputTokens),
+              costUSD: delta((resultMsg.total_cost_usd as number) || 0, lastReportedUsage.costUSD),
+              durationMs: delta((resultMsg.duration_ms as number) || 0, lastReportedUsage.durationMs),
+              numTurns: delta((resultMsg.num_turns as number) || 0, lastReportedUsage.numTurns),
               modelUsage: Object.keys(modelUsageSummary).length > 0 ? modelUsageSummary : undefined,
             },
           },
         });
+        lastReportedUsage = {
+          inputTokens: sdkUsage.input_tokens || 0,
+          outputTokens: sdkUsage.output_tokens || 0,
+          cacheReadInputTokens: sdkUsage.cache_read_input_tokens || 0,
+          cacheCreationInputTokens: sdkUsage.cache_creation_input_tokens || 0,
+          costUSD: (resultMsg.total_cost_usd as number) || 0,
+          durationMs: (resultMsg.duration_ms as number) || 0,
+          numTurns: (resultMsg.num_turns as number) || 0,
+        };
         log(`Usage: input=${sdkUsage.input_tokens} output=${sdkUsage.output_tokens} cost=$${resultMsg.total_cost_usd} turns=${resultMsg.num_turns}`);
       }
 
       // ── 标记结果已收到 ──
       // pollIpcDuringQuery 会在 POST_RESULT_TIMEOUT_MS 后关闭 stream，
       // 期间仍可检测 _drain/_close/_interrupt sentinel。
-      resultReceivedAt = Date.now();
+      // 后台任务感知：主 turn 结束时若仍有未 settle 的后台任务（异步 Agent /
+      // backgrounded Bash），不启动关流倒计时——关流会连坐杀掉还在跑的任务
+      //（表现为子 Agent 全部 stoppedByUser，模型承诺的"完成后汇总"永远不来）。
+      // 文本已在上方正常 emit（用户即时收到本 turn 回复），只推迟关流：
+      // 任务 settle 后 CLI 注入通知唤起模型开新 turn，汇总以第二条 result/消息
+      // 送达（CLI 对 completed/failed/stopped 全部状态无差别入队唤醒）。
+      // 同时清掉前一条 result 可能遗留的倒计时，避免 mid-query follow-up 场景
+      // 下旧倒计时在等待期误触发关流。
+      // side-query（emitOutput=false，如 memory flush）不参与：其 result 本就
+      // 不面向用户，挂起等待只会阻塞主循环。
+      // 常驻型后台任务（dev server 等）永不 settle，流保持打开直到
+      // IDLE_TIMEOUT / CONTAINER_TIMEOUT 兜底回收——用户已收到回复，无消息损失。
+      const pendingBgTasks = emitOutput ? processor.getPendingSdkTaskCount() : 0;
+      if (pendingBgTasks > 0) {
+        resultReceivedAt = null;
+        log(`Result #${resultCount} emitted; holding stream open for ${pendingBgTasks} background task(s): ${processor.describePendingSdkTasks().join(' | ')}`);
+        emit({
+          status: 'stream',
+          result: null,
+          streamEvent: {
+            eventType: 'status',
+            agentScope: 'system',
+            statusText: `${pendingBgTasks} 个后台任务运行中，完成后将继续汇总`,
+            summary: `${pendingBgTasks} 个后台任务运行中，完成后将继续汇总`,
+            displayLevel: 'primary',
+          },
+        });
+      } else {
+        resultReceivedAt = Date.now();
+      }
     }
   }
 
