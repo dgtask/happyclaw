@@ -1540,8 +1540,11 @@ export function storeMessageDirect(
   },
 ): string {
   const { attachments, tokenUsage, sourceJid, meta } = opts ?? {};
+  // truncation_continue 与 sdk_final 同属"最终回复"：截断自动续写的后续 turn
+  // 复用挂起序列的 turnId 时必须命中同一行（全渠道一条回复的 DB 合并基础）。
   const existingFinalRow =
-    meta?.sourceKind === 'sdk_final' && meta.turnId
+    (meta?.sourceKind === 'sdk_final' || meta?.sourceKind === 'truncation_continue') &&
+    meta.turnId
       ? (stmts().storeMessageSelect.get(chatJid, meta.turnId) as { id: string } | undefined)
       : undefined;
   const effectiveMsgId = existingFinalRow?.id || msgId;
