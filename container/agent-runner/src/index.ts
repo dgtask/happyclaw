@@ -36,7 +36,7 @@ import type {
 import type { ClaudeContextAudit } from './stream-event.types.js';
 export type { StreamEventType, StreamEvent } from './types.js';
 
-import { sanitizeFilename, generateFallbackName, formatLocalNow, isSuspectTruncatedStreamResult } from './utils.js';
+import { sanitizeFilename, generateFallbackName, formatLocalNow, isSuspectTruncatedStreamResult, AssistantTextTracker } from './utils.js';
 import {
   extractSessionHistory as extractSessionHistoryImpl,
   parseTranscript,
@@ -821,7 +821,7 @@ const TRANSCRIPT_UUID_RE = /"uuid":"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
  * 模式下干净会话 resume 会重放上一轮 assistant + result；streaming 模式下
  * 带孤儿后台任务的会话 resume 会合成 init/result 对）。收集旧 transcript
  *（主会话 + subagents，含嵌套子目录）里已有消息的 uuid，for-await 中命中即
- * 跳过——否则重放的旧 assistant 文本会混进 canonicalAssistantText 造成回复
+ * 跳过——否则重放的旧 assistant 文本会混进 assistantTextTracker 造成回复
  * 重复历史内容。
  * 注意：result 不写入 transcript（CLI 重放时现场合成、uuid 全新），无法用
  * 本集合判别——调用方用 num_turns===0 指纹 + 活体信号双重判别，且该判别
@@ -1241,7 +1241,7 @@ async function runQuery(
   const pipedMessagesDuringQuery: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }>; taskId?: string; sourceJid?: string }> = [];
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
-  let canonicalAssistantText: string | undefined;
+  const assistantTextTracker = new AssistantTextTracker();
   let canonicalAssistantUuid: string | undefined;
   const initialRejected = stream.push(prompt, images);
   const decorateStreamEvent = (event: StreamEvent): StreamEvent => ({
@@ -1730,21 +1730,16 @@ async function runQuery(
       const assistantMsg = message as Record<string, unknown>;
       if ((assistantMsg.parent_tool_use_id ?? null) === null) {
         const msgContent = (assistantMsg.message as Record<string, unknown> | undefined)?.content;
-        const topLevelText = Array.isArray(msgContent)
-          ? (msgContent as Array<{ type: string; text?: string }>)
-              .filter((block) => block.type === 'text' && typeof block.text === 'string')
-              .map((block) => block.text!)
-              .join('')
-          : '';
-        if (topLevelText) {
-          // Accumulate rather than overwrite. The SDK splits assistant output
-          // into multiple messages around each tool_use call (text → tool_use →
-          // text → tool_use → text...), so taking only the last message's text
-          // drops everything emitted before the first tool call. The canonical
-          // text must be the concatenation of all top-level text content blocks
-          // in this turn.
-          canonicalAssistantText = (canonicalAssistantText || '') + topLevelText;
-          canonicalAssistantUuid = assistantMsg.uuid as string;
+        if (Array.isArray(msgContent)) {
+          // 按 content block 顺序分段累积：text 进当前段，top-level tool_use
+          // 把当前段轮转为旁白。turn 结束时 tracker 的最终段 = 最后一次工具
+          // 调用之后的文本，过程旁白不再混进定稿正文（见 AssistantTextTracker）。
+          const sawText = assistantTextTracker.addContentBlocks(
+            msgContent as Array<{ type: string; text?: string }>,
+          );
+          if (sawText) {
+            canonicalAssistantUuid = assistantMsg.uuid as string;
+          }
         }
       }
       processor.processAssistantMessage(message as any);
@@ -1844,8 +1839,11 @@ async function runQuery(
         return { newSessionId, lastAssistantUuid, closedDuringQuery, unrecoverableTranscriptError: true, interruptedDuringQuery, pipedMessagesDuringQuery };
       }
 
-      const { effectiveResult } = processor.processResult(textResult);
-      const finalText = canonicalAssistantText || effectiveResult;
+      // processResult 的调用保留其副作用（flush 流式缓冲、重置 fullTextAccumulator），
+      // 但定稿正文不再取"全量拼接与 SDK result 的更长者"——那会把工具调用之间的
+      // 过程旁白混进最终回复。改走 tracker 的选择链：最终段 → SDK result → 末段旁白。
+      processor.processResult(textResult);
+      const finalText = assistantTextTracker.pickFinalText(textResult);
       // ── emit 前置计算：截断指纹 + 后台任务数 ──
       // finalizationReason / pendingBgTasks 必须随本条 result 一起送达主进程，
       // 主进程据此决定流式卡片是定稿「已完成」还是保持「后台任务运行中/自动续写中」。
@@ -1875,10 +1873,10 @@ async function runQuery(
       // another result is emitted within the same query (e.g. user sent
       // a follow-up via IPC mid-query), it won't overwrite this one (#214).
       containerInput.turnId = generateTurnId();
-      // 同步重置已累积的 assistant 文本缓冲：单次 query 内若产生第二条 result
-      // （mid-query follow-up），canonicalAssistantText 不应携带上一 turn 的文本，
+      // 同步重置已累积的 assistant 文本分段：单次 query 内若产生第二条 result
+      // （mid-query follow-up），tracker 不应携带上一 turn 的文本，
       // 否则第二条回复会重复前一 turn 的内容前缀（与 turnId 轮转对称）。
-      canonicalAssistantText = undefined;
+      assistantTextTracker.reset();
       canonicalAssistantUuid = undefined;
 
       // Emit usage stream event with token counts and cost.
