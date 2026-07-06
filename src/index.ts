@@ -76,12 +76,15 @@ import {
   deleteAgent,
   deleteCompletedAgents,
   deleteImGroupRecord,
+  deleteImContextBindingsByWorkspace,
   getRunningTaskAgentsByChat,
   markRunningTaskAgentsAsError,
   markAllRunningTaskAgentsAsError,
   markStaleSpawnAgentsAsError,
   listActiveConversationAgents,
   getSession,
+  getSessionAgentIdentity,
+  getAgentProfileForWorkspace,
   listAgentsByJid,
   getGroupsByOwner,
   getMessagesPage,
@@ -94,7 +97,15 @@ import {
   touchImContextBindingActivity,
   updateAgentContextInfo,
   backfillEmptyAllowlistsForUser,
+  listFeishuThreadAgentIds,
+  getChannelMount,
 } from './db.js';
+import {
+  buildSessionMountUpdate,
+  buildUnmountUpdate,
+  buildWorkspaceMountUpdate,
+} from './channel-mount-service.js';
+import { isThreadMapCapableChat } from './im-channel-capabilities.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
 import {
@@ -175,6 +186,7 @@ import {
 } from './billing.js';
 import {
   AgentStatus,
+  AgentProfile,
   FeishuMessageMeta,
   MessageCursor,
   NewMessage,
@@ -836,20 +848,41 @@ function resolveImRoute(opts: {
   return isHome ? (imFromGroup ?? imFromJid) : (imFromJid ?? imFromGroup);
 }
 
+function cleanupThreadMapWorkspace(targetMainJid?: string): void {
+  if (!targetMainJid) return;
+  const workspaceJid = resolveWorkspaceJid(targetMainJid);
+  if (!workspaceJid) return;
+  const workspace = registeredGroups[workspaceJid] ?? getRegisteredGroup(workspaceJid);
+  if (!workspace) return;
+
+  const threadAgentIds = listFeishuThreadAgentIds(workspaceJid);
+  for (const agentId of threadAgentIds) {
+    deleteAgent(agentId);
+  }
+  deleteImContextBindingsByWorkspace(workspaceJid);
+  const updatedWorkspace: RegisteredGroup = {
+    ...workspace,
+    conversation_source: 'manual',
+    conversation_nav_mode: 'horizontal',
+  };
+  setRegisteredGroup(workspaceJid, updatedWorkspace);
+  registeredGroups[workspaceJid] = updatedWorkspace;
+}
+
 /** Unbind an IM group from its conversation agent or main conversation, syncing DB + in-memory cache + failure counters. */
 function unbindImGroup(jid: string, reason: string): void {
   const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
   if (!group?.target_agent_id && !group?.target_main_jid) return;
   const agentId = group.target_agent_id;
   const targetMainJid = group.target_main_jid;
+  const wasThreadMap = group.binding_mode === 'thread_map';
   const updated = {
-    ...group,
-    target_agent_id: undefined,
-    target_main_jid: undefined,
+    ...buildUnmountUpdate(group),
     reply_policy: 'source_only' as const,
   };
   setRegisteredGroup(jid, updated);
   registeredGroups[jid] = updated;
+  if (wasThreadMap) cleanupThreadMapWorkspace(targetMainJid);
   imSendFailCounts.delete(jid);
   imHealthCheckFailCounts.delete(jid);
   logger.info({ jid, agentId, targetMainJid }, reason);
@@ -866,6 +899,9 @@ function unbindImGroup(jid: string, reason: string): void {
 export function removeImGroupRecord(jid: string, reason: string): void {
   const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
   if (!group) return;
+  if (group.binding_mode === 'thread_map') {
+    cleanupThreadMapWorkspace(group.target_main_jid);
+  }
   deleteImGroupRecord(jid);
   delete registeredGroups[jid];
   imSendFailCounts.delete(jid);
@@ -994,6 +1030,82 @@ function resolveOwnerHomeFolder(group: RegisteredGroup): string {
     return getUserHomeGroup(group.created_by)?.folder || group.folder;
   }
   return group.folder;
+}
+
+function toContainerAgentProfile(
+  profile: AgentProfile | undefined,
+): ContainerInput['agentProfile'] | undefined {
+  if (!profile) return undefined;
+  return {
+    id: profile.id,
+    name: profile.name,
+    version: profile.version,
+    identityHash: profile.identity_hash,
+    identityPrompt: profile.identity_prompt,
+    includeClaudePreset: profile.include_claude_preset,
+  };
+}
+
+function hasSessionAgentProfileMismatch(
+  groupFolder: string,
+  agentId: string | null | undefined,
+  profile: AgentProfile | undefined,
+): boolean {
+  if (!profile) return false;
+  const current = getSessionAgentIdentity(groupFolder, agentId);
+  if (!current) return false;
+
+  const hasLegacyUntrackedIdentity =
+    !current.agent_profile_id && !current.identity_hash;
+  if (
+    hasLegacyUntrackedIdentity &&
+    profile.identity_prompt.trim() === '' &&
+    profile.include_claude_preset
+  ) {
+    return false;
+  }
+
+  if (current.identity_hash !== profile.identity_hash) return true;
+  return !!current.agent_profile_id && current.agent_profile_id !== profile.id;
+}
+
+function resetMainSessionForAgentProfileMismatch(
+  group: RegisteredGroup,
+  profile: AgentProfile | undefined,
+): boolean {
+  if (!hasSessionAgentProfileMismatch(group.folder, null, profile)) return false;
+  deleteSession(group.folder);
+  delete sessions[group.folder];
+  logger.info(
+    {
+      groupFolder: group.folder,
+      agentProfileId: profile?.id,
+      identityHash: profile?.identity_hash,
+    },
+    'Cleared main Claude session after AgentProfile identity changed',
+  );
+  return true;
+}
+
+function resetConversationSessionForAgentProfileMismatch(
+  group: RegisteredGroup,
+  agentId: string,
+  profile: AgentProfile | undefined,
+): boolean {
+  if (!hasSessionAgentProfileMismatch(group.folder, agentId, profile)) {
+    return false;
+  }
+  deleteSession(group.folder, agentId);
+  logger.info(
+    {
+      groupFolder: group.folder,
+      agentId,
+      agentProfileId: profile?.id,
+      identityHash: profile?.identity_hash,
+    },
+    'Cleared conversation agent Claude session after AgentProfile identity changed',
+  );
+  return true;
 }
 
 /**
@@ -1581,9 +1693,9 @@ function resolveBindingTarget(
   const spec = rawSpec.trim();
   if (!spec) return null;
 
-  const [workspaceSpecRaw, agentSpecRaw] = spec.split('/', 2);
+  const [workspaceSpecRaw, sessionSpecRaw] = spec.split('/', 2);
   const workspaceSpec = workspaceSpecRaw.trim().toLowerCase();
-  const agentSpec = agentSpecRaw?.trim().toLowerCase();
+  const sessionSpec = sessionSpecRaw?.trim().toLowerCase();
   const workspaces = collectWorkspaces(userId);
   const workspace = workspaces.find(
     (ws) =>
@@ -1592,19 +1704,24 @@ function resolveBindingTarget(
   );
   if (!workspace) return null;
 
-  if (!agentSpec || agentSpec === 'main' || agentSpec === '主对话') {
+  if (
+    !sessionSpec ||
+    sessionSpec === 'main' ||
+    sessionSpec === '主会话' ||
+    sessionSpec === '主对话'
+  ) {
     const mainJid = findWebJidForFolder(workspace.folder);
     if (!mainJid) return null;
     return {
       target_main_jid: mainJid,
-      display: `${workspace.name} / 主对话`,
+      display: `${workspace.name} / 主会话`,
     };
   }
 
   const agent = workspace.agents.find(
     (item) =>
-      item.id.toLowerCase().startsWith(agentSpec) ||
-      item.name.trim().toLowerCase() === agentSpec,
+      item.id.toLowerCase().startsWith(sessionSpec) ||
+      item.name.trim().toLowerCase() === sessionSpec,
   );
   if (!agent) return null;
 
@@ -1689,7 +1806,7 @@ function handleListCommand(chatJid: string): string {
       location.folder,
       currentAgentId,
       currentOnMain,
-    ) + '\n💡 使用 /bind <workspace> 或 /bind <workspace>/<agent短ID>'
+    ) + '\n💡 使用 /bind <workspace> 或 /bind <workspace>/<会话短ID>'
   );
 }
 
@@ -1770,19 +1887,35 @@ function handleBindCommand(chatJid: string, rawSpec: string): string {
   const userId = group.created_by;
   if (!userId) return '无法确定当前聊天所属用户';
   if (!rawSpec)
-    return '用法: /bind <workspace> 或 /bind <workspace>/<agent短ID>';
+    return '用法: /bind <workspace> 或 /bind <workspace>/<会话短ID>';
 
   const resolved = resolveBindingTarget(userId, rawSpec);
   if (!resolved) {
-    return '未找到目标。先用 /list 查看工作区和 agent 短 ID，再执行 /bind <workspace>/<agent短ID>';
+    return '未找到目标。先用 /list 查看工作区和会话短 ID，再执行 /bind <workspace>/<会话短ID>';
   }
 
-  const updated: RegisteredGroup = {
-    ...group,
-    target_agent_id: resolved.target_agent_id,
-    target_main_jid: resolved.target_main_jid,
-    reply_policy: 'source_only',
-  };
+  const channelType = getChannelType(chatJid);
+  const threadMapCapable =
+    group.binding_mode === 'thread_map' ||
+    isThreadMapCapableChat({
+      channel_type: channelType,
+      chat_mode: group.feishu_chat_mode,
+      group_message_type: group.feishu_group_message_type,
+    });
+  if (threadMapCapable && resolved.target_agent_id) {
+    return '飞书话题群只能绑定工作区，不能绑定单个会话。请使用 /bind <workspace>。';
+  }
+
+  const updated: RegisteredGroup = resolved.target_agent_id
+    ? buildSessionMountUpdate(group, resolved.target_agent_id, {
+        replyPolicy: 'source_only',
+      })
+    : buildWorkspaceMountUpdate(
+        group,
+        resolved.target_main_jid!,
+        threadMapCapable ? 'thread_map' : 'single_session',
+        { replyPolicy: 'source_only' },
+      );
   setRegisteredGroup(chatJid, updated);
   registeredGroups[chatJid] = updated;
   imSendFailCounts.delete(chatJid);
@@ -2093,11 +2226,11 @@ async function handleRecallCommand(chatJid: string): Promise<string> {
     const target =
       registeredGroups[group.target_main_jid] ??
       getRegisteredGroup(group.target_main_jid);
-    headerName = `${target?.name || group.target_main_jid} / 主对话`;
+    headerName = `${target?.name || group.target_main_jid} / 主会话`;
     targetFolder = target?.folder || group.folder;
     targetJid = group.target_main_jid;
   } else {
-    headerName = `${findGroupNameByFolder(group.folder)} / 主对话`;
+    headerName = `${findGroupNameByFolder(group.folder)} / 主会话`;
     targetFolder = group.folder;
     targetJid = findWebJidForFolder(group.folder) ?? undefined;
   }
@@ -2268,7 +2401,7 @@ function resolveSpawnWorkspace(
       getRegisteredGroup(target.baseChatJid);
     if (!targetGroup) {
       return group.target_agent_id
-        ? '绑定 Agent 所属的工作区不存在'
+        ? '绑定会话所属的工作区不存在'
         : '绑定的工作区不存在';
     }
     homeChatJid = target.baseChatJid;
@@ -3053,6 +3186,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   }
 
+  const agentProfile = getAgentProfileForWorkspace(
+    effectiveGroup.folder,
+    effectiveGroup.created_by,
+  );
+  const resetForAgentProfile =
+    resetMainSessionForAgentProfileMismatch(effectiveGroup, agentProfile);
+
   const shared = isGroupShared(group.folder);
   let prompt = formatMessages(missedMessages, shared);
 
@@ -3075,6 +3215,28 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       logger.info(
         { group: group.name, historyCount: historyContext.count },
         'Recovery: injected recent conversation history into prompt',
+      );
+    }
+  } else if (resetForAgentProfile) {
+    const historyContext = buildRecentConversationHistoryContext(
+      chatJid,
+      new Set(missedMessages.map((m) => m.id)),
+      {
+        limit: 30,
+        maxMessageLength: 700,
+        intro:
+          '检测到当前 workspace 切换或更新了顶层 AgentProfile 身份提示词，底层模型 session 已重置。以下是 HappyClaw 保存的最近对话记录，供你在新身份下延续上下文。',
+      },
+    );
+    if (historyContext) {
+      prompt = historyContext.context + prompt;
+      logger.info(
+        {
+          group: group.name,
+          agentProfileId: agentProfile?.id,
+          historyCount: historyContext.count,
+        },
+        'AgentProfile identity change: injected recent conversation history into prompt',
       );
     }
   } else if (willClearSessionOnProviderSwitch(effectiveGroup.folder)) {
@@ -4147,6 +4309,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       imagesForAgent,
       messageTaskId,
       currentSourceJid,
+      agentProfile,
     );
   } finally {
     runEnded = true;
@@ -4671,11 +4834,21 @@ async function runAgent(
   images?: Array<{ data: string; mimeType?: string }>,
   messageTaskId?: string,
   currentSourceJid?: string,
+  agentProfile?: AgentProfile,
 ): Promise<{ status: 'success' | 'error' | 'closed'; error?: string }> {
   const isHome = !!group.is_home;
   // For the agent-runner: isMain means this is an admin home container (full privileges)
   const isAdminHome = isHome && group.folder === MAIN_GROUP_FOLDER;
+  const resolvedAgentProfile =
+    agentProfile ?? getAgentProfileForWorkspace(group.folder, group.created_by);
+  if (resetMainSessionForAgentProfileMismatch(group, resolvedAgentProfile)) {
+    logger.info(
+      { groupFolder: group.folder, chatJid },
+      'AgentProfile identity mismatch handled inside runAgent',
+    );
+  }
   const sessionId = sessions[group.folder];
+  const containerAgentProfile = toContainerAgentProfile(resolvedAgentProfile);
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -4722,7 +4895,10 @@ async function runAgent(
           !output.providerFailure
         ) {
           sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
+          setSession(group.folder, output.newSessionId, undefined, {
+            agentProfileId: resolvedAgentProfile?.id,
+            identityHash: resolvedAgentProfile?.identity_hash,
+          });
         }
         await onOutput(output);
       }
@@ -4766,6 +4942,7 @@ async function runAgent(
           isAdminHome,
           images,
           messageTaskId,
+          agentProfile: containerAgentProfile,
         },
         onProcessCb,
         wrappedOnOutput,
@@ -4786,6 +4963,7 @@ async function runAgent(
           isAdminHome,
           images,
           messageTaskId,
+          agentProfile: containerAgentProfile,
         },
         onProcessCb,
         wrappedOnOutput,
@@ -4801,7 +4979,10 @@ async function runAgent(
       !output.providerFailure
     ) {
       sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      setSession(group.folder, output.newSessionId, undefined, {
+        agentProfileId: resolvedAgentProfile?.id,
+        identityHash: resolvedAgentProfile?.identity_hash,
+      });
     }
 
     // Agent was interrupted by _close sentinel (home folder drain).
@@ -6873,6 +7054,17 @@ async function processAgentConversation(
   updateAgentStatus(agentId, 'running');
   broadcastAgentStatus(chatJid, agentId, 'running', agent.name, agent.prompt);
 
+  const agentProfile = getAgentProfileForWorkspace(
+    effectiveGroup.folder,
+    effectiveGroup.created_by,
+  );
+  const resetForAgentProfile =
+    resetConversationSessionForAgentProfileMismatch(
+      effectiveGroup,
+      agentId,
+      agentProfile,
+    );
+
   // Get or use agent-specific session before building the prompt. If the
   // session was cleared by provider/model switching, inject persisted HappyClaw
   // chat history so the new model does not mistake the fresh SDK session for
@@ -6883,7 +7075,11 @@ async function processAgentConversation(
   // Inject history when the SDK session is fresh, or when a proactive provider
   // switch (sticky binding unhealthy/disabled) will clear the existing session
   // inside the runner — otherwise the new provider's first turn loses context.
-  if (!sessionId || willClearSessionOnProviderSwitch(effectiveGroup.folder, agentId)) {
+  if (
+    !sessionId ||
+    resetForAgentProfile ||
+    willClearSessionOnProviderSwitch(effectiveGroup.folder, agentId)
+  ) {
     const historyContext = buildRecentConversationHistoryContext(
       virtualChatJid,
       new Set(missedMessages.map((m) => m.id)),
@@ -6891,7 +7087,9 @@ async function processAgentConversation(
         limit: 30,
         maxMessageLength: 700,
         intro:
-          '检测到当前 agent 的底层模型 session 是新的（可能因为切换 provider/model 或恢复失败）。以下是 HappyClaw 保存的最近对话记录，供你延续上下文。',
+          resetForAgentProfile
+            ? '检测到当前 workspace 切换或更新了顶层 AgentProfile 身份提示词，当前 agent 的底层模型 session 已重置。以下是 HappyClaw 保存的最近对话记录，供你在新身份下延续上下文。'
+            : '检测到当前 agent 的底层模型 session 是新的（可能因为切换 provider/model 或恢复失败）。以下是 HappyClaw 保存的最近对话记录，供你延续上下文。',
       },
     );
     if (historyContext) {
@@ -7154,7 +7352,10 @@ async function processAgentConversation(
       output.status !== 'error' &&
       !output.providerFailure
     ) {
-      setSession(effectiveGroup.folder, output.newSessionId, agentId);
+      setSession(effectiveGroup.folder, output.newSessionId, agentId, {
+        agentProfileId: agentProfile?.id,
+        identityHash: agentProfile?.identity_hash,
+      });
       currentAgentSessionId = output.newSessionId;
     }
 
@@ -7680,6 +7881,7 @@ async function processAgentConversation(
       agentId,
       agentName: agent.name,
       images: imagesForAgent,
+      agentProfile: toContainerAgentProfile(agentProfile),
     };
 
     // Write tasks/groups snapshots
@@ -7732,7 +7934,10 @@ async function processAgentConversation(
       output.status !== 'error' &&
       !output.providerFailure
     ) {
-      setSession(effectiveGroup.folder, output.newSessionId, agentId);
+      setSession(effectiveGroup.folder, output.newSessionId, agentId, {
+        agentProfileId: agentProfile?.id,
+        identityHash: agentProfile?.identity_hash,
+      });
     }
 
     // 不可恢复的转录错误（如超大图片/MIME 错配被固化在会话历史中）
@@ -9165,6 +9370,64 @@ function buildResolveEffectiveChatJid(): (
     if (!group) {
       logger.debug({ chatJid }, 'resolveEffectiveChatJid: group not found');
       return null;
+    }
+
+    const mount = getChannelMount(chatJid);
+    if (mount?.session_id) {
+      const agent = getAgent(mount.session_id);
+      if (!agent) {
+        logger.warn(
+          { chatJid, sessionId: mount.session_id },
+          'resolveEffectiveChatJid: session not found for channel_mounts row',
+        );
+      } else {
+        return {
+          effectiveJid: `${mount.workspace_jid}#agent:${mount.session_id}`,
+          agentId: mount.session_id,
+        };
+      }
+    }
+
+    if (
+      mount?.routing_mode === 'thread_map' &&
+      getChannelType(chatJid) === 'feishu' &&
+      messageMeta &&
+      (messageMeta?.threadId || messageMeta?.rootId || messageMeta?.messageId)
+    ) {
+      const threadContextId =
+        messageMeta.threadId || messageMeta.rootId || messageMeta.messageId;
+      if (!threadContextId) return null;
+      const workspace =
+        registeredGroups[mount.workspace_jid] ??
+        getRegisteredGroup(mount.workspace_jid);
+      if (!workspace) {
+        logger.warn(
+          { chatJid, workspaceJid: mount.workspace_jid },
+          'resolveEffectiveChatJid: workspace not found for thread_map channel_mounts row',
+        );
+      } else {
+        return resolveOrCreateThreadAgent(
+          chatJid,
+          mount.workspace_jid,
+          workspace,
+          group,
+          { ...messageMeta, threadId: threadContextId },
+        );
+      }
+    }
+
+    if (mount?.workspace_jid) {
+      const workspace =
+        registeredGroups[mount.workspace_jid] ??
+        getRegisteredGroup(mount.workspace_jid);
+      if (!workspace) {
+        logger.warn(
+          { chatJid, workspaceJid: mount.workspace_jid },
+          'resolveEffectiveChatJid: workspace not found for channel_mounts row',
+        );
+      } else {
+        return { effectiveJid: mount.workspace_jid, agentId: null };
+      }
     }
 
     // Agent binding takes priority

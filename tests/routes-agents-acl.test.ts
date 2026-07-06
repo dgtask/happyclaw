@@ -58,6 +58,7 @@ vi.mock('../src/middleware/auth.ts', () => ({
 // Avoid loading the full web.js (Hono app + WebSocket) for the success path.
 vi.mock('../src/web.js', () => ({
   broadcastAgentStatus: () => {},
+  broadcastAgentRemoved: () => {},
 }));
 
 const agentRoutesModule = await import('../src/routes/agents.js');
@@ -107,6 +108,11 @@ beforeEach(() => {
   } catch {
     /* ignore */
   }
+  try {
+    db.deleteRegisteredGroup('telegram:bound-session');
+  } catch {
+    /* ignore */
+  }
 });
 
 afterEach(() => {
@@ -122,6 +128,28 @@ async function postAgent(body: unknown): Promise<{ status: number; body: any }> 
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
     },
+  );
+  return { status: res.status, body: await res.json().catch(() => ({})) };
+}
+
+async function postSession(body: unknown): Promise<{ status: number; body: any }> {
+  const res = await agentRoutes.request(
+    `/${encodeURIComponent(GROUP_JID)}/sessions`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  );
+  return { status: res.status, body: await res.json().catch(() => ({})) };
+}
+
+async function deleteSessionRoute(
+  sessionId: string,
+): Promise<{ status: number; body: any }> {
+  const res = await agentRoutes.request(
+    `/${encodeURIComponent(GROUP_JID)}/sessions/${sessionId}`,
+    { method: 'DELETE' },
   );
   return { status: res.status, body: await res.json().catch(() => ({})) };
 }
@@ -212,6 +240,49 @@ describe('agents CRUD ACL', () => {
     const { status, body } = await postAgent({ name: 'Nope' });
     expect(status).toBe(404);
     expect(body.error).toMatch(/not found/i);
+  });
+});
+
+describe('formal sessions API', () => {
+  test('owner can POST /sessions (create) a conversation session', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+
+    const { status, body } = await postSession({ name: 'Session API' });
+    expect(status).toBe(200);
+    expect(body.session?.id).toBeTruthy();
+    expect(body.session?.name).toBe('Session API');
+    expect(body.agent?.id).toBe(body.session?.id);
+  });
+
+  test('shared member is denied POST /sessions (403, owner-only)', async () => {
+    seedTestGroup();
+    asUser(MEMBER_ID);
+
+    const { status, body } = await postSession({ name: 'Nope' });
+    expect(status).toBe(403);
+    expect(body.error).toMatch(/owner/i);
+  });
+
+  test('DELETE /sessions/:id is blocked by channel_mounts session binding', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+
+    const created = await postSession({ name: 'Bound session' });
+    const sessionId = created.body.session.id as string;
+    db.setRegisteredGroup('telegram:bound-session', {
+      name: 'Bound Telegram',
+      folder: 'owner-home',
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+      target_agent_id: sessionId,
+    } as any);
+
+    const { status, body } = await deleteSessionRoute(sessionId);
+    expect(status).toBe(409);
+    expect(body.linked_im_groups).toEqual([
+      { jid: 'telegram:bound-session', name: 'Bound Telegram' },
+    ]);
   });
 });
 

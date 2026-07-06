@@ -41,7 +41,7 @@ export function ChatPage() {
   const hasGroups = Object.keys(groups).length > 0;
 
   // Build categorized group lists for mobile view (mirrors UnifiedSidebar)
-  const { mainGroup, pinnedGroups, mySections, collabSections } = useMemo(() => {
+  const { mainGroup, pinnedGroups, myAgentSections, collabSections } = useMemo(() => {
     let main: GroupEntry | null = null;
     const others: GroupEntry[] = [];
     for (const [jid, info] of Object.entries(groups)) {
@@ -59,9 +59,35 @@ export function ChatPage() {
       else my.push(g);
     });
     pinned.sort((a, b) => (a.pinned_at || '').localeCompare(b.pinned_at || ''));
-    return { mainGroup: main, pinnedGroups: pinned, mySections: groupByDate(my), collabSections: groupByDate(collab) };
+    const byAgent = new Map<
+      string,
+      { id: string; name: string; version?: number; items: GroupEntry[] }
+    >();
+    for (const group of my) {
+      const id = group.agent_profile_id || '__default__';
+      const existing =
+        byAgent.get(id) ||
+        {
+          id,
+          name: group.agent_profile_name || 'Default Agent',
+          version: group.agent_profile_version,
+          items: [],
+        };
+      existing.items.push(group);
+      if (!existing.version && group.agent_profile_version) {
+        existing.version = group.agent_profile_version;
+      }
+      byAgent.set(id, existing);
+    }
+    const myAgentSections = Array.from(byAgent.values())
+      .map((section) => ({
+        ...section,
+        items: section.items.sort(compareByLastActivity),
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
+    return { mainGroup: main, pinnedGroups: pinned, myAgentSections, collabSections: groupByDate(collab) };
   }, [groups]);
-  const hasAnyGroup = mainGroup || pinnedGroups.length > 0 || mySections.length > 0 || collabSections.length > 0;
+  const hasAnyGroup = mainGroup || pinnedGroups.length > 0 || myAgentSections.length > 0 || collabSections.length > 0;
 
   // Sync URL param to store selection. No auto-redirect to home container —
   // users land on the welcome screen and choose a container manually.
@@ -131,11 +157,11 @@ export function ChatPage() {
           </div>
           {hasAnyGroup ? (
             <div className="px-2 pb-nav-safe">
-              {/* 主工作区 */}
+              {/* Default Agent workspace */}
               {mainGroup && (
                 <div className="mb-1">
                   <div className="px-2 pt-1 pb-1">
-                    <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">主工作区</span>
+                    <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">默认 Agent</span>
                   </div>
                   <ChatGroupItem
                     jid={mainGroup.jid} name={mainGroup.name} folder={mainGroup.folder}
@@ -166,16 +192,19 @@ export function ChatPage() {
                   ))}
                 </div>
               )}
-              {/* 我的工作区 */}
-              {mySections.length > 0 && (
+              {/* My Agent workspaces */}
+              {myAgentSections.length > 0 && (
                 <div className="mb-1">
                   <div className="px-2 pt-2 pb-1">
-                    <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">我的工作区</span>
+                    <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">我的 Agent</span>
                   </div>
-                  {mySections.map((section) => (
-                    <div key={section.label} className="mb-1">
-                      <div className="px-2 pt-1 pb-1">
-                        <span className="text-[10px] text-muted-foreground/70 tracking-wide">{section.label}</span>
+                  {myAgentSections.map((section) => (
+                    <div key={section.id} className="mb-1">
+                      <div className="px-2 pt-2 pb-1 flex items-center gap-1.5">
+                        <span className="text-[10px] text-muted-foreground/80 truncate">{section.name}</span>
+                        {section.version && (
+                          <span className="text-[10px] text-muted-foreground/60">v{section.version}</span>
+                        )}
                       </div>
                       {section.items.map((g) => (
                         <ChatGroupItem
@@ -192,11 +221,11 @@ export function ChatPage() {
                   ))}
                 </div>
               )}
-              {/* 协作工作区 */}
+              {/* Shared Agent workspaces */}
               {collabSections.length > 0 && (
                 <div className="mb-1">
                   <div className="px-2 pt-2 pb-1">
-                    <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">协作工作区</span>
+                    <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">协作 Agent 工作区</span>
                   </div>
                   {collabSections.map((section) => (
                     <div key={section.label} className="mb-1">
@@ -223,7 +252,7 @@ export function ChatPage() {
           ) : (
             <div className="flex flex-col items-center justify-center h-64 px-4">
               <img src={`${import.meta.env.BASE_URL}icons/logo-text.svg`} alt={appearance?.appName || 'HappyClaw'} className="h-12 mb-6" />
-              <p className="text-muted-foreground text-sm">暂无工作区</p>
+              <p className="text-muted-foreground text-sm">暂无 Agent 工作区</p>
             </div>
           )}
         </div>

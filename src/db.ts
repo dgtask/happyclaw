@@ -6,6 +6,7 @@ import path from 'path';
 import { STORE_DIR, GROUPS_DIR } from './config.js';
 import { logger } from './logger.js';
 import {
+  AgentProfile,
   AgentKind,
   AgentStatus,
   AuthAuditLog,
@@ -18,6 +19,7 @@ import {
   BillingAuditEventType,
   BillingAuditLog,
   BillingPlan,
+  ChannelMount,
   DailyUsage,
   ExecutionMode,
   GroupMember,
@@ -46,6 +48,7 @@ import {
   PermissionTemplateKey,
 } from './types.js';
 import { getDefaultPermissions, normalizePermissions } from './permissions.js';
+import { getChannelFromJid } from './channel-prefixes.js';
 
 let db: InstanceType<typeof Database>;
 
@@ -230,6 +233,74 @@ function getRouterStateInternal(key: string): string | undefined {
   }
 }
 
+function tableExists(tableName: string): boolean {
+  const row = db
+    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+    .get(tableName);
+  return !!row;
+}
+
+function cleanupKnownForeignKeyOrphans(): void {
+  if (!tableExists('users')) return;
+  const specs: Array<{
+    childTable: string;
+    childColumn: string;
+    parentTable: string;
+    parentColumn: string;
+  }> = [
+    {
+      childTable: 'user_balances',
+      childColumn: 'user_id',
+      parentTable: 'users',
+      parentColumn: 'id',
+    },
+    {
+      childTable: 'user_sessions',
+      childColumn: 'user_id',
+      parentTable: 'users',
+      parentColumn: 'id',
+    },
+    {
+      childTable: 'user_subscriptions',
+      childColumn: 'user_id',
+      parentTable: 'users',
+      parentColumn: 'id',
+    },
+    {
+      childTable: 'balance_transactions',
+      childColumn: 'user_id',
+      parentTable: 'users',
+      parentColumn: 'id',
+    },
+  ];
+
+  for (const spec of specs) {
+    if (!tableExists(spec.childTable) || !tableExists(spec.parentTable)) {
+      continue;
+    }
+    const result = db
+      .prepare(
+        `DELETE FROM ${spec.childTable}
+         WHERE ${spec.childColumn} IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM ${spec.parentTable}
+             WHERE ${spec.parentTable}.${spec.parentColumn} = ${spec.childTable}.${spec.childColumn}
+           )`,
+      )
+      .run();
+    if (result.changes > 0) {
+      logger.warn(
+        {
+          table: spec.childTable,
+          parentTable: spec.parentTable,
+          rows: result.changes,
+        },
+        'Cleaned orphaned rows before enabling foreign-key enforcement',
+      );
+    }
+  }
+}
+
 export function initDatabase(): void {
   const dbPath = path.join(STORE_DIR, 'messages.db');
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -239,6 +310,7 @@ export function initDatabase(): void {
   // Enable WAL mode for better concurrency and performance
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA busy_timeout = 5000');
+  cleanupKnownForeignKeyOrphans();
   // Enable foreign-key enforcement. SQLite defaults to OFF for backward
   // compatibility, so all FK declarations on existing schemas are silent
   // no-ops without this PRAGMA. We log existing orphans (if any) but only
@@ -365,6 +437,21 @@ export function initDatabase(): void {
     );
     CREATE INDEX IF NOT EXISTS idx_icb_workspace ON im_context_bindings(workspace_jid);
     CREATE INDEX IF NOT EXISTS idx_icb_agent ON im_context_bindings(agent_id);
+    CREATE TABLE IF NOT EXISTS channel_mounts (
+      channel_jid TEXT PRIMARY KEY,
+      channel_type TEXT NOT NULL,
+      workspace_jid TEXT NOT NULL,
+      session_id TEXT,
+      routing_mode TEXT NOT NULL DEFAULT 'single_session',
+      reply_policy TEXT NOT NULL DEFAULT 'source_only',
+      activation_mode TEXT NOT NULL DEFAULT 'auto',
+      owner_im_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_channel_mounts_workspace ON channel_mounts(workspace_jid);
+    CREATE INDEX IF NOT EXISTS idx_channel_mounts_session ON channel_mounts(session_id);
+    CREATE INDEX IF NOT EXISTS idx_channel_mounts_type ON channel_mounts(channel_type);
   `);
 
   // Auth tables
@@ -482,6 +569,39 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_agents_group ON agents(group_folder);
     CREATE INDEX IF NOT EXISTS idx_agents_jid ON agents(chat_jid);
     CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
+  `);
+
+  // Top-level Agent Profiles: runtime identities/personas that own workspaces.
+  // Do not confuse this with the legacy `agents` table above, which stores
+  // workspace-scoped conversation/task/spawn agents.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_profiles (
+      id TEXT PRIMARY KEY,
+      owner_user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      identity_prompt TEXT NOT NULL DEFAULT '',
+      include_claude_preset INTEGER NOT NULL DEFAULT 1,
+      identity_hash TEXT NOT NULL DEFAULT '',
+      version INTEGER NOT NULL DEFAULT 1,
+      is_default INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_profiles_default
+      ON agent_profiles(owner_user_id)
+      WHERE is_default = 1 AND status = 'active';
+    CREATE INDEX IF NOT EXISTS idx_agent_profiles_owner
+      ON agent_profiles(owner_user_id, status);
+
+    CREATE TABLE IF NOT EXISTS workspace_agent_profiles (
+      group_folder TEXT PRIMARY KEY,
+      agent_profile_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_workspace_agent_profiles_profile
+      ON workspace_agent_profiles(agent_profile_id);
   `);
 
   // Billing tables
@@ -1298,6 +1418,20 @@ export function initDatabase(): void {
     db.exec('ALTER TABLE sessions ADD COLUMN provider_id TEXT');
   }
 
+  // v39 → v40: Track the top-level AgentProfile identity used by each Claude
+  // session. When a profile prompt changes, callers can detect the hash mismatch
+  // and start a fresh SDK session without losing HappyClaw message history.
+  ensureColumn('sessions', 'agent_profile_id', 'TEXT');
+  ensureColumn('sessions', 'identity_hash', 'TEXT');
+
+  // v40 → v41: Allow each AgentProfile to opt out of the Claude Code
+  // built-in system prompt preset and use only HappyClaw/Agent prompts.
+  ensureColumn(
+    'agent_profiles',
+    'include_claude_preset',
+    'INTEGER NOT NULL DEFAULT 1',
+  );
+
   // v37 → v38: Added users.default_require_mention column (per-user default
   // for require_mention on auto-registered IM group chats). The actual
   // ensureColumn migration runs above with the other users.* additions —
@@ -1359,7 +1493,10 @@ export function initDatabase(): void {
     }
   }
 
-  const SCHEMA_VERSION = '39';
+  backfillAgentProfileDefaultsAndWorkspaceMappings();
+  syncAllChannelMountsFromRegisteredGroups();
+
+	  const SCHEMA_VERSION = '42';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -2457,12 +2594,25 @@ export function setSession(
   groupFolder: string,
   sessionId: string,
   agentId?: string | null,
+  agentIdentity?: { agentProfileId?: string | null; identityHash?: string | null },
 ): void {
   const effectiveAgentId = agentId || '';
   db.prepare(
     `INSERT INTO sessions (group_folder, session_id, agent_id) VALUES (?, ?, ?)
      ON CONFLICT(group_folder, agent_id) DO UPDATE SET session_id = excluded.session_id`,
   ).run(groupFolder, sessionId, effectiveAgentId);
+  if (agentIdentity) {
+    db.prepare(
+      `UPDATE sessions
+       SET agent_profile_id = ?, identity_hash = ?
+       WHERE group_folder = ? AND agent_id = ?`,
+    ).run(
+      agentIdentity.agentProfileId ?? null,
+      agentIdentity.identityHash ?? null,
+      groupFolder,
+      effectiveAgentId,
+    );
+  }
 }
 
 export function deleteSession(
@@ -2517,6 +2667,302 @@ export function setSessionProviderId(
 
 export function deleteAllSessionsForFolder(groupFolder: string): void {
   db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+}
+
+export interface SessionAgentIdentity {
+  agent_profile_id: string | null;
+  identity_hash: string | null;
+}
+
+export function getSessionAgentIdentity(
+  groupFolder: string,
+  agentId?: string | null,
+): SessionAgentIdentity | undefined {
+  const effectiveAgentId = agentId || '';
+  const row = db
+    .prepare(
+      `SELECT agent_profile_id, identity_hash
+       FROM sessions
+       WHERE group_folder = ? AND agent_id = ?`,
+    )
+    .get(groupFolder, effectiveAgentId) as SessionAgentIdentity | undefined;
+  return row;
+}
+
+export function computeAgentProfileIdentityHash(
+  identityPrompt: string,
+  includeClaudePreset = true,
+): string {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify({ identityPrompt, includeClaudePreset }))
+    .digest('hex');
+}
+
+function mapAgentProfileRow(row: Record<string, unknown>): AgentProfile {
+  const prompt = String(row.identity_prompt ?? '');
+  const includeClaudePreset = Number(row.include_claude_preset ?? 1) === 1;
+  return {
+    id: String(row.id),
+    owner_user_id: String(row.owner_user_id),
+    name: String(row.name),
+    identity_prompt: prompt,
+    include_claude_preset: includeClaudePreset,
+    identity_hash: String(
+      row.identity_hash ??
+        computeAgentProfileIdentityHash(prompt, includeClaudePreset),
+    ),
+    version: Number(row.version ?? 1),
+    is_default: Number(row.is_default ?? 0) === 1,
+    status: row.status === 'archived' ? 'archived' : 'active',
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+export function getAgentProfile(profileId: string): AgentProfile | undefined {
+  const row = db
+    .prepare('SELECT * FROM agent_profiles WHERE id = ?')
+    .get(profileId) as Record<string, unknown> | undefined;
+  return row ? mapAgentProfileRow(row) : undefined;
+}
+
+export function getAgentProfileForUser(
+  profileId: string,
+  userId: string,
+): AgentProfile | undefined {
+  const row = db
+    .prepare(
+      "SELECT * FROM agent_profiles WHERE id = ? AND owner_user_id = ? AND status = 'active'",
+    )
+    .get(profileId, userId) as Record<string, unknown> | undefined;
+  return row ? mapAgentProfileRow(row) : undefined;
+}
+
+export function getOrCreateDefaultAgentProfile(userId: string): AgentProfile {
+  const existing = db
+    .prepare(
+      "SELECT * FROM agent_profiles WHERE owner_user_id = ? AND is_default = 1 AND status = 'active' LIMIT 1",
+    )
+    .get(userId) as Record<string, unknown> | undefined;
+  if (existing) return mapAgentProfileRow(existing);
+
+  const now = new Date().toISOString();
+  const id = crypto.randomUUID();
+  const identityPrompt = '';
+  const includeClaudePreset = true;
+  const identityHash = computeAgentProfileIdentityHash(
+    identityPrompt,
+    includeClaudePreset,
+  );
+  db.prepare(
+    `INSERT INTO agent_profiles (
+      id, owner_user_id, name, identity_prompt, include_claude_preset, identity_hash, version,
+      is_default, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, 'active', ?, ?)`,
+  ).run(
+    id,
+    userId,
+    'Default Agent',
+    identityPrompt,
+    includeClaudePreset ? 1 : 0,
+    identityHash,
+    now,
+    now,
+  );
+  return getAgentProfile(id)!;
+}
+
+export function listAgentProfilesForUser(userId: string): AgentProfile[] {
+  getOrCreateDefaultAgentProfile(userId);
+  const rows = db
+    .prepare(
+      `SELECT * FROM agent_profiles
+       WHERE owner_user_id = ? AND status = 'active'
+       ORDER BY is_default DESC, updated_at DESC, created_at ASC`,
+    )
+    .all(userId) as Array<Record<string, unknown>>;
+  return rows.map(mapAgentProfileRow);
+}
+
+export function createAgentProfile(input: {
+  ownerUserId: string;
+  name: string;
+  identityPrompt?: string;
+  includeClaudePreset?: boolean;
+}): AgentProfile {
+  const now = new Date().toISOString();
+  const id = crypto.randomUUID();
+  const identityPrompt = input.identityPrompt ?? '';
+  const includeClaudePreset = input.includeClaudePreset ?? true;
+  const identityHash = computeAgentProfileIdentityHash(
+    identityPrompt,
+    includeClaudePreset,
+  );
+  db.prepare(
+    `INSERT INTO agent_profiles (
+      id, owner_user_id, name, identity_prompt, include_claude_preset, identity_hash, version,
+      is_default, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, 1, 0, 'active', ?, ?)`,
+  ).run(
+    id,
+    input.ownerUserId,
+    input.name,
+    identityPrompt,
+    includeClaudePreset ? 1 : 0,
+    identityHash,
+    now,
+    now,
+  );
+  return getAgentProfile(id)!;
+}
+
+export function updateAgentProfile(
+  profileId: string,
+  ownerUserId: string,
+  updates: { name?: string; identityPrompt?: string; includeClaudePreset?: boolean },
+): AgentProfile | undefined {
+  const existing = getAgentProfileForUser(profileId, ownerUserId);
+  if (!existing) return undefined;
+  const nextName = updates.name ?? existing.name;
+  const promptChanged =
+    updates.identityPrompt !== undefined &&
+    updates.identityPrompt !== existing.identity_prompt;
+  const nextPrompt = updates.identityPrompt ?? existing.identity_prompt;
+  const includeChanged =
+    updates.includeClaudePreset !== undefined &&
+    updates.includeClaudePreset !== existing.include_claude_preset;
+  const nextIncludeClaudePreset =
+    updates.includeClaudePreset ?? existing.include_claude_preset;
+  const identityChanged = promptChanged || includeChanged;
+  const nextHash = identityChanged
+    ? computeAgentProfileIdentityHash(nextPrompt, nextIncludeClaudePreset)
+    : existing.identity_hash;
+  const nextVersion = identityChanged ? existing.version + 1 : existing.version;
+  const now = new Date().toISOString();
+  db.prepare(
+    `UPDATE agent_profiles
+     SET name = ?, identity_prompt = ?, include_claude_preset = ?, identity_hash = ?, version = ?, updated_at = ?
+     WHERE id = ? AND owner_user_id = ? AND status = 'active'`,
+  ).run(
+    nextName,
+    nextPrompt,
+    nextIncludeClaudePreset ? 1 : 0,
+    nextHash,
+    nextVersion,
+    now,
+    profileId,
+    ownerUserId,
+  );
+  return getAgentProfile(profileId);
+}
+
+export function archiveAgentProfile(
+  profileId: string,
+  ownerUserId: string,
+): 'ok' | 'not_found' | 'is_default' | 'has_workspaces' {
+  const existing = getAgentProfileForUser(profileId, ownerUserId);
+  if (!existing) return 'not_found';
+  if (existing.is_default) return 'is_default';
+  const count = countWorkspaceAgentProfileMappings(profileId);
+  if (count > 0) return 'has_workspaces';
+  db.prepare(
+    "UPDATE agent_profiles SET status = 'archived', updated_at = ? WHERE id = ? AND owner_user_id = ?",
+  ).run(new Date().toISOString(), profileId, ownerUserId);
+  return 'ok';
+}
+
+export function assignWorkspaceAgentProfile(
+  groupFolder: string,
+  profileId: string,
+): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO workspace_agent_profiles (
+      group_folder, agent_profile_id, created_at, updated_at
+    ) VALUES (?, ?, ?, ?)
+    ON CONFLICT(group_folder) DO UPDATE SET
+      agent_profile_id = excluded.agent_profile_id,
+      updated_at = excluded.updated_at`,
+  ).run(groupFolder, profileId, now, now);
+}
+
+export function getWorkspaceAgentProfileId(
+  groupFolder: string,
+): string | undefined {
+  const row = db
+    .prepare(
+      'SELECT agent_profile_id FROM workspace_agent_profiles WHERE group_folder = ?',
+    )
+    .get(groupFolder) as { agent_profile_id: string } | undefined;
+  return row?.agent_profile_id;
+}
+
+export function deleteWorkspaceAgentProfile(groupFolder: string): void {
+  db.prepare('DELETE FROM workspace_agent_profiles WHERE group_folder = ?').run(
+    groupFolder,
+  );
+}
+
+export function countWorkspaceAgentProfileMappings(profileId: string): number {
+  const row = db
+    .prepare(
+      'SELECT COUNT(*) as count FROM workspace_agent_profiles WHERE agent_profile_id = ?',
+    )
+    .get(profileId) as { count: number };
+  return row.count;
+}
+
+export function getAgentProfileForWorkspace(
+  groupFolder: string,
+  ownerUserId?: string | null,
+): AgentProfile | undefined {
+  const mappedId = getWorkspaceAgentProfileId(groupFolder);
+  if (mappedId) {
+    const mapped = getAgentProfile(mappedId);
+    if (mapped?.status === 'active') return mapped;
+  }
+  if (!ownerUserId) return undefined;
+  const fallback = getOrCreateDefaultAgentProfile(ownerUserId);
+  assignWorkspaceAgentProfile(groupFolder, fallback.id);
+  return fallback;
+}
+
+export function backfillAgentProfileDefaultsAndWorkspaceMappings(): void {
+  const tx = db.transaction(() => {
+    const users = db
+      .prepare("SELECT id FROM users WHERE status != 'deleted'")
+      .all() as Array<{ id: string }>;
+    for (const user of users) {
+      getOrCreateDefaultAgentProfile(user.id);
+    }
+
+    const webWorkspaces = db
+      .prepare(
+        "SELECT DISTINCT folder, created_by FROM registered_groups WHERE jid LIKE 'web:%' AND created_by IS NOT NULL",
+      )
+      .all() as Array<{ folder: string; created_by: string }>;
+    for (const ws of webWorkspaces) {
+      if (getWorkspaceAgentProfileId(ws.folder)) continue;
+      const profile = getOrCreateDefaultAgentProfile(ws.created_by);
+      assignWorkspaceAgentProfile(ws.folder, profile.id);
+    }
+
+    const memberOwnedFolders = db
+      .prepare(
+        `SELECT gm.group_folder as folder, MIN(gm.user_id) as owner_user_id
+         FROM group_members gm
+         LEFT JOIN workspace_agent_profiles wap ON wap.group_folder = gm.group_folder
+         WHERE gm.role = 'owner' AND wap.group_folder IS NULL
+         GROUP BY gm.group_folder`,
+      )
+      .all() as Array<{ folder: string; owner_user_id: string }>;
+    for (const ws of memberOwnedFolders) {
+      const profile = getOrCreateDefaultAgentProfile(ws.owner_user_id);
+      assignWorkspaceAgentProfile(ws.folder, profile.id);
+    }
+  });
+  tx();
 }
 
 /**
@@ -2746,9 +3192,11 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.feishu_group_message_type ?? null,
     group.sender_allowlist != null ? JSON.stringify(group.sender_allowlist) : null,
   );
+  syncChannelMountFromRegisteredGroup(jid, group);
 }
 
 export function deleteRegisteredGroup(jid: string): void {
+  deleteChannelMount(jid);
   db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
 }
 
@@ -2854,6 +3302,201 @@ export function getGroupsByTargetMainJid(
   return rows.map((row) => ({ jid: row.jid, group: parseGroupRow(row) }));
 }
 
+type ChannelMountRow = {
+  channel_jid: string;
+  channel_type: string;
+  workspace_jid: string;
+  session_id: string | null;
+  routing_mode: string | null;
+  reply_policy: string | null;
+  activation_mode: string | null;
+  owner_im_id: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+function parseChannelMountRow(row: ChannelMountRow): ChannelMount {
+  return {
+    channel_jid: row.channel_jid,
+    channel_type: row.channel_type,
+    workspace_jid: row.workspace_jid,
+    session_id: row.session_id,
+    routing_mode:
+      row.routing_mode === 'thread_map' ? 'thread_map' : 'single_session',
+    reply_policy: row.reply_policy === 'mirror' ? 'mirror' : 'source_only',
+    activation_mode: parseActivationMode(row.activation_mode),
+    owner_im_id: row.owner_im_id,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+function resolveWorkspaceJidForMount(targetMainJid?: string): string | null {
+  if (!targetMainJid) return null;
+  const exists = db
+    .prepare('SELECT 1 FROM registered_groups WHERE jid = ?')
+    .get(targetMainJid);
+  if (exists) return targetMainJid;
+  if (!targetMainJid.startsWith('web:')) return null;
+  const folder = targetMainJid.slice(4);
+  const row = db
+    .prepare(
+      "SELECT jid FROM registered_groups WHERE folder = ? AND jid LIKE 'web:%' ORDER BY is_home DESC, added_at ASC LIMIT 1",
+    )
+    .get(folder) as { jid: string } | undefined;
+  return row?.jid ?? null;
+}
+
+function channelMountFromRegisteredGroup(
+  channelJid: string,
+  group: RegisteredGroup,
+): Omit<ChannelMount, 'created_at' | 'updated_at'> | null {
+  const channelType = getChannelFromJid(channelJid);
+  if (channelType === 'web') return null;
+
+  if (group.target_agent_id) {
+    const agent = getAgent(group.target_agent_id);
+    if (!agent?.chat_jid) return null;
+    return {
+      channel_jid: channelJid,
+      channel_type: channelType,
+      workspace_jid: agent.chat_jid,
+      session_id: group.target_agent_id,
+      routing_mode: 'single_session',
+      reply_policy: group.reply_policy === 'mirror' ? 'mirror' : 'source_only',
+      activation_mode: group.activation_mode ?? 'auto',
+      owner_im_id: group.owner_im_id ?? null,
+    };
+  }
+
+  if (group.target_main_jid) {
+    const workspaceJid = resolveWorkspaceJidForMount(group.target_main_jid);
+    if (!workspaceJid) return null;
+    return {
+      channel_jid: channelJid,
+      channel_type: channelType,
+      workspace_jid: workspaceJid,
+      session_id: null,
+      routing_mode:
+        group.binding_mode === 'thread_map' ? 'thread_map' : 'single_session',
+      reply_policy: group.reply_policy === 'mirror' ? 'mirror' : 'source_only',
+      activation_mode: group.activation_mode ?? 'auto',
+      owner_im_id: group.owner_im_id ?? null,
+    };
+  }
+
+  return null;
+}
+
+export function upsertChannelMount(
+  mount: Omit<ChannelMount, 'created_at' | 'updated_at'> &
+    Partial<Pick<ChannelMount, 'created_at' | 'updated_at'>>,
+): ChannelMount {
+  const now = new Date().toISOString();
+  const existing = getChannelMount(mount.channel_jid);
+  const createdAt = mount.created_at ?? existing?.created_at ?? now;
+  const updatedAt = mount.updated_at ?? now;
+  db.prepare(
+    `INSERT INTO channel_mounts (
+      channel_jid, channel_type, workspace_jid, session_id, routing_mode,
+      reply_policy, activation_mode, owner_im_id, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(channel_jid) DO UPDATE SET
+      channel_type = excluded.channel_type,
+      workspace_jid = excluded.workspace_jid,
+      session_id = excluded.session_id,
+      routing_mode = excluded.routing_mode,
+      reply_policy = excluded.reply_policy,
+      activation_mode = excluded.activation_mode,
+      owner_im_id = excluded.owner_im_id,
+      updated_at = excluded.updated_at`,
+  ).run(
+    mount.channel_jid,
+    mount.channel_type,
+    mount.workspace_jid,
+    mount.session_id ?? null,
+    mount.routing_mode,
+    mount.reply_policy,
+    mount.activation_mode,
+    mount.owner_im_id ?? null,
+    createdAt,
+    updatedAt,
+  );
+  return getChannelMount(mount.channel_jid)!;
+}
+
+export function deleteChannelMount(channelJid: string): void {
+  if (!db) return;
+  try {
+    db.prepare('DELETE FROM channel_mounts WHERE channel_jid = ?').run(
+      channelJid,
+    );
+  } catch {
+    // Startup can call legacy group deletion paths before a pre-v42 DB has
+    // created channel_mounts. The next init pass will create and backfill it.
+  }
+}
+
+export function getChannelMount(channelJid: string): ChannelMount | undefined {
+  const row = db
+    .prepare('SELECT * FROM channel_mounts WHERE channel_jid = ?')
+    .get(channelJid) as ChannelMountRow | undefined;
+  return row ? parseChannelMountRow(row) : undefined;
+}
+
+export function listChannelMounts(): ChannelMount[] {
+  const rows = db
+    .prepare('SELECT * FROM channel_mounts ORDER BY updated_at DESC')
+    .all() as ChannelMountRow[];
+  return rows.map(parseChannelMountRow);
+}
+
+export function listChannelMountsByWorkspace(
+  workspaceJid: string,
+): ChannelMount[] {
+  const rows = db
+    .prepare(
+      'SELECT * FROM channel_mounts WHERE workspace_jid = ? ORDER BY updated_at DESC',
+    )
+    .all(workspaceJid) as ChannelMountRow[];
+  return rows.map(parseChannelMountRow);
+}
+
+export function listChannelMountsBySession(sessionId: string): ChannelMount[] {
+  const rows = db
+    .prepare(
+      'SELECT * FROM channel_mounts WHERE session_id = ? ORDER BY updated_at DESC',
+    )
+    .all(sessionId) as ChannelMountRow[];
+  return rows.map(parseChannelMountRow);
+}
+
+export function syncChannelMountFromRegisteredGroup(
+  channelJid: string,
+  group: RegisteredGroup,
+): void {
+  if (getChannelFromJid(channelJid) === 'web') {
+    deleteChannelMount(channelJid);
+    return;
+  }
+  const mount = channelMountFromRegisteredGroup(channelJid, group);
+  if (!mount) {
+    deleteChannelMount(channelJid);
+    return;
+  }
+  upsertChannelMount(mount);
+}
+
+export function syncAllChannelMountsFromRegisteredGroups(): void {
+  db.prepare('DELETE FROM channel_mounts').run();
+  const rows = db
+    .prepare('SELECT * FROM registered_groups')
+    .all() as RegisteredGroupRow[];
+  for (const row of rows) {
+    syncChannelMountFromRegisteredGroup(row.jid, parseGroupRow(row));
+  }
+}
+
 function mapImContextBindingRow(
   row: Record<string, unknown>,
 ): ImContextBinding {
@@ -2921,6 +3564,17 @@ export function listImContextBindingsByWorkspace(
       'SELECT * FROM im_context_bindings WHERE workspace_jid = ? ORDER BY last_active_at DESC, created_at DESC',
     )
     .all(workspaceJid) as Record<string, unknown>[];
+  return rows.map(mapImContextBindingRow);
+}
+
+export function listImContextBindingsByAgent(
+  agentId: string,
+): ImContextBinding[] {
+  const rows = db
+    .prepare(
+      'SELECT * FROM im_context_bindings WHERE agent_id = ? ORDER BY last_active_at DESC, created_at DESC',
+    )
+    .all(agentId) as Record<string, unknown>[];
   return rows.map(mapImContextBindingRow);
 }
 
@@ -3099,10 +3753,12 @@ export function deleteChatHistory(chatJid: string): void {
  */
 export function deleteImGroupRecord(jid: string): void {
   const tx = db.transaction(() => {
+    db.prepare('DELETE FROM channel_mounts WHERE channel_jid = ?').run(jid);
     db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
     db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(jid);
     db.prepare('DELETE FROM chats WHERE jid = ?').run(jid);
     db.prepare('DELETE FROM user_pinned_groups WHERE jid = ?').run(jid);
+    db.prepare('DELETE FROM im_context_bindings WHERE source_jid = ?').run(jid);
     // Feishu thread agents (source_kind='feishu_thread') and other chat-scoped
     // agents reference this jid via agents.chat_jid — without this, deleting
     // an IM group leaves orphan agent rows visible in the agents list.
@@ -3116,6 +3772,23 @@ export function deleteImGroupRecord(jid: string): void {
 
 export function deleteGroupData(jid: string, folder: string): void {
   const tx = db.transaction(() => {
+    const legacyMainJid = `web:${folder}`;
+    db.prepare(
+      `UPDATE registered_groups
+       SET target_main_jid = NULL, binding_mode = 'single_context'
+       WHERE target_main_jid = ? OR target_main_jid = ?`,
+    ).run(jid, legacyMainJid);
+    db.prepare(
+      `UPDATE registered_groups
+       SET target_agent_id = NULL, binding_mode = 'single_context'
+       WHERE target_agent_id IN (
+         SELECT id FROM agents WHERE group_folder = ? OR chat_jid = ?
+       )`,
+    ).run(folder, jid);
+    db.prepare('DELETE FROM channel_mounts WHERE workspace_jid = ?').run(jid);
+    db.prepare('DELETE FROM im_context_bindings WHERE workspace_jid = ?').run(
+      jid,
+    );
     // 1. 删除定时任务运行日志 + 定时任务
     db.prepare(
       'DELETE FROM task_run_logs WHERE task_id IN (SELECT id FROM scheduled_tasks WHERE group_folder = ?)',
@@ -3125,16 +3798,28 @@ export function deleteGroupData(jid: string, folder: string): void {
     );
     // 2. 删除成员记录
     db.prepare('DELETE FROM group_members WHERE group_folder = ?').run(folder);
-    // 3. 删除注册信息
+    // 3. 删除 workspace -> AgentProfile 归属映射
+    db.prepare('DELETE FROM workspace_agent_profiles WHERE group_folder = ?').run(
+      folder,
+    );
+    // 4. 删除注册信息
     db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
-    // 4. 删除会话
+    // 5. 删除会话与 workspace-owned agents
     db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(folder);
-    // 5. 删除聊天记录
+    db.prepare('DELETE FROM agents WHERE group_folder = ? OR chat_jid = ?').run(
+      folder,
+      jid,
+    );
+    // 6. 删除聊天记录
     db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(jid);
+    db.prepare('DELETE FROM messages WHERE chat_jid LIKE ?').run(
+      `${jid}#agent:%`,
+    );
     db.prepare('DELETE FROM chats WHERE jid = ?').run(jid);
-    // 6. 删除 pin 记录
+    db.prepare('DELETE FROM chats WHERE jid LIKE ?').run(`${jid}#agent:%`);
+    // 7. 删除 pin 记录
     db.prepare('DELETE FROM user_pinned_groups WHERE jid = ?').run(jid);
-    // 7. 清除定时任务的工作区关联（任务本身不删，只断开绑定）
+    // 8. 清除定时任务的工作区关联（任务本身不删，只断开绑定）
     db.prepare(
       'UPDATE scheduled_tasks SET workspace_jid = NULL, workspace_folder = NULL WHERE workspace_jid = ?',
     ).run(jid);
@@ -3586,6 +4271,7 @@ export function createUser(user: CreateUserInput): void {
     user.deleted_at ?? null,
   );
   initializeBillingForUser(user.id, user.role, user.created_at);
+  getOrCreateDefaultAgentProfile(user.id);
 }
 
 export type CreateInitialAdminResult =
@@ -4088,6 +4774,7 @@ export function registerUserWithInvite(input: {
         null,
       );
       initializeBillingForUser(params.id, inviteRole, params.created_at);
+      getOrCreateDefaultAgentProfile(params.id);
 
       return { ok: true, role: inviteRole, permissions };
     },
@@ -4144,6 +4831,7 @@ export function registerUserWithoutInvite(input: {
       null,
     );
     initializeBillingForUser(input.id, role, input.created_at);
+    getOrCreateDefaultAgentProfile(input.id);
     return { ok: true, role, permissions };
   } catch (err) {
     if (

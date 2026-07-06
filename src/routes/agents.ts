@@ -26,13 +26,21 @@ import {
   updateChatName,
   getMessagesPageMulti,
   deleteImContextBindingsByWorkspace,
+  listImContextBindingsByAgent,
   listFeishuThreadAgentIds,
+  listChannelMountsBySession,
 } from '../db.js';
 import { DATA_DIR } from '../config.js';
 import type { RegisteredGroup, SubAgent } from '../types.js';
 import { logger } from '../logger.js';
 import { getChannelType, extractChatId } from '../im-channel.js';
 import { ensureAgentDirectories } from '../utils.js';
+import {
+  buildSessionMountUpdate,
+  buildUnmountUpdate,
+  buildWorkspaceMountUpdate,
+} from '../channel-mount-service.js';
+import { isThreadMapCapableChat } from '../im-channel-capabilities.js';
 
 const router = new Hono<{ Variables: Variables }>();
 
@@ -147,6 +155,94 @@ router.get('/:jid/agents', authMiddleware, async (c) => {
   });
 });
 
+// GET /api/groups/:jid/sessions — formal workspace session list
+router.get('/:jid/sessions', authMiddleware, async (c) => {
+  const jid = decodeURIComponent(c.req.param('jid'));
+  const user = c.get('user');
+
+  const group = getRegisteredGroup(jid);
+  if (!group) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (!canAccessGroup(user, { ...group, jid })) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const agents = listAgentsByJid(jid).filter((a) => a.kind === 'conversation');
+  const virtualChatJids = agents.map((a) => `${jid}#agent:${a.id}`);
+  const latestMessages = getMessagesPageMulti(
+    virtualChatJids,
+    undefined,
+    Math.max(virtualChatJids.length * 2, 50),
+  );
+  const latestByChatJid = new Map<
+    string,
+    { content: string; timestamp: string }
+  >();
+  for (const msg of latestMessages) {
+    if (!latestByChatJid.has(msg.chat_jid)) {
+      latestByChatJid.set(msg.chat_jid, {
+        content: msg.content,
+        timestamp: msg.timestamp,
+      });
+    }
+  }
+
+  return c.json({
+    sessions: [
+      {
+        id: 'main',
+        name: '主会话',
+        prompt: '',
+        status: 'idle',
+        kind: 'main',
+        chat_jid: jid,
+        is_main: true,
+        created_at: group.added_at,
+        source_kind: null,
+        thread_id: null,
+        root_message_id: null,
+        title_source: null,
+        last_active_at: null,
+        latest_message: null,
+      },
+      ...agents.map((a) => {
+        const latest = latestByChatJid.get(`${jid}#agent:${a.id}`);
+        return {
+          id: a.id,
+          name: a.name,
+          prompt: a.prompt,
+          status: a.status,
+          kind: 'conversation',
+          chat_jid: jid,
+          is_main: false,
+          created_at: a.created_at,
+          completed_at: a.completed_at,
+          result_summary: a.result_summary,
+          source_kind: a.source_kind ?? null,
+          thread_id: a.thread_id ?? null,
+          root_message_id: a.root_message_id ?? null,
+          title_source: a.title_source ?? null,
+          last_active_at: a.last_active_at ?? null,
+          latest_message: latest
+            ? {
+                content: latest.content,
+                timestamp: latest.timestamp,
+              }
+            : null,
+          linked_im_groups: listChannelMountsBySession(a.id).map((mount) => {
+            const imGroup = getRegisteredGroup(mount.channel_jid);
+            return {
+              jid: mount.channel_jid,
+              name: imGroup?.name ?? mount.channel_jid,
+            };
+          }),
+        };
+      }),
+    ],
+  });
+});
+
 // POST /api/groups/:jid/agents — create a user conversation
 router.post('/:jid/agents', authMiddleware, async (c) => {
   const jid = decodeURIComponent(c.req.param('jid'));
@@ -242,6 +338,89 @@ router.post('/:jid/agents', authMiddleware, async (c) => {
   });
 });
 
+// POST /api/groups/:jid/sessions — create a workspace conversation session
+router.post('/:jid/sessions', authMiddleware, async (c) => {
+  const jid = decodeURIComponent(c.req.param('jid'));
+  const user = c.get('user');
+
+  const group = getRegisteredGroup(jid);
+  if (!group) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (!canAccessGroup(user, { ...group, jid })) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (!canModifyGroup(user, { ...group, jid })) {
+    return c.json(
+      { error: 'Only the workspace owner can manage sessions' },
+      403,
+    );
+  }
+  if (group.conversation_source === 'feishu_thread') {
+    return c.json(
+      { error: 'Feishu topic workspaces do not support manual sessions' },
+      400,
+    );
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  let name = typeof body.name === 'string' ? body.name.trim() : '';
+  if (name.length > 40) {
+    return c.json({ error: 'Name too long (max 40 chars)' }, 400);
+  }
+  const isAutoTitle = !name;
+  if (!name) name = '新对话';
+  const description =
+    typeof body.description === 'string' ? body.description.trim() : '';
+
+  const sessionId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const session: SubAgent = {
+    id: sessionId,
+    group_folder: group.folder,
+    chat_jid: jid,
+    name,
+    prompt: description,
+    status: 'idle',
+    kind: 'conversation',
+    created_by: user.id,
+    created_at: now,
+    completed_at: null,
+    result_summary: null,
+    last_im_jid: null,
+    spawned_from_jid: null,
+    title_source: isAutoTitle ? 'auto_pending' : 'manual',
+  };
+
+  createAgent(session);
+  ensureAgentDirectories(group.folder, sessionId);
+  ensureChatExists(`${jid}#agent:${sessionId}`);
+
+  const { broadcastAgentStatus } = await import('../web.js');
+  broadcastAgentStatus(jid, sessionId, 'idle', name, description);
+
+  logger.info(
+    { sessionId, jid, name, userId: user.id },
+    'Workspace session created',
+  );
+
+  const payload = {
+    id: session.id,
+    name: session.name,
+    prompt: session.prompt,
+    status: session.status,
+    kind: session.kind,
+    created_at: session.created_at,
+    source_kind: session.source_kind ?? null,
+    thread_id: session.thread_id ?? null,
+    root_message_id: session.root_message_id ?? null,
+    title_source: session.title_source ?? null,
+    last_active_at: session.last_active_at ?? null,
+    is_main: false,
+  };
+  return c.json({ session: payload, agent: payload });
+});
+
 // PATCH /api/groups/:jid/agents/:agentId — rename a conversation agent
 router.patch('/:jid/agents/:agentId', authMiddleware, async (c) => {
   const jid = decodeURIComponent(c.req.param('jid'));
@@ -302,6 +481,64 @@ router.patch('/:jid/agents/:agentId', authMiddleware, async (c) => {
   return c.json({ success: true });
 });
 
+// PATCH /api/groups/:jid/sessions/:sessionId — rename a workspace session
+router.patch('/:jid/sessions/:sessionId', authMiddleware, async (c) => {
+  const jid = decodeURIComponent(c.req.param('jid'));
+  const sessionId = c.req.param('sessionId');
+  const user = c.get('user');
+
+  if (sessionId === 'main') {
+    return c.json({ error: 'Main session is renamed with the workspace' }, 400);
+  }
+
+  const group = getRegisteredGroup(jid);
+  if (!group) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (!canAccessGroup(user, { ...group, jid })) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (!canModifyGroup(user, { ...group, jid })) {
+    return c.json(
+      { error: 'Only the workspace owner can manage sessions' },
+      403,
+    );
+  }
+
+  const session = getAgent(sessionId);
+  if (!session || session.chat_jid !== jid || session.kind !== 'conversation') {
+    return c.json({ error: 'Session not found' }, 404);
+  }
+  if (session.source_kind === 'feishu_thread') {
+    return c.json(
+      { error: 'Feishu topic sessions use read-only titles' },
+      400,
+    );
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  if (!name || name.length > 40) {
+    return c.json({ error: 'Name is required (max 40 chars)' }, 400);
+  }
+
+  updateAgentInfo(sessionId, name, session.prompt);
+  updateAgentContextInfo(sessionId, { title_source: 'manual' });
+  updateChatName(`${jid}#agent:${sessionId}`, name);
+
+  const { broadcastAgentStatus } = await import('../web.js');
+  broadcastAgentStatus(
+    jid,
+    sessionId,
+    session.status as import('../types.js').AgentStatus,
+    name,
+    session.prompt,
+  );
+
+  logger.info({ sessionId, jid, name, userId: user.id }, 'Session renamed');
+  return c.json({ success: true });
+});
+
 // DELETE /api/groups/:jid/agents/:agentId — stop and delete an agent
 router.delete('/:jid/agents/:agentId', authMiddleware, async (c) => {
   const jid = decodeURIComponent(c.req.param('jid'));
@@ -330,18 +567,44 @@ router.delete('/:jid/agents/:agentId', authMiddleware, async (c) => {
   }
   // Block deletion if conversation agent has active IM bindings
   if (agent.kind === 'conversation') {
-    const linkedImGroups = getGroupsByTargetAgent(agentId);
+    const legacyLinkedImGroups = getGroupsByTargetAgent(agentId);
+    const mountedImGroups = listChannelMountsBySession(agentId).map((mount) => ({
+      jid: mount.channel_jid,
+      group: getRegisteredGroup(mount.channel_jid),
+    }));
+    const linkedByJid = new Map<string, { jid: string; name: string }>();
+    for (const { jid: imJid, group: imGroup } of legacyLinkedImGroups) {
+      linkedByJid.set(imJid, { jid: imJid, name: imGroup.name });
+    }
+    for (const { jid: imJid, group: imGroup } of mountedImGroups) {
+      linkedByJid.set(imJid, { jid: imJid, name: imGroup?.name ?? imJid });
+    }
+    const linkedImGroups = Array.from(linkedByJid.values());
+    const threadBindings = listImContextBindingsByAgent(agentId);
     if (linkedImGroups.length > 0) {
       return c.json(
         {
           error:
-            'Agent has active IM bindings. Unbind all IM groups before deleting.',
-          linked_im_groups: linkedImGroups.map(
-            ({ jid: imJid, group: imGroup }) => ({
-              jid: imJid,
-              name: imGroup.name,
-            }),
-          ),
+            'Session has active IM bindings. Unbind all IM groups before deleting.',
+          linked_im_groups: linkedImGroups,
+        },
+        409,
+      );
+    }
+    if (threadBindings.length > 0) {
+      const linkedThreadGroups = threadBindings.map((binding) => {
+        const imGroup = getRegisteredGroup(binding.source_jid);
+        return {
+          jid: binding.source_jid,
+          name: imGroup?.name ?? binding.source_jid,
+          context_id: binding.context_id,
+        };
+      });
+      return c.json(
+        {
+          error:
+            'Session is managed by a thread-mapped IM channel. Unbind the workspace channel before deleting.',
+          linked_im_groups: linkedThreadGroups,
         },
         409,
       );
@@ -407,22 +670,112 @@ router.delete('/:jid/agents/:agentId', authMiddleware, async (c) => {
   return c.json({ success: true });
 });
 
-// Helper: check if a Telegram JID is a private/P2P chat
-function isTelegramPrivateChat(jid: string): boolean {
-  if (!jid.startsWith('telegram:')) return false;
-  const id = jid.slice('telegram:'.length);
-  return !id.startsWith('-');
-}
+// DELETE /api/groups/:jid/sessions/:sessionId — delete a workspace session
+router.delete('/:jid/sessions/:sessionId', authMiddleware, async (c) => {
+  const jid = decodeURIComponent(c.req.param('jid'));
+  const sessionId = c.req.param('sessionId');
+  const user = c.get('user');
+
+  if (sessionId === 'main') {
+    return c.json({ error: 'Main session cannot be deleted' }, 400);
+  }
+
+  const group = getRegisteredGroup(jid);
+  if (!group) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (!canAccessGroup(user, { ...group, jid })) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (!canModifyGroup(user, { ...group, jid })) {
+    return c.json(
+      { error: 'Only the workspace owner can manage sessions' },
+      403,
+    );
+  }
+
+  const session = getAgent(sessionId);
+  if (!session || session.chat_jid !== jid || session.kind !== 'conversation') {
+    return c.json({ error: 'Session not found' }, 404);
+  }
+
+  const legacyLinkedImGroups = getGroupsByTargetAgent(sessionId);
+  const mountedImGroups = listChannelMountsBySession(sessionId).map((mount) => ({
+    jid: mount.channel_jid,
+    group: getRegisteredGroup(mount.channel_jid),
+  }));
+  const linkedByJid = new Map<string, { jid: string; name: string }>();
+  for (const { jid: imJid, group: imGroup } of legacyLinkedImGroups) {
+    linkedByJid.set(imJid, { jid: imJid, name: imGroup.name });
+  }
+  for (const { jid: imJid, group: imGroup } of mountedImGroups) {
+    linkedByJid.set(imJid, { jid: imJid, name: imGroup?.name ?? imJid });
+  }
+  const linkedImGroups = Array.from(linkedByJid.values());
+  if (linkedImGroups.length > 0) {
+    return c.json(
+      {
+        error:
+          'Session has active IM bindings. Unbind all IM groups before deleting.',
+        linked_im_groups: linkedImGroups,
+      },
+      409,
+    );
+  }
+
+  const threadBindings = listImContextBindingsByAgent(sessionId);
+  if (threadBindings.length > 0) {
+    return c.json(
+      {
+        error:
+          'Session is managed by a thread-mapped IM channel. Unbind the workspace channel before deleting.',
+        linked_im_groups: threadBindings.map((binding) => {
+          const imGroup = getRegisteredGroup(binding.source_jid);
+          return {
+            jid: binding.source_jid,
+            name: imGroup?.name ?? binding.source_jid,
+            context_id: binding.context_id,
+          };
+        }),
+      },
+      409,
+    );
+  }
+
+  if (session.status === 'running' || session.status === 'idle') {
+    updateAgentStatus(sessionId, 'error', '用户手动停止');
+    const deps = getWebDeps();
+    if (deps) deps.queue.stopGroup(`${jid}#agent:${sessionId}`);
+  }
+
+  for (const dir of [
+    path.join(DATA_DIR, 'ipc', group.folder, 'agents', sessionId),
+    path.join(DATA_DIR, 'sessions', group.folder, 'agents', sessionId),
+  ]) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  deleteMessagesForChatJid(`${jid}#agent:${sessionId}`);
+  deleteSession(group.folder, sessionId);
+  deleteAgent(sessionId);
+
+  const { broadcastAgentRemoved } = await import('../web.js');
+  broadcastAgentRemoved(jid, sessionId, session.name);
+
+  logger.info({ sessionId, jid, userId: user.id }, 'Session deleted by user');
+  return c.json({ success: true });
+});
 
 function isThreadCapableFeishuGroup(info?: {
   channel_type?: string;
   chat_mode?: string;
   group_message_type?: string;
 }): boolean {
-  if (!info || info.channel_type !== 'feishu') return false;
-  return (
-    info.chat_mode === 'topic' || info.group_message_type === 'thread'
-  );
+  return isThreadMapCapableChat(info);
 }
 
 // GET /api/groups/:jid/im-groups — list available IM group chats for this folder
@@ -440,20 +793,21 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
 
   // Find all IM groups this user can access (across all folders).
   const allGroups = getAllRegisteredGroups();
-  const imJids = Object.keys(allGroups)
-    .filter((j) => {
-      if (j.startsWith('web:')) return false;
-      return canAccessGroup(user, { ...allGroups[j], jid: j });
-    })
-    .filter((j) => !isTelegramPrivateChat(j));
+  const imJids = Object.keys(allGroups).filter((j) => {
+    if (j.startsWith('web:')) return false;
+    return canAccessGroup(user, { ...allGroups[j], jid: j });
+  });
 
   // Build candidate list
   interface ImGroupCandidate {
     jid: string;
     name: string;
     bound_agent_id: string | null;
+    bound_session_id: string | null;
     bound_main_jid: string | null;
+    bound_workspace_jid: string | null;
     binding_mode: 'single_context' | 'thread_map';
+    routing_mode: 'single_session' | 'thread_map';
     reply_policy: 'source_only' | 'mirror';
     bound_target_name: string | null;
     bound_workspace_name: string | null;
@@ -502,8 +856,11 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
       jid: j,
       name: g.name,
       bound_agent_id: g.target_agent_id ?? null,
+      bound_session_id: g.target_agent_id ?? null,
       bound_main_jid: g.target_main_jid ?? null,
+      bound_workspace_jid: g.target_main_jid ?? null,
       binding_mode: g.binding_mode ?? 'single_context',
+      routing_mode: g.binding_mode === 'thread_map' ? 'thread_map' : 'single_session',
       reply_policy: g.reply_policy === 'mirror' ? 'mirror' : 'source_only',
       bound_target_name: boundTargetName,
       bound_workspace_name: boundWorkspaceName,
@@ -556,7 +913,267 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
   return c.json({ imGroups: candidates });
 });
 
-// PUT /api/groups/:jid/agents/:agentId/im-binding — bind an IM group to this agent
+// PUT /api/groups/:jid/sessions/:sessionId/im-binding — bind an IM group to a workspace session
+router.put('/:jid/sessions/:sessionId/im-binding', authMiddleware, async (c) => {
+  const jid = decodeURIComponent(c.req.param('jid'));
+  const sessionId = c.req.param('sessionId');
+  const user = c.get('user');
+
+  const group = getRegisteredGroup(jid);
+  if (!group) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (!canAccessGroup(user, { ...group, jid })) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (!canModifyGroup(user, { ...group, jid })) {
+    return c.json(
+      { error: 'Only the workspace owner can manage IM bindings' },
+      403,
+    );
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const imJid = typeof body.im_jid === 'string' ? body.im_jid.trim() : '';
+  if (!imJid) {
+    return c.json({ error: 'im_jid is required' }, 400);
+  }
+
+  const imGroup = getRegisteredGroup(imJid);
+  if (!imGroup) {
+    return c.json({ error: 'IM group not found' }, 404);
+  }
+  if (!canModifyGroup(user, { ...imGroup, jid: imJid })) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const force = body.force === true;
+  const replyPolicy =
+    body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
+
+  if (sessionId !== 'main') {
+    const session = getAgent(sessionId);
+    if (!session || session.chat_jid !== jid || session.kind !== 'conversation') {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+    const { threadCapable } = await checkFeishuThreadCapable(user.id, imJid, imGroup);
+    if (threadCapable) {
+      return c.json(
+        {
+          error:
+            'Feishu topic/thread groups can only bind to a workspace, not a single session',
+        },
+        400,
+      );
+    }
+    const hasConflict =
+      (imGroup.target_agent_id && imGroup.target_agent_id !== sessionId) ||
+      !!imGroup.target_main_jid;
+    if (hasConflict && !force) {
+      return c.json({ error: 'IM group is already bound elsewhere' }, 409);
+    }
+
+    const updated = buildSessionMountUpdate(imGroup, sessionId, {
+      replyPolicy,
+    });
+    setRegisteredGroup(imJid, updated);
+    const deps = getWebDeps();
+    if (deps) {
+      const groups = deps.getRegisteredGroups();
+      if (groups[imJid]) groups[imJid] = updated;
+    }
+    logger.info(
+      { imJid, sessionId, userId: user.id },
+      'IM group bound to workspace session',
+    );
+    return c.json({ success: true });
+  }
+
+  const { threadCapable, feishuInfo } = await checkFeishuThreadCapable(
+    user.id,
+    imJid,
+    imGroup,
+  );
+  const targetMainJid = jid;
+  const legacyMainJid = `web:${group.folder}`;
+  const hasConflict =
+    !!imGroup.target_agent_id ||
+    (imGroup.target_main_jid &&
+      imGroup.target_main_jid !== targetMainJid &&
+      imGroup.target_main_jid !== legacyMainJid);
+  if (hasConflict && !force) {
+    return c.json({ error: 'IM group is already bound elsewhere' }, 409);
+  }
+  if (group.conversation_source === 'feishu_thread' && !threadCapable) {
+    return c.json(
+      { error: 'Topic workspaces only accept Feishu topic/thread group bindings' },
+      400,
+    );
+  }
+  if (threadCapable) {
+    const currentThreadMap = Object.entries(getAllRegisteredGroups()).find(
+      ([otherJid, otherGroup]) =>
+        otherJid !== imJid &&
+        otherGroup.binding_mode === 'thread_map' &&
+        (otherGroup.target_main_jid === targetMainJid ||
+          otherGroup.target_main_jid === legacyMainJid),
+    );
+    if (currentThreadMap) {
+      return c.json(
+        { error: 'Workspace already has a Feishu topic group binding' },
+        409,
+      );
+    }
+  }
+
+  const validActivationModes = [
+    'always',
+    'when_mentioned',
+    'owner_mentioned',
+    'auto',
+    'disabled',
+  ] as const;
+  const rawActivationMode = body.activation_mode;
+  const activationMode =
+    typeof rawActivationMode === 'string' &&
+    validActivationModes.includes(
+      rawActivationMode as (typeof validActivationModes)[number],
+    )
+      ? (rawActivationMode as (typeof validActivationModes)[number])
+      : undefined;
+  const ownerImId =
+    typeof body.owner_im_id === 'string' && body.owner_im_id.trim()
+      ? body.owner_im_id.trim()
+      : undefined;
+
+  const updated: RegisteredGroup = {
+    ...buildWorkspaceMountUpdate(
+      imGroup,
+      targetMainJid,
+      threadCapable ? 'thread_map' : 'single_session',
+      {
+        replyPolicy,
+        ...(activationMode !== undefined ? { activationMode } : {}),
+        ...(ownerImId !== undefined ? { ownerImId } : {}),
+      },
+    ),
+    feishu_chat_mode: feishuInfo?.chat_mode ?? imGroup.feishu_chat_mode,
+    feishu_group_message_type:
+      feishuInfo?.group_message_type ?? imGroup.feishu_group_message_type,
+  };
+  setRegisteredGroup(imJid, updated);
+  const deps = getWebDeps();
+  if (deps) {
+    const groups = deps.getRegisteredGroups();
+    if (groups[imJid]) groups[imJid] = updated;
+  }
+  if (threadCapable) {
+    updateWorkspaceGroup(jid, {
+      ...group,
+      conversation_source: 'feishu_thread',
+      conversation_nav_mode: 'vertical_threads',
+    });
+  }
+
+  logger.info(
+    { imJid, targetMainJid, threadCapable, userId: user.id },
+    'IM group bound to workspace main session',
+  );
+  return c.json({ success: true });
+});
+
+// DELETE /api/groups/:jid/sessions/:sessionId/im-binding/:imJid — unbind an IM group from a session
+router.delete(
+  '/:jid/sessions/:sessionId/im-binding/:imJid',
+  authMiddleware,
+  async (c) => {
+    const jid = decodeURIComponent(c.req.param('jid'));
+    const sessionId = c.req.param('sessionId');
+    const imJid = decodeURIComponent(c.req.param('imJid'));
+    const user = c.get('user');
+
+    const group = getRegisteredGroup(jid);
+    if (!group) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+    if (!canAccessGroup(user, { ...group, jid })) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+    if (!canModifyGroup(user, { ...group, jid })) {
+      return c.json(
+        { error: 'Only the workspace owner can manage IM bindings' },
+        403,
+      );
+    }
+
+    const imGroup = getRegisteredGroup(imJid);
+    if (!imGroup) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    if (!canModifyGroup(user, { ...imGroup, jid: imJid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+
+    if (sessionId !== 'main') {
+      const session = getAgent(sessionId);
+      if (!session || session.chat_jid !== jid || session.kind !== 'conversation') {
+        return c.json({ error: 'Session not found' }, 404);
+      }
+      if (imGroup.target_agent_id !== sessionId) {
+        return c.json({ error: 'IM group is not bound to this session' }, 400);
+      }
+      const updated = buildUnmountUpdate(imGroup);
+      setRegisteredGroup(imJid, updated);
+      const deps = getWebDeps();
+      if (deps) {
+        const groups = deps.getRegisteredGroups();
+        if (groups[imJid]) groups[imJid] = updated;
+      }
+      updateAgentLastImJid(sessionId, null);
+      logger.info(
+        { imJid, sessionId, userId: user.id },
+        'IM group unbound from workspace session',
+      );
+      return c.json({ success: true });
+    }
+
+    const targetMainJid = jid;
+    const legacyMainJid = `web:${group.folder}`;
+    if (
+      imGroup.target_main_jid !== targetMainJid &&
+      imGroup.target_main_jid !== legacyMainJid
+    ) {
+      return c.json({ error: 'IM group is not bound to this workspace' }, 400);
+    }
+    const updated = buildUnmountUpdate(imGroup, { resetActivation: true });
+    setRegisteredGroup(imJid, updated);
+    const deps = getWebDeps();
+    if (deps) {
+      const groups = deps.getRegisteredGroups();
+      if (groups[imJid]) groups[imJid] = updated;
+    }
+    if (imGroup.binding_mode === 'thread_map') {
+      const threadAgentIds = listFeishuThreadAgentIds(jid);
+      for (const threadAgentId of threadAgentIds) {
+        deleteAgent(threadAgentId);
+      }
+      deleteImContextBindingsByWorkspace(jid);
+      updateWorkspaceGroup(jid, {
+        ...group,
+        conversation_source: 'manual',
+        conversation_nav_mode: 'horizontal',
+      });
+    }
+
+    logger.info(
+      { imJid, targetMainJid, userId: user.id },
+      'IM group unbound from workspace main session',
+    );
+    return c.json({ success: true });
+  },
+);
+
+// PUT /api/groups/:jid/agents/:agentId/im-binding — bind an IM group to this workspace session
 router.put('/:jid/agents/:agentId/im-binding', authMiddleware, async (c) => {
   const jid = decodeURIComponent(c.req.param('jid'));
   const agentId = c.req.param('agentId');
@@ -581,11 +1198,11 @@ router.put('/:jid/agents/:agentId/im-binding', authMiddleware, async (c) => {
 
   const agent = getAgent(agentId);
   if (!agent || agent.chat_jid !== jid) {
-    return c.json({ error: 'Agent not found' }, 404);
+    return c.json({ error: 'Session not found' }, 404);
   }
   if (agent.kind !== 'conversation') {
     return c.json(
-      { error: 'Only conversation agents can bind IM groups' },
+      { error: 'Only workspace sessions can bind IM groups' },
       400,
     );
   }
@@ -608,7 +1225,7 @@ router.put('/:jid/agents/:agentId/im-binding', authMiddleware, async (c) => {
     return c.json(
       {
         error:
-          'Feishu topic/thread groups can only bind to a workspace, not a single conversation',
+          'Feishu topic/thread groups can only bind to a workspace, not a single session',
       },
       400,
     );
@@ -623,12 +1240,9 @@ router.put('/:jid/agents/:agentId/im-binding', authMiddleware, async (c) => {
   }
 
   // Update DB + in-memory cache — clear target_main_jid to avoid conflicts
-  const updated: RegisteredGroup = {
-    ...imGroup,
-    target_agent_id: agentId,
-    target_main_jid: undefined,
-    reply_policy: replyPolicy,
-  };
+  const updated: RegisteredGroup = buildSessionMountUpdate(imGroup, agentId, {
+    replyPolicy,
+  });
   setRegisteredGroup(imJid, updated);
   const webDeps = getWebDeps();
   if (webDeps) {
@@ -636,11 +1250,11 @@ router.put('/:jid/agents/:agentId/im-binding', authMiddleware, async (c) => {
     if (groups[imJid]) groups[imJid] = updated;
   }
 
-  logger.info({ imJid, agentId, userId: user.id }, 'IM group bound to agent');
+  logger.info({ imJid, sessionId: agentId, userId: user.id }, 'IM group bound to workspace session');
   return c.json({ success: true });
 });
 
-// DELETE /api/groups/:jid/agents/:agentId/im-binding/:imJid — unbind an IM group
+// DELETE /api/groups/:jid/agents/:agentId/im-binding/:imJid — unbind an IM group from this workspace session
 router.delete(
   '/:jid/agents/:agentId/im-binding/:imJid',
   authMiddleware,
@@ -667,7 +1281,7 @@ router.delete(
 
     const agent = getAgent(agentId);
     if (!agent || agent.chat_jid !== jid) {
-      return c.json({ error: 'Agent not found' }, 404);
+      return c.json({ error: 'Session not found' }, 404);
     }
 
     const imGroup = getRegisteredGroup(imJid);
@@ -678,11 +1292,11 @@ router.delete(
       return c.json({ error: 'Forbidden' }, 403);
     }
     if (imGroup.target_agent_id !== agentId) {
-      return c.json({ error: 'IM group is not bound to this agent' }, 400);
+      return c.json({ error: 'IM group is not bound to this session' }, 400);
     }
 
     // Update DB + in-memory cache
-    const updated = { ...imGroup, target_agent_id: undefined };
+    const updated = buildUnmountUpdate(imGroup);
     setRegisteredGroup(imJid, updated);
     const deps = getWebDeps();
     if (deps) {
@@ -694,8 +1308,8 @@ router.delete(
     updateAgentLastImJid(agentId, null);
 
     logger.info(
-      { imJid, agentId, userId: user.id },
-      'IM group unbound from agent',
+      { imJid, sessionId: agentId, userId: user.id },
+      'IM group unbound from workspace session',
     );
     return c.json({ success: true });
   },
@@ -721,13 +1335,6 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
       403,
     );
   }
-  if (group.is_home) {
-    return c.json(
-      { error: 'Home workspace main conversation uses default IM routing' },
-      400,
-    );
-  }
-
   const body = await c.req.json().catch(() => ({}));
   const imJid = typeof body.im_jid === 'string' ? body.im_jid.trim() : '';
   if (!imJid) {
@@ -809,18 +1416,19 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
 
   // Update DB + in-memory cache — clear target_agent_id to avoid conflicts
   const updated: RegisteredGroup = {
-    ...imGroup,
-    target_main_jid: targetMainJid,
-    target_agent_id: undefined,
-    binding_mode: threadCapable ? 'thread_map' : 'single_context',
+    ...buildWorkspaceMountUpdate(
+      imGroup,
+      targetMainJid,
+      threadCapable ? 'thread_map' : 'single_session',
+      {
+        ...(replyPolicy !== undefined ? { replyPolicy } : {}),
+        ...(activationMode !== undefined ? { activationMode } : {}),
+        ...(ownerImId !== undefined ? { ownerImId } : {}),
+      },
+    ),
     feishu_chat_mode: feishuInfo?.chat_mode ?? imGroup.feishu_chat_mode,
     feishu_group_message_type:
       feishuInfo?.group_message_type ?? imGroup.feishu_group_message_type,
-    ...(replyPolicy !== undefined ? { reply_policy: replyPolicy } : {}),
-    ...(activationMode !== undefined
-      ? { activation_mode: activationMode }
-      : {}),
-    ...(ownerImId !== undefined ? { owner_im_id: ownerImId } : {}),
   };
   setRegisteredGroup(imJid, updated);
   const deps = getWebDeps();
@@ -887,12 +1495,7 @@ router.delete('/:jid/im-binding/:imJid', authMiddleware, async (c) => {
   }
 
   // Update DB + in-memory cache — reset activation_mode to 'auto' on unbind
-  const updated = {
-    ...imGroup,
-    target_main_jid: undefined,
-    activation_mode: 'auto' as const,
-    binding_mode: 'single_context' as const,
-  };
+  const updated = buildUnmountUpdate(imGroup, { resetActivation: true });
   setRegisteredGroup(imJid, updated);
   const deps = getWebDeps();
   if (deps) {

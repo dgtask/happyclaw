@@ -21,9 +21,8 @@ import { GroupMembersPanel } from './GroupMembersPanel';
 import { WorkspaceSkillsPanel } from './WorkspaceSkillsPanel';
 import { WorkspaceMcpPanel } from './WorkspaceMcpPanel';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
-import { AgentTabBar } from './AgentTabBar';
 import { ImBindingDialog } from './ImBindingDialog';
-import { TopicSidebar } from './TopicSidebar';
+import { SessionSidebar } from './SessionSidebar';
 import { showToast } from '../../utils/toast';
 import { getWorkspaceLastAgent, setWorkspaceLastAgent } from '../../utils/workspaceLastAgent';
 import { CHANNEL_LABEL } from '../settings/channel-meta';
@@ -74,11 +73,6 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const [bindingAgentId, setBindingAgentId] = useState<string | null>(null);
   const [renameTarget, setRenameTarget] = useState<{ agentId: string; name: string } | null>(null);
   const [topicFilter, setTopicFilter] = useState('');
-  const [isDesktop, setIsDesktop] = useState(() =>
-    typeof window !== 'undefined'
-      ? window.matchMedia('(min-width: 1024px)').matches
-      : true,
-  );
   const [imStatus, setImStatus] = useState<Record<string, boolean> | null>(null);
   const [imBannerDismissed, setImBannerDismissed] = useState(() =>
     localStorage.getItem('im-banner-dismissed') === '1',
@@ -131,7 +125,6 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const agentStreaming = useChatStore(s => s.agentStreaming);
   const createConversation = useChatStore(s => s.createConversation);
   const renameConversation = useChatStore(s => s.renameConversation);
-  const reorderConversations = useChatStore(s => s.reorderConversations);
   const loadAgentMessages = useChatStore(s => s.loadAgentMessages);
   const hydrateAgentMessages = useChatStore(s => s.hydrateAgentMessages);
   const refreshAgentMessages = useChatStore(s => s.refreshAgentMessages);
@@ -264,7 +257,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const isTopicWorkspace =
     group?.conversation_nav_mode === 'vertical_threads' ||
     agents.some((a) => a.source_kind === 'feishu_thread');
-  const topicAgents = useMemo(() =>
+  const conversationAgents = useMemo(() =>
     agents
       .filter((a) => a.kind === 'conversation')
       .slice()
@@ -275,8 +268,8 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
       }),
     [agents],
   );
-  const filteredTopicAgents = useMemo(() =>
-    topicAgents.filter((agent) => {
+  const filteredSessionAgents = useMemo(() =>
+    conversationAgents.filter((agent) => {
       const q = topicFilter.trim().toLowerCase();
       if (!q) return true;
       return (
@@ -284,7 +277,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         (agent.latest_message?.content || '').toLowerCase().includes(q)
       );
     }),
-    [topicAgents, topicFilter],
+    [conversationAgents, topicFilter],
   );
   // SDK Tasks 不再创建独立标签页，事件直接显示在主对话流式卡片中
 
@@ -340,26 +333,6 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   useEffect(() => {
     setTopicFilter('');
   }, [groupJid]);
-
-  useEffect(() => {
-    const media = window.matchMedia('(min-width: 1024px)');
-    const syncDesktop = () => setIsDesktop(media.matches);
-    syncDesktop();
-    media.addEventListener('change', syncDesktop);
-    return () => media.removeEventListener('change', syncDesktop);
-  }, []);
-
-  useEffect(() => {
-    if (!isTopicWorkspace || !isDesktop || activeAgentTab || filteredTopicAgents.length === 0) return;
-    selectTab(filteredTopicAgents[0].id);
-  }, [isTopicWorkspace, isDesktop, activeAgentTab, filteredTopicAgents, selectTab]);
-
-  useEffect(() => {
-    if (!isTopicWorkspace || !activeAgentTab) return;
-    const existsInTopics = topicAgents.some((agent) => agent.id === activeAgentTab);
-    if (existsInTopics) return;
-    selectTab(isDesktop && topicAgents[0] ? topicAgents[0].id : null);
-  }, [isTopicWorkspace, activeAgentTab, topicAgents, isDesktop, selectTab]);
 
   // Load messages for conversation agent tabs.
   // hydrate-then-calibrate: 先把 IndexedDB 快照灌回 store（避免首屏回退），
@@ -531,13 +504,8 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   };
 
   const handleBackAction = () => {
-    if (isTopicWorkspace && !isDesktop && activeAgentTab) {
-      selectTab(null);
-      return;
-    }
     onBack?.();
   };
-  const showTopicListOnlyMobile = isTopicWorkspace && !isDesktop && !activeAgentTab;
 
   if (!group) {
     return (
@@ -550,7 +518,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   }
 
   return (
-    <div ref={containerRef} className="h-full flex flex-col bg-surface dark:bg-background max-lg:rounded-none lg:rounded-t-2xl lg:rounded-b-none lg:mr-5 lg:ml-3 lg:overflow-hidden">
+    <div ref={containerRef} data-hc-chat-view className="h-full flex flex-col bg-surface dark:bg-background max-lg:rounded-none lg:rounded-t-2xl lg:rounded-b-none lg:mr-5 lg:ml-3 lg:overflow-hidden">
       {/* Header */}
       <div className="flex items-center gap-3 px-6 py-4 max-lg:px-4 max-lg:py-2.5 max-lg:bg-background/60 max-lg:backdrop-blur-xl max-lg:saturate-[1.8] max-lg:border-border/40">
         {onBack && (
@@ -643,7 +611,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
       {isOwnHome && imStatus && !Object.values(imStatus).some(Boolean) && !imBannerDismissed && (
         <div className="flex items-center gap-2 px-4 py-2 bg-amber-50 dark:bg-amber-950/40 border-b border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300 text-sm">
           <Link className="w-4 h-4 flex-shrink-0" />
-          <span className="flex-1 min-w-0">未配置 IM 渠道（飞书 / Telegram / Discord / QQ / 微信 / 钉钉），消息无法与主工作区互通</span>
+          <span className="flex-1 min-w-0">未配置 IM 渠道（飞书 / Telegram / Discord / QQ / 微信 / 钉钉 / WhatsApp），消息无法与默认 Agent 的主会话互通</span>
           <button
             onClick={() => navigate('/setup/channels')}
             className="flex-shrink-0 px-3 py-1 text-xs font-medium rounded-md bg-amber-600 text-white hover:bg-amber-700 transition-colors cursor-pointer"
@@ -663,109 +631,45 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         </div>
       )}
 
-      {!isTopicWorkspace && (
-        <AgentTabBar
-          agents={agents}
-          activeTab={activeAgentTab}
-          canModify={canModifyWorkspaceConfig}
-          onSelectTab={(id) => selectTab(id)}
-          onDeleteAgent={(id) => {
-            const agent = agents.find((a) => a.id === id);
-            if (agent?.linked_im_groups && agent.linked_im_groups.length > 0) {
-              const names = agent.linked_im_groups.map((g) => g.name).join('、');
-              alert(`该对话已绑定 IM 渠道（${names}），请先解绑后再删除。`);
-              setBindingAgentId(id);
-              return;
-            }
-            deleteAgentAction(groupJid, id);
-          }}
-          onRenameAgent={(id, currentName) => setRenameTarget({ agentId: id, name: currentName })}
-          onCreateConversation={() => {
-            createConversation(groupJid, '').then((agent) => {
-              if (agent) selectTab(agent.id);
-            });
-          }}
-          onBindIm={setBindingAgentId}
-          onBindMainIm={!isHome ? () => setBindingAgentId(MAIN_BINDING) : undefined}
-          onReorder={(orderedIds) => reorderConversations(groupJid, orderedIds)}
-        />
-      )}
-
       {/* Main Content: Messages + Sidebar */}
       <div className="flex-1 flex overflow-hidden min-h-0">
+        <div className="hidden w-56 shrink-0 border-r border-border/80 bg-background/35 lg:flex xl:w-60">
+          <SessionSidebar
+            sessions={filteredSessionAgents}
+            activeSessionId={activeAgentTab}
+            canModify={canModifyWorkspaceConfig}
+            isTopicWorkspace={isTopicWorkspace}
+            filter={topicFilter}
+            onFilterChange={setTopicFilter}
+            onSelectSession={(id) => selectTab(id)}
+            onCreateSession={() => {
+              createConversation(groupJid, '').then((agent) => {
+                if (agent) selectTab(agent.id);
+              });
+            }}
+            onRenameSession={(id, currentName) => setRenameTarget({ agentId: id, name: currentName })}
+            onDeleteSession={(id) => {
+              const agent = agents.find((a) => a.id === id);
+              if (agent?.linked_im_groups && agent.linked_im_groups.length > 0) {
+                const names = agent.linked_im_groups.map((g) => g.name).join('、');
+                alert(`该会话已绑定 IM 渠道（${names}），请先解绑后再删除。`);
+                setBindingAgentId(id);
+                return;
+              }
+              deleteAgentAction(groupJid, id).then((ok) => {
+                if (!ok) {
+                  alert(useChatStore.getState().error || '删除会话失败');
+                }
+              });
+            }}
+            onBindSession={setBindingAgentId}
+            onBindMain={() => setBindingAgentId(MAIN_BINDING)}
+          />
+        </div>
+
         {/* Messages Area */}
         <div className="flex-1 flex flex-col min-w-0 overflow-x-hidden">
-          {isTopicWorkspace ? (
-            <div className="flex flex-1 min-h-0">
-              <div className={cn(
-                'border-r border-border bg-muted/20 lg:w-80 lg:flex lg:flex-col',
-                showTopicListOnlyMobile ? 'flex flex-1 flex-col' : 'hidden',
-              )}>
-                <TopicSidebar
-                  topicAgents={filteredTopicAgents}
-                  activeAgentTab={activeAgentTab}
-                  canModify={canModifyWorkspaceConfig}
-                  onSelectAgent={(id) => selectTab(id)}
-                  onDeleteAgent={(id) => deleteAgentAction(groupJid, id)}
-                  topicFilter={topicFilter}
-                  onFilterChange={setTopicFilter}
-                  emptyCount={topicAgents.length}
-                />
-              </div>
-
-              <div className={cn('flex-1 min-w-0 flex-col', showTopicListOnlyMobile ? 'hidden' : 'flex')}>
-                {activeAgentTab && isConversationTab ? (
-                  <>
-                    {!isDesktop && (
-                      <div className="flex items-center gap-2 border-b border-border px-4 py-2.5">
-                        <button
-                          onClick={() => selectTab(null)}
-                          className="rounded-lg p-2 text-muted-foreground transition-colors hover:bg-muted cursor-pointer"
-                          aria-label="返回话题列表"
-                        >
-                          <ArrowLeft className="h-4 w-4" />
-                        </button>
-                        <div className="min-w-0">
-                          <div className="truncate text-sm font-medium text-foreground">{activeAgent?.name}</div>
-                          <div className="text-xs text-muted-foreground">飞书话题上下文</div>
-                        </div>
-                      </div>
-                    )}
-                    <MessageList
-                      key={`conv-${activeAgentTab}`}
-                      messages={agentMessages[activeAgentTab] || []}
-                      loading={false}
-                      hasMore={!!agentHasMore[activeAgentTab]}
-                      onLoadMore={() => loadAgentMessages(groupJid, activeAgentTab, true)}
-                      scrollTrigger={scrollTrigger}
-                      groupJid={groupJid}
-                      isWaiting={!!agentWaiting[activeAgentTab] || !!agentStreaming[activeAgentTab]}
-                      onInterrupt={agentStreaming[activeAgentTab]?.interrupted ? undefined : () => interruptQuery(`${groupJid}#agent:${activeAgentTab}`)}
-                      agentId={activeAgentTab}
-                    />
-                    <MessageInput
-                      onSend={(content, attachments) => {
-                        const ok = sendAgentMessage(groupJid, activeAgentTab, content, attachments);
-                        if (ok) setScrollTrigger(n => n + 1);
-                        return ok;
-                      }}
-                      groupJid={groupJid}
-                      onResetSession={canModifyWorkspaceConfig ? () => { setResetAgentId(activeAgentTab); setShowResetConfirm(true); } : undefined}
-                    />
-                  </>
-                ) : (
-                  <div className="flex flex-1 items-center justify-center bg-background px-6 text-center">
-                    <div>
-                      <div className="text-sm font-medium text-foreground">选择一个飞书话题</div>
-                      <div className="mt-2 text-sm text-muted-foreground">
-                        左侧列表按最近活跃排序，进入后可继续在对应飞书话题里同步对话。
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          ) : activeAgentTab && isConversationTab ? (
+          {activeAgentTab && isConversationTab ? (
             <>
               <MessageList
                 key={`conv-${activeAgentTab}`}
@@ -1057,7 +961,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         title="清除上下文"
         message={resetAgentId
           ? '将清除该子对话的 Claude 会话上下文，下次发送消息时将开始全新会话。聊天记录不受影响。'
-          : '将清除主会话的 Claude 上下文并停止运行中的主工作区进程，下次发送消息时将开始全新会话。聊天记录和子对话不受影响。'
+          : '将清除主会话的 Claude 上下文并停止运行中的默认 Agent 进程，下次发送消息时将开始全新会话。聊天记录和子对话不受影响。'
         }
         confirmText="清除"
         confirmVariant="danger"

@@ -5,6 +5,7 @@ export const CHANNEL_LABEL: Record<string, string> = {
   wechat: '微信',
   dingtalk: '钉钉',
   discord: 'Discord',
+  whatsapp: 'WhatsApp',
 };
 
 export const CHANNEL_COLORS: Record<string, string> = {
@@ -14,6 +15,7 @@ export const CHANNEL_COLORS: Record<string, string> = {
   wechat: 'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300',
   dingtalk: 'bg-cyan-100 dark:bg-cyan-900/40 text-cyan-700 dark:text-cyan-300',
   discord: 'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300',
+  whatsapp: 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300',
 };
 
 const FeishuIcon = () => (
@@ -53,6 +55,12 @@ const DiscordIcon = () => (
   </svg>
 );
 
+const WhatsAppIcon = () => (
+  <svg viewBox="0 0 24 24" className="w-3 h-3" fill="currentColor">
+    <path d="M12.04 2C6.58 2 2.14 6.34 2.14 11.69c0 1.83.52 3.6 1.51 5.13L2 22l5.34-1.39a10.16 10.16 0 0 0 4.7 1.17h.01c5.45 0 9.89-4.35 9.89-9.69C21.94 6.34 17.5 2 12.04 2zm5.83 13.84c-.25.68-1.45 1.3-2.04 1.38-.52.08-1.18.11-1.91-.12-.44-.14-1.01-.33-1.74-.64-3.05-1.29-5.04-4.27-5.19-4.47-.15-.2-1.24-1.63-1.24-3.11s.79-2.21 1.07-2.51c.28-.3.61-.38.81-.38h.59c.18.01.44-.07.69.52.25.59.84 2.03.91 2.18.07.15.12.33.02.53-.1.2-.15.32-.3.49-.15.17-.32.38-.46.51-.15.15-.31.31-.13.6.18.3.8 1.3 1.72 2.1 1.18 1.03 2.17 1.35 2.48 1.5.31.15.49.13.67-.08.18-.2.77-.89.98-1.2.2-.3.41-.25.69-.15.28.1 1.78.83 2.08.98.31.15.51.23.59.36.07.13.07.75-.18 1.43z" />
+  </svg>
+);
+
 export const CHANNEL_ICON: Record<string, React.FC> = {
   feishu: FeishuIcon,
   telegram: TelegramIcon,
@@ -60,6 +68,7 @@ export const CHANNEL_ICON: Record<string, React.FC> = {
   wechat: WeChatIcon,
   dingtalk: DingTalkIcon,
   discord: DiscordIcon,
+  whatsapp: WhatsAppIcon,
 };
 
 /**

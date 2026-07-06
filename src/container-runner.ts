@@ -220,6 +220,14 @@ export interface ContainerInput {
    * outputs can be attributed back to the task record. */
   messageTaskId?: string;
   images?: Array<{ data: string; mimeType?: string }>;
+  agentProfile?: {
+    id: string;
+    name: string;
+    version: number;
+    identityHash: string;
+    identityPrompt: string;
+    includeClaudePreset: boolean;
+  };
   agentId?: string;
   agentName?: string;
   /**

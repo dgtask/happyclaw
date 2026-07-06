@@ -1,4 +1,4 @@
-import { MoreHorizontal, Pencil, Trash2, RotateCcw, Star, Pin, Timer } from 'lucide-react';
+import { Bot, MoreHorizontal, Pencil, Trash2, RotateCcw, Pin, Timer } from 'lucide-react';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -74,7 +74,7 @@ export function ChatGroupItem({
       >
         <div className="flex items-center gap-1.5 min-w-0">
           {isHome && (
-            <Star className="w-3.5 h-3.5 text-yellow-500 fill-yellow-500 flex-shrink-0" />
+            <Bot className="w-3.5 h-3.5 text-primary flex-shrink-0" />
           )}
           {isPinned && !isHome && (
             <Pin className="w-3 h-3 text-primary flex-shrink-0" />

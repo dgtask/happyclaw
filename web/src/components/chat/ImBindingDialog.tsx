@@ -18,7 +18,7 @@ import { ACTIVATION_MODE_OPTIONS } from '../../constants/im';
 interface ImBindingDialogProps {
   open: boolean;
   groupJid: string;
-  /** agentId for conversation agent binding; null for main conversation binding */
+  /** session id for workspace-session binding; null for main session binding */
   agentId: string | null;
   agent?: AgentInfo;
   onClose: () => void;
@@ -79,14 +79,14 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
 
   const isBoundToThis = (group: AvailableImGroup): boolean => {
     if (isMainMode) {
-      return group.bound_main_jid === groupJid;
+      return (group.bound_workspace_jid ?? group.bound_main_jid) === groupJid;
     }
-    return group.bound_agent_id === agentId;
+    return (group.bound_session_id ?? group.bound_agent_id) === agentId;
   };
 
   const isBoundToOther = (group: AvailableImGroup): boolean => {
     if (isBoundToThis(group)) return false;
-    return !!group.bound_agent_id || !!group.bound_main_jid;
+    return !!(group.bound_session_id ?? group.bound_agent_id) || !!(group.bound_workspace_jid ?? group.bound_main_jid);
   };
 
   const reloadGroups = async () => {
@@ -152,13 +152,13 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
   }, [groupJid, bindMainImGroup]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const describeBindTarget = (group: AvailableImGroup): string => {
-    if (group.bound_agent_id && group.bound_target_name) {
+    if ((group.bound_session_id ?? group.bound_agent_id) && group.bound_target_name) {
       return group.bound_workspace_name && group.bound_workspace_name !== group.bound_target_name
-        ? `Agent「${group.bound_workspace_name} / ${group.bound_target_name}」`
-        : `Agent「${group.bound_target_name}」`;
+        ? `会话「${group.bound_workspace_name} / ${group.bound_target_name}」`
+        : `会话「${group.bound_target_name}」`;
     }
     if (group.bound_main_jid && group.bound_target_name) {
-      return `工作区「${group.bound_target_name}」`;
+      return `工作区「${group.bound_target_name} / 主会话」`;
     }
     return '其他对话';
   };
@@ -188,8 +188,8 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
   };
 
   const title = isMainMode
-    ? '绑定 IM 渠道 — 主对话'
-    : `绑定 IM 渠道${agent ? ` — ${agent.name}` : ''}`;
+    ? '绑定 IM 渠道 — 主会话'
+    : `绑定 IM 渠道${agent ? ` — ${agent.name}` : ' — 当前会话'}`;
 
   const renderThreadCapability = (group: AvailableImGroup) => {
     if (!group.is_thread_capable) return null;
@@ -236,9 +236,9 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
 
           {!loading && imGroups.length === 0 && (
             <div className="text-center py-8 text-muted-foreground text-sm">
-              暂无群聊可绑定。请先在飞书/Telegram/Discord 群中向 Bot 发送消息，群聊会自动出现在此列表中。
+              暂无可绑定的消息通道。请先在飞书、Telegram、Discord、QQ、微信、钉钉或 WhatsApp 中向 Bot 发送消息，通道会自动出现在此列表中。
               <br />
-              <span className="text-xs opacity-70">私聊不支持绑定到子对话。</span>
+              <span className="text-xs opacity-70">普通群和私聊可绑定到会话；飞书话题群绑定到工作区后按话题自动分会话。</span>
             </div>
           )}
 
@@ -253,7 +253,7 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
               const boundToThis = isBoundToThis(group);
               const boundToOther = isBoundToOther(group);
               const isActioning = actionLoading === group.jid;
-              const cannotBindToAgent = !isMainMode && !!group.is_thread_capable;
+              const cannotBindToSession = !isMainMode && !!group.is_thread_capable;
               const supportsActivation = isMainMode && (group.channel_type === 'feishu' || group.channel_type === 'dingtalk');
               const effectiveMode = (activationModes[group.jid] || group.activation_mode || 'auto') as string;
 
@@ -297,7 +297,7 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
                       )}
                       {boundToOther && (
                         <span className="text-amber-500 truncate">
-                          已绑定{group.bound_agent_id ? ' Agent' : ''}
+                          已绑定{(group.bound_session_id ?? group.bound_agent_id) ? '会话' : '主会话'}
                           {group.bound_target_name && `「${
                             group.bound_workspace_name && group.bound_workspace_name !== group.bound_target_name
                               ? `${group.bound_workspace_name} / ${group.bound_target_name}`
@@ -306,9 +306,9 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
                         </span>
                       )}
                     </div>
-                    {cannotBindToAgent && (
+                    {cannotBindToSession && (
                       <div className="mt-1 text-[11px] text-muted-foreground">
-                        该群会按飞书话题自动映射，只能绑定到工作区主对话。
+                        该群会按飞书话题自动映射，只能绑定到工作区。
                       </div>
                     )}
                   </div>
@@ -395,7 +395,7 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
                       )}
                       换绑
                     </Button>
-                  ) : cannotBindToAgent ? (
+                  ) : cannotBindToSession ? (
                     <Button
                       size="sm"
                       variant="outline"
@@ -431,7 +431,7 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
       onClose={() => setRebindTarget(null)}
       onConfirm={confirmRebind}
       title="确认换绑"
-      message={rebindTarget ? `该群组当前已绑定到${describeBindTarget(rebindTarget.group)}，确认换绑到当前${isMainMode ? '主对话' : 'Agent'}吗？` : ''}
+      message={rebindTarget ? `该通道当前已绑定到${describeBindTarget(rebindTarget.group)}，确认换绑到当前${isMainMode ? '主会话' : '会话'}吗？` : ''}
       confirmText="换绑"
     />
   </>

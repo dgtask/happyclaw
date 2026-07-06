@@ -199,3 +199,58 @@ describe('PATCH /:jid preserves owner fields on rename (regression)', () => {
     expect(after?.conversation_nav_mode).toBe('vertical_threads');
   });
 });
+
+describe('DELETE /:jid blocks channel_mounts-bound workspaces', () => {
+  const JID = 'web:mounted-delete-block';
+  const FOLDER = 'mounted-delete-block';
+  const IM_JID = 'telegram:mounted-delete-block';
+
+  beforeEach(() => {
+    db.setRegisteredGroup(JID, {
+      name: 'Mounted Workspace',
+      folder: FOLDER,
+      added_at: new Date().toISOString(),
+      executionMode: 'container',
+      created_by: OWNER_ID,
+      is_home: false,
+    } as any);
+    db.setRegisteredGroup(IM_JID, {
+      name: 'Mounted Telegram',
+      folder: 'owner-home',
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+    } as any);
+    db.upsertChannelMount({
+      channel_jid: IM_JID,
+      channel_type: 'telegram',
+      workspace_jid: JID,
+      session_id: null,
+      routing_mode: 'single_session',
+      reply_policy: 'source_only',
+      activation_mode: 'auto',
+      owner_im_id: null,
+    });
+  });
+
+  afterEach(() => {
+    for (const jid of [JID, IM_JID]) {
+      try {
+        db.deleteRegisteredGroup(jid);
+      } catch {
+        /* ignore */
+      }
+    }
+  });
+
+  test('owner gets 409 until mounted IM channel is unbound', async () => {
+    asUser(OWNER_ID, 'member');
+    const res = await groupRoutes.request(`/${encodeURIComponent(JID)}`, {
+      method: 'DELETE',
+    });
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.bound_main_im_groups).toEqual([
+      { jid: IM_JID, name: 'Mounted Telegram' },
+    ]);
+  });
+});

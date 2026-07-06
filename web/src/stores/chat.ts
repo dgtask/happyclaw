@@ -258,7 +258,7 @@ interface ChatState {
   resetSession: (jid: string, agentId?: string) => Promise<boolean>;
   clearHistory: (jid: string) => Promise<boolean>;
   deleteMessage: (jid: string, messageId: string) => Promise<boolean>;
-  createFlow: (name: string, options?: { execution_mode?: 'container' | 'host'; custom_cwd?: string; init_source_path?: string; init_git_url?: string }) => Promise<{ jid: string; folder: string } | null>;
+  createFlow: (name: string, options?: { execution_mode?: 'container' | 'host'; custom_cwd?: string; init_source_path?: string; init_git_url?: string; agent_profile_id?: string }) => Promise<{ jid: string; folder: string } | null>;
   renameFlow: (jid: string, name: string) => Promise<void>;
   togglePin: (jid: string) => Promise<void>;
   deleteFlow: (jid: string) => Promise<void>;
@@ -1573,13 +1573,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  createFlow: async (name: string, options?: { execution_mode?: 'container' | 'host'; custom_cwd?: string; init_source_path?: string; init_git_url?: string }) => {
+  createFlow: async (name: string, options?: { execution_mode?: 'container' | 'host'; custom_cwd?: string; init_source_path?: string; init_git_url?: string; agent_profile_id?: string }) => {
     try {
       const body: Record<string, string> = { name };
       if (options?.execution_mode) body.execution_mode = options.execution_mode;
       if (options?.custom_cwd) body.custom_cwd = options.custom_cwd;
       if (options?.init_source_path) body.init_source_path = options.init_source_path;
       if (options?.init_git_url) body.init_git_url = options.init_git_url;
+      if (options?.agent_profile_id) body.agent_profile_id = options.agent_profile_id;
 
       const needsLongTimeout = !!(options?.init_source_path || options?.init_git_url);
       const data = await api.post<{
@@ -1699,12 +1700,25 @@ export const useChatStore = create<ChatState>((set, get) => ({
       });
     } catch (err: unknown) {
       const apiErr = err as { status?: number; body?: Record<string, unknown>; message?: string };
-      if (apiErr.status === 409 && apiErr.body?.bound_agents) {
-        const e = new Error(apiErr.message || 'IM binding conflict') as Error & { boundAgents: unknown };
+      if (
+        apiErr.status === 409 &&
+        (apiErr.body?.bound_sessions ||
+          apiErr.body?.bound_agents ||
+          apiErr.body?.bound_main_im_groups)
+      ) {
+        const e = new Error(apiErr.message || 'IM binding conflict') as Error & {
+          boundSessions?: unknown;
+          boundAgents?: unknown;
+          boundMainImGroups?: unknown;
+        };
+        e.boundSessions = apiErr.body.bound_sessions;
         e.boundAgents = apiErr.body.bound_agents;
+        e.boundMainImGroups = apiErr.body.bound_main_im_groups;
         throw e;
       }
-      set({ error: apiErr.message || (err instanceof Error ? err.message : String(err)) });
+      const message = apiErr.message || (err instanceof Error ? err.message : String(err));
+      set({ error: message });
+      throw err;
     }
   },
 
@@ -2507,7 +2521,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   // 删除子 Agent
   deleteAgentAction: async (jid, agentId) => {
     try {
-      await api.delete(`/api/groups/${encodeURIComponent(jid)}/agents/${agentId}`);
+      await api.delete(`/api/groups/${encodeURIComponent(jid)}/sessions/${agentId}`);
       void deleteAgentMessageSnapshot(jid, agentId);
       clearSdkTaskCleanupTimer(agentId);
       clearSdkTaskStaleTimer(agentId);
@@ -2538,7 +2552,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         };
       });
       return true;
-    } catch {
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : '删除会话失败' });
       return false;
     }
   },
@@ -2568,17 +2583,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   createConversation: async (jid, name, description?) => {
     try {
-      const data = await api.post<{ agent: AgentInfo }>(
-        `/api/groups/${encodeURIComponent(jid)}/agents`,
+      const data = await api.post<{ session?: AgentInfo; agent?: AgentInfo }>(
+        `/api/groups/${encodeURIComponent(jid)}/sessions`,
         { name, description },
       );
+      const created = data.session ?? data.agent;
+      if (!created) throw new Error('创建会话失败');
       set((s) => {
         const existing = s.agents[jid] || [];
         // WS agent_status broadcast may have already added it
-        if (existing.some((a) => a.id === data.agent.id)) return s;
-        return { agents: { ...s.agents, [jid]: [...existing, data.agent] } };
+        if (existing.some((a) => a.id === created.id)) return s;
+        return { agents: { ...s.agents, [jid]: [...existing, created] } };
       });
-      return data.agent;
+      return created;
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
       return null;
@@ -2587,7 +2604,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   renameConversation: async (jid, agentId, name) => {
     try {
-      await api.patch(`/api/groups/${encodeURIComponent(jid)}/agents/${agentId}`, { name });
+      await api.patch(`/api/groups/${encodeURIComponent(jid)}/sessions/${agentId}`, { name });
       set((s) => {
         const agents = (s.agents[jid] || []).map((a) =>
           a.id === agentId ? { ...a, name } : a,
@@ -2746,7 +2763,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   bindImGroup: async (jid, agentId, imJid, force) => {
     try {
       await api.put(
-        `/api/groups/${encodeURIComponent(jid)}/agents/${agentId}/im-binding`,
+        `/api/groups/${encodeURIComponent(jid)}/sessions/${agentId}/im-binding`,
         { im_jid: imJid, ...(force ? { force: true } : {}) },
       );
       // Refresh agents to get updated linked_im_groups
@@ -2760,7 +2777,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   unbindImGroup: async (jid, agentId, imJid) => {
     try {
       await api.delete(
-        `/api/groups/${encodeURIComponent(jid)}/agents/${agentId}/im-binding/${encodeURIComponent(imJid)}`,
+        `/api/groups/${encodeURIComponent(jid)}/sessions/${agentId}/im-binding/${encodeURIComponent(imJid)}`,
       );
       get().loadAgents(jid, { force: true });
       return true;
@@ -2772,7 +2789,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   bindMainImGroup: async (jid, imJid, force, activationMode, ownerImId) => {
     try {
       await api.put(
-        `/api/groups/${encodeURIComponent(jid)}/im-binding`,
+        `/api/groups/${encodeURIComponent(jid)}/sessions/main/im-binding`,
         {
           im_jid: imJid,
           ...(force ? { force: true } : {}),
@@ -2790,7 +2807,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   unbindMainImGroup: async (jid, imJid) => {
     try {
       await api.delete(
-        `/api/groups/${encodeURIComponent(jid)}/im-binding/${encodeURIComponent(imJid)}`,
+        `/api/groups/${encodeURIComponent(jid)}/sessions/main/im-binding/${encodeURIComponent(imJid)}`,
       );
       await get().loadGroups();
       return true;

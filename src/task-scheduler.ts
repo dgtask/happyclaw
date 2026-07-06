@@ -29,11 +29,15 @@ import {
   getTaskById,
   getUserById,
   getUserHomeGroup,
+  getAgentProfileForWorkspace,
+  getSessionAgentIdentity,
   logTaskRun,
   logTaskRunStart,
   updateTaskRunLog,
   pauseTaskAfterRun,
   setRegisteredGroup,
+  setSession,
+  deleteSession,
   updateChatName,
   updateTaskAfterRun,
   updateTaskWorkspace,
@@ -45,7 +49,7 @@ import { resolveTaskOwner } from './task-utils.js';
 import { removeFlowArtifacts } from './file-manager.js';
 import { hasScriptCapacity, runScript } from './script-runner.js';
 import type { StreamEvent } from './stream-event.types.js';
-import { ExecutionMode, RegisteredGroup, ScheduledTask } from './types.js';
+import { AgentProfile, ExecutionMode, RegisteredGroup, ScheduledTask } from './types.js';
 import { checkBillingAccessFresh, isBillingEnabled } from './billing.js';
 import { checkOwnerActive } from './owner-gate.js';
 import { stripAgentInternalTags } from './utils.js';
@@ -90,6 +94,37 @@ function resolveTaskExecutionMode(
     return group.executionMode || 'container';
   }
   return 'container';
+}
+
+function toRunnerAgentProfile(profile: AgentProfile | undefined) {
+  if (!profile) return undefined;
+  return {
+    id: profile.id,
+    name: profile.name,
+    version: profile.version,
+    identityHash: profile.identity_hash,
+    identityPrompt: profile.identity_prompt,
+    includeClaudePreset: profile.include_claude_preset,
+  };
+}
+
+function taskSessionNeedsAgentProfileReset(
+  groupFolder: string,
+  profile: AgentProfile | undefined,
+): boolean {
+  if (!profile) return false;
+  const current = getSessionAgentIdentity(groupFolder);
+  if (!current) return false;
+  if (
+    !current.agent_profile_id &&
+    !current.identity_hash &&
+    profile.identity_prompt.trim() === '' &&
+    profile.include_claude_preset
+  ) {
+    return false;
+  }
+  if (current.identity_hash !== profile.identity_hash) return true;
+  return !!current.agent_profile_id && current.agent_profile_id !== profile.id;
 }
 
 function ensureTaskWorkspace(
@@ -589,6 +624,22 @@ async function runTaskInner(
 
   // Use persistent session for task workspace
   const sessions = deps.getSessions();
+  const agentProfile = getAgentProfileForWorkspace(
+    workspace.folder,
+    workspaceGroup.created_by,
+  );
+  if (taskSessionNeedsAgentProfileReset(workspace.folder, agentProfile)) {
+    deleteSession(workspace.folder);
+    delete sessions[workspace.folder];
+    logger.info(
+      {
+        taskId: task.id,
+        groupFolder: workspace.folder,
+        agentProfileId: agentProfile?.id,
+      },
+      'Cleared scheduled task Claude session after AgentProfile identity changed',
+    );
+  }
   const sessionId = sessions[workspace.folder];
 
   // Idle timer: writes _close sentinel after idleTimeout of no output,
@@ -628,6 +679,7 @@ async function runTaskInner(
         isAdminHome,
         isScheduledTask: true,
         taskRunId: options?.taskRunId,
+        agentProfile: toRunnerAgentProfile(agentProfile),
       },
       (proc, identifier, selectedProviderId) =>
         deps.onProcess(
@@ -653,6 +705,17 @@ async function runTaskInner(
           error = streamedOutput.error || 'Unknown error';
           lastOutputTime = Date.now();
         }
+        if (
+          streamedOutput.newSessionId &&
+          streamedOutput.status !== 'error' &&
+          !streamedOutput.providerFailure
+        ) {
+          sessions[workspace.folder] = streamedOutput.newSessionId;
+          setSession(workspace.folder, streamedOutput.newSessionId, undefined, {
+            agentProfileId: agentProfile?.id,
+            identityHash: agentProfile?.identity_hash,
+          });
+        }
         // Finalize run log on first non-stream output (success/error/closed).
         // Don't wait for the process to exit — idle timeout can be very long.
         if (streamedOutput.status !== 'stream') {
@@ -671,6 +734,17 @@ async function runTaskInner(
       // Messages are sent via MCP tool (IPC), result text is just logged
       result = output.result;
       lastOutputTime = Date.now();
+    }
+    if (
+      output.newSessionId &&
+      output.status !== 'error' &&
+      !output.providerFailure
+    ) {
+      sessions[workspace.folder] = output.newSessionId;
+      setSession(workspace.folder, output.newSessionId, undefined, {
+        agentProfileId: agentProfile?.id,
+        identityHash: agentProfile?.identity_hash,
+      });
     }
 
     // Finalize if not already done by onOutput callback

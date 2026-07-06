@@ -169,7 +169,7 @@ tools:
                   <Bot className="w-5 h-5 text-primary" />
                 </div>
               <div>
-                <h1 className="text-2xl font-bold text-foreground">Agent 管理</h1>
+                <h1 className="text-2xl font-bold text-foreground">子 Agent 定义</h1>
                 <p className="text-sm text-muted-foreground mt-0.5">
                   管理 Agent 定义文件，通过 Task 工具的 subagent_type 调用。
                 </p>
@@ -187,7 +187,7 @@ tools:
             </div>
           </div>
             <div className="text-xs text-muted-foreground">
-              已加载 Agent: {agents.length}
+              已加载子 Agent 定义: {agents.length}
             </div>
           </CardContent>
         </Card>
@@ -203,7 +203,7 @@ tools:
                     type="text"
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder="搜索 Agent 名称或描述"
+                    placeholder="搜索子 Agent 名称或描述"
                   />
                 </div>
 
@@ -216,7 +216,7 @@ tools:
                   <div className="text-sm text-error py-4 text-center">{listError}</div>
                 ) : filtered.length === 0 ? (
                   <div className="text-sm text-muted-foreground py-4 text-center">
-                    {searchQuery ? '没有匹配的 Agent' : '暂无 Agent 定义'}
+                    {searchQuery ? '没有匹配的子 Agent' : '暂无子 Agent 定义'}
                   </div>
                 ) : (
                   filtered.map((agent) => {
@@ -333,7 +333,7 @@ tools:
                 </div>
               ) : (
                 <div className="flex items-center justify-center h-full text-sm text-muted-foreground">
-                  {selectedId ? (detailError || '加载失败') : '选择一个 Agent 查看详情'}
+                  {selectedId ? (detailError || '加载失败') : '选择一个子 Agent 查看详情'}
                 </div>
                 )}
               </CardContent>
@@ -347,7 +347,7 @@ tools:
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
           <Card className="w-full max-w-md mx-4">
             <CardContent>
-              <h2 className="text-lg font-semibold text-foreground mb-4">新建 Agent</h2>
+              <h2 className="text-lg font-semibold text-foreground mb-4">新建子 Agent</h2>
               <div className="space-y-4">
                 <div>
                   <Label className="mb-1">

@@ -509,47 +509,40 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
         </div>
 
         {messages.length === 0 && !loading && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center px-6">
-            <div className="max-w-lg w-full space-y-8">
-              {/* Welcome header */}
-              <div className="flex flex-col items-center text-center space-y-4">
-                <div className="relative w-16 h-16">
-                  {/* Breathing glow ring */}
-                  <div className="absolute inset-0 rounded-full bg-brand-200/40 dark:bg-brand-500/20 animate-[breathe_3s_ease-in-out_infinite]" />
-                  {/* Orbiting dot */}
-                  <div className="absolute inset-[-6px] animate-[orbit_6s_linear_infinite]">
-                    <div className="w-2 h-2 rounded-full bg-brand-400" />
-                  </div>
-                  {/* Avatar */}
-                  <div className="relative w-16 h-16 animate-[float_4s_ease-in-out_infinite]">
-                    <EmojiAvatar
-                      imageUrl={aiImageUrl}
-                      emoji={aiEmoji}
-                      color={aiColor}
-                      fallbackChar={aiName[0]}
-                      size="lg"
-                      className="!w-16 !h-16 !text-2xl"
-                    />
-                  </div>
-                </div>
-                <div>
-                  <h2 className="text-2xl font-semibold text-foreground">你好，有什么可以帮你？</h2>
-                  <p className="text-sm text-muted-foreground mt-2">我是 {aiName}，你的 AI 助手。选择下方话题快速开始，或直接输入你的问题。</p>
+          <div data-hc-empty-state className="absolute inset-x-0 top-0 bottom-0 flex justify-center px-6 pt-[clamp(4.5rem,14vh,9rem)]">
+            <div className="w-full max-w-3xl">
+              <div className="flex items-start gap-3">
+                <EmojiAvatar
+                  imageUrl={aiImageUrl}
+                  emoji={aiEmoji}
+                  color={aiColor}
+                  fallbackChar={aiName[0]}
+                  size="md"
+                  className="mt-0.5 !h-10 !w-10 shrink-0 !text-lg"
+                />
+                <div className="min-w-0 flex-1">
+                  <h2 className="text-xl font-semibold leading-7 text-foreground">开始主会话</h2>
+                  <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
+                    我是 {aiName}。直接输入你的问题，或从下面选择一个常用起点。
+                  </p>
                 </div>
               </div>
 
-              {/* Quick prompt cards — 2x2 grid */}
               {onSend && (
-                <div className="grid grid-cols-2 gap-3">
+                <div className="mt-6 grid gap-2.5 sm:grid-cols-2">
                   {quickPrompts.map((prompt) => (
                     <button
                       key={prompt.title}
                       onClick={() => onSend(prompt.desc)}
-                      className="group text-left p-4 rounded-2xl border border-border/60 bg-muted/30 hover:bg-muted/60 hover:border-border transition-all active:scale-[0.98] cursor-pointer"
+                      className="group min-h-[72px] rounded-lg border border-border/70 bg-background/70 px-3.5 py-3 text-left transition-colors hover:border-border hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.99] cursor-pointer"
                     >
-                      <prompt.icon className="w-5 h-5 mb-2 text-muted-foreground" strokeWidth={1.75} />
-                      <span className="text-sm font-medium text-foreground block">{prompt.title}</span>
-                      <span className="text-xs text-muted-foreground mt-0.5 block">{prompt.desc}</span>
+                      <div className="flex items-start gap-3">
+                        <prompt.icon className="mt-0.5 h-4.5 w-4.5 shrink-0 text-muted-foreground group-hover:text-foreground" strokeWidth={1.75} />
+                        <span className="min-w-0">
+                          <span className="block truncate text-sm font-medium text-foreground">{prompt.title}</span>
+                          <span className="mt-0.5 block overflow-hidden text-ellipsis text-xs leading-5 text-muted-foreground">{prompt.desc}</span>
+                        </span>
+                      </div>
                     </button>
                   ))}
                 </div>

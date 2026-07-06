@@ -11,7 +11,7 @@ import { api } from '../../api/client';
 import type { AvailableImGroup } from '../../types';
 import type { BindingTarget } from './hooks/useImBindings';
 
-type ChannelFilter = 'all' | 'feishu' | 'telegram' | 'qq' | 'wechat' | 'dingtalk' | 'discord';
+type ChannelFilter = 'all' | 'feishu' | 'telegram' | 'qq' | 'wechat' | 'dingtalk' | 'discord' | 'whatsapp';
 
 export function BindingsSection() {
   const { bindings, loading, targets, targetsLoading, reload, rebind, resetAllowlist, error: hookError, clearError: clearHookError } = useImBindings();
@@ -37,6 +37,7 @@ export function BindingsSection() {
     if (types.has('wechat')) all.push({ key: 'wechat', label: '微信' });
     if (types.has('dingtalk')) all.push({ key: 'dingtalk', label: '钉钉' });
     if (types.has('discord')) all.push({ key: 'discord', label: 'Discord' });
+    if (types.has('whatsapp')) all.push({ key: 'whatsapp', label: 'WhatsApp' });
     return all;
   }, [bindings]);
 
@@ -56,6 +57,11 @@ export function BindingsSection() {
     }
     return list;
   }, [bindings, channelFilter, search]);
+
+  const selectableTargets = useMemo(() => {
+    if (!rebindGroup?.is_thread_capable) return targets;
+    return targets.filter((target) => target.type === 'main');
+  }, [rebindGroup?.is_thread_capable, targets]);
 
   const handleRebind = useCallback((group: AvailableImGroup) => {
     setRebindGroup(group);
@@ -122,19 +128,19 @@ export function BindingsSection() {
   const handleSelectTarget = useCallback(async (target: BindingTarget) => {
     if (!rebindGroup) return;
     const imJid = rebindGroup.jid;
-    const key = target.agentId || `main:${target.groupJid}`;
+    const key = target.sessionId || `main:${target.groupJid}`;
     setSelectingKey(key);
     setLocalError(null);
 
-    const hasBound = !!rebindGroup.bound_agent_id || !!rebindGroup.bound_main_jid;
+    const hasBound = !!(rebindGroup.bound_session_id ?? rebindGroup.bound_agent_id) || !!rebindGroup.bound_main_jid;
     const payload: {
-      target_agent_id?: string;
+      target_session_id?: string;
       target_main_jid?: string;
       force?: boolean;
     } = {};
 
-    if (target.type === 'agent' && target.agentId) {
-      payload.target_agent_id = target.agentId;
+    if (target.type === 'session' && target.sessionId) {
+      payload.target_session_id = target.sessionId;
     } else {
       payload.target_main_jid = target.groupJid;
     }
@@ -173,10 +179,10 @@ export function BindingsSection() {
           <div>
             <h1 className="text-2xl font-bold text-foreground flex items-center gap-2">
               <Link2 className="w-6 h-6" />
-              IM 绑定管理
+              消息挂载管理
             </h1>
             <p className="text-sm text-muted-foreground mt-1">
-              查看和管理所有 IM 渠道的消息路由。未绑定的渠道默认发送到你的主工作区。
+              查看和管理 IM 渠道到工作区/会话的路由。未绑定的渠道默认发送到默认 Agent 的主会话。
             </p>
           </div>
           <Button
@@ -240,7 +246,7 @@ export function BindingsSection() {
             <CardContent className="text-center">
             <MessageSquare className="w-10 h-10 mx-auto text-muted-foreground mb-3" />
             <p className="text-sm text-muted-foreground">
-              暂无 IM 渠道。在飞书、Telegram、QQ、微信、钉钉或 Discord 中向 Bot 发送消息后，渠道会自动出现在这里。
+              暂无 IM 渠道。在飞书、Telegram、QQ、微信、钉钉、Discord 或 WhatsApp 中向 Bot 发送消息后，渠道会自动出现在这里。
             </p>
             </CardContent>
           </Card>
@@ -270,7 +276,7 @@ export function BindingsSection() {
       <BindingTargetDialog
         open={!!rebindGroup}
         imGroupName={rebindGroup?.name || ''}
-        targets={targets}
+        targets={selectableTargets}
         targetsLoading={targetsLoading}
         onSelect={handleSelectTarget}
         onRestoreDefault={handleRestoreDefault}
@@ -284,7 +290,7 @@ export function BindingsSection() {
         onClose={() => setUnbindGroup(null)}
         onConfirm={confirmUnbind}
         title="确认解绑"
-        message={unbindGroup ? `解绑后，「${unbindGroup.name}」的消息将恢复默认路由到主工作区。确认解绑？` : ''}
+        message={unbindGroup ? `解绑后，「${unbindGroup.name}」的消息将恢复默认路由到默认 Agent 的主会话。确认解绑？` : ''}
         confirmText="解绑"
       />
 
@@ -294,7 +300,7 @@ export function BindingsSection() {
         onClose={() => setRestoreConfirmGroup(null)}
         onConfirm={confirmRestoreDefault}
         title="恢复默认路由"
-        message={restoreConfirmGroup ? `确认将「${restoreConfirmGroup.name}」恢复为默认路由（消息发送到主工作区）？` : ''}
+        message={restoreConfirmGroup ? `确认将「${restoreConfirmGroup.name}」恢复为默认路由（消息发送到默认 Agent 的主会话）？` : ''}
         confirmText="恢复默认"
       />
 

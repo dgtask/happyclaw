@@ -21,6 +21,23 @@ export interface GroupInfo {
   activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled';
   conversation_source?: 'manual' | 'feishu_thread';
   conversation_nav_mode?: 'horizontal' | 'vertical_threads';
+  agent_profile_id?: string;
+  agent_profile_name?: string;
+  agent_profile_version?: number;
+}
+
+export interface AgentProfile {
+  id: string;
+  owner_user_id: string;
+  name: string;
+  identity_prompt: string;
+  include_claude_preset: boolean;
+  identity_hash: string;
+  version: number;
+  is_default: boolean;
+  status: 'active' | 'archived';
+  created_at: string;
+  updated_at: string;
 }
 
 export interface AgentInfo {
@@ -46,7 +63,9 @@ export interface AvailableImGroup {
   jid: string;
   name: string;
   bound_agent_id: string | null;
+  bound_session_id?: string | null;
   bound_main_jid: string | null;
+  bound_workspace_jid?: string | null;
   bound_target_name: string | null;
   bound_workspace_name: string | null;
   reply_policy?: 'source_only' | 'mirror';
@@ -56,6 +75,7 @@ export interface AvailableImGroup {
   activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled';
   owner_im_id?: string | null;
   binding_mode?: 'single_context' | 'thread_map';
+  routing_mode?: 'single_session' | 'thread_map';
   chat_mode?: string;
   group_message_type?: string;
   is_thread_capable?: boolean;

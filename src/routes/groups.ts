@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import type { Variables } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
 import {
+  GroupAgentProfilePatchSchema,
   GroupCreateSchema,
   GroupPatchSchema,
   GroupMemberAddSchema,
@@ -48,6 +49,8 @@ import {
   listAgentsByJid,
   getGroupsByTargetAgent,
   getGroupsByTargetMainJid,
+  listChannelMountsByWorkspace,
+  listImContextBindingsByWorkspace,
   getMessage,
   deleteMessage,
   getUserPinnedGroups,
@@ -55,9 +58,14 @@ import {
   unpinGroup,
   deleteAgent,
   deleteImContextBindingsByWorkspace,
+  assignWorkspaceAgentProfile,
+  getAgentProfileForUser,
+  getAgentProfileForWorkspace,
+  getOrCreateDefaultAgentProfile,
 } from '../db.js';
 import { releaseOwner, persistGroupUpdate } from '../group-owner.js';
 import { logger } from '../logger.js';
+import { stopWorkspaceRunnersForAgentIdentityChange } from '../agent-profile-runtime.js';
 import {
   getContainerEnvConfig,
   saveContainerEnvConfig,
@@ -123,6 +131,9 @@ interface GroupPayloadItem {
   activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled';
   conversation_source?: 'manual' | 'feishu_thread';
   conversation_nav_mode?: 'horizontal' | 'vertical_threads';
+  agent_profile_id?: string;
+  agent_profile_name?: string;
+  agent_profile_version?: number;
 }
 
 function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
@@ -209,6 +220,9 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
     const latest = latestByJid.get(jid);
     const memberInfo = !isHome ? getMemberInfo(group.folder) : null;
     const isShared = memberInfo ? memberInfo.count > 1 : false;
+    const agentProfile = isWeb
+      ? getAgentProfileForWorkspace(group.folder, group.created_by)
+      : undefined;
 
     result[jid] = {
       name: group.name,
@@ -238,6 +252,9 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
       activation_mode: group.activation_mode ?? 'auto',
       conversation_source: group.conversation_source ?? 'manual',
       conversation_nav_mode: group.conversation_nav_mode ?? 'horizontal',
+      agent_profile_id: agentProfile?.id,
+      agent_profile_name: agentProfile?.name,
+      agent_profile_version: agentProfile?.version,
     };
   }
 
@@ -323,6 +340,12 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   const initSourcePath = validation.data.init_source_path;
   const initGitUrl = validation.data.init_git_url;
   const authUser = c.get('user') as AuthUser;
+  const agentProfile = validation.data.agent_profile_id
+    ? getAgentProfileForUser(validation.data.agent_profile_id, authUser.id)
+    : getOrCreateDefaultAgentProfile(authUser.id);
+  if (!agentProfile) {
+    return c.json({ error: 'Agent profile not found' }, 404);
+  }
 
   // Billing: check group limit
   const groupLimit = checkGroupLimit(authUser.id, authUser.role);
@@ -581,6 +604,8 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     return c.json({ error: `Workspace initialization failed: ${errMsg}` }, 500);
   }
 
+  assignWorkspaceAgentProfile(folder, agentProfile.id);
+
   // 容器模式工作区创建后立即启动容器预热，避免用户打开终端时还需等待
   if (executionMode === 'container') {
     deps.ensureTerminalContainerStarted(jid);
@@ -613,6 +638,9 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     activation_mode: group.activation_mode ?? 'auto',
     conversation_source: group.conversation_source ?? 'manual',
     conversation_nav_mode: group.conversation_nav_mode ?? 'horizontal',
+    agent_profile_id: agentProfile.id,
+    agent_profile_name: agentProfile.name,
+    agent_profile_version: agentProfile.version,
   };
 
   return c.json({
@@ -751,6 +779,76 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
   return c.json({ success: true, pinned_at });
 });
 
+// PATCH /api/groups/:jid/agent-profile - 切换 workspace 归属的顶层 AgentProfile
+groupRoutes.patch('/:jid/agent-profile', authMiddleware, async (c) => {
+  const deps = getWebDeps();
+  if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+
+  const jid = c.req.param('jid');
+  const existing = getRegisteredGroup(jid);
+  if (!existing) return c.json({ error: 'Group not found' }, 404);
+
+  const authUser = c.get('user') as AuthUser;
+  if (
+    !canModifyGroup(
+      { id: authUser.id, role: authUser.role },
+      { ...existing, jid },
+    )
+  ) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (!jid.startsWith('web:')) {
+    return c.json({ error: 'Only web workspaces can switch AgentProfile' }, 403);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const validation = GroupAgentProfilePatchSchema.safeParse(body);
+  if (!validation.success) {
+    return c.json({ error: 'Invalid request body' }, 400);
+  }
+
+  const profile = getAgentProfileForUser(
+    validation.data.agent_profile_id,
+    authUser.id,
+  );
+  if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+
+  assignWorkspaceAgentProfile(existing.folder, profile.id);
+
+  let invalidatedRuntimeJids = 0;
+  try {
+    const stopped = await stopWorkspaceRunnersForAgentIdentityChange(
+      deps,
+      existing.folder,
+      {
+        primaryJid: jid,
+        reason: `Workspace ${jid} switched to Agent profile ${profile.id}`,
+      },
+    );
+    invalidatedRuntimeJids = stopped.length;
+  } catch (err) {
+    logger.error(
+      { err, jid, folder: existing.folder, agentProfileId: profile.id },
+      'Workspace Agent profile switched but active runner invalidation failed',
+    );
+    return c.json(
+      {
+        error:
+          'Workspace Agent profile updated, but failed to refresh active runtime',
+      },
+      500,
+    );
+  }
+
+  return c.json({
+    success: true,
+    agent_profile_id: profile.id,
+    agent_profile_name: profile.name,
+    agent_profile_version: profile.version,
+    invalidated_runtime_jids: invalidatedRuntimeJids,
+  });
+});
+
 // POST /api/groups/:jid/reset-owner — admin break-glass for a stuck IM owner.
 // The IM owner-gate keys destructive commands on owner_im_id === sender. If the
 // recorded owner leaves the group / switches account, nobody matches and
@@ -826,22 +924,47 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
     );
   }
 
-  // Block deletion if any IM binding exists (agent or main conversation)
+  // Block deletion if any IM channel is mounted to this workspace or one of its sessions.
   const agents = listAgentsByJid(jid);
-  const boundAgents: Array<{
-    agentId: string;
-    agentName: string;
+  const sessionNameById = new Map(
+    agents
+      .filter((a) => a.kind === 'conversation')
+      .map((a) => [a.id, a.name] as const),
+  );
+  const boundSessions: Array<{
+    sessionId: string;
+    sessionName: string;
     imGroups: Array<{ jid: string; name: string }>;
   }> = [];
+  const sessionBindings = new Map<string, Array<{ jid: string; name: string }>>();
+  const mainBindings = new Map<string, { jid: string; name: string }>();
+
+  for (const mount of listChannelMountsByWorkspace(jid)) {
+    const imGroup = getRegisteredGroup(mount.channel_jid);
+    const item = {
+      jid: mount.channel_jid,
+      name: imGroup?.name ?? mount.channel_jid,
+    };
+    if (mount.session_id) {
+      const items = sessionBindings.get(mount.session_id) ?? [];
+      items.push(item);
+      sessionBindings.set(mount.session_id, items);
+    } else {
+      mainBindings.set(mount.channel_jid, item);
+    }
+  }
+
   for (const a of agents) {
     if (a.kind === 'conversation') {
       const linked = getGroupsByTargetAgent(a.id);
-      if (linked.length > 0) {
-        boundAgents.push({
-          agentId: a.id,
-          agentName: a.name,
-          imGroups: linked.map((l) => ({ jid: l.jid, name: l.group.name })),
-        });
+      const items = sessionBindings.get(a.id) ?? [];
+      for (const l of linked) {
+        if (!items.some((item) => item.jid === l.jid)) {
+          items.push({ jid: l.jid, name: l.group.name });
+        }
+      }
+      if (items.length > 0) {
+        sessionBindings.set(a.id, items);
       }
     }
   }
@@ -855,16 +978,45 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
     ...mainBoundByJid,
     ...mainBoundByFolder.filter((l) => !mainBoundJids.has(l.jid)),
   ];
-  if (boundAgents.length > 0 || mainBound.length > 0) {
-    const mainImGroups = mainBound.map((l) => ({
-      jid: l.jid,
-      name: l.group.name,
-    }));
+  for (const l of mainBound) {
+    mainBindings.set(l.jid, { jid: l.jid, name: l.group.name });
+  }
+
+  for (const [sessionId, imGroups] of sessionBindings.entries()) {
+    boundSessions.push({
+      sessionId,
+      sessionName: sessionNameById.get(sessionId) ?? sessionId,
+      imGroups,
+    });
+  }
+
+  const threadContextBindings = listImContextBindingsByWorkspace(jid).map(
+    (binding) => {
+      const imGroup = getRegisteredGroup(binding.source_jid);
+      return {
+        jid: binding.source_jid,
+        name: imGroup?.name ?? binding.source_jid,
+        context_id: binding.context_id,
+      };
+    },
+  );
+  const mainImGroups = Array.from(mainBindings.values());
+  if (
+    boundSessions.length > 0 ||
+    mainImGroups.length > 0 ||
+    threadContextBindings.length > 0
+  ) {
     return c.json(
       {
         error: '该工作区绑定了 IM 群组，请先解绑后再删除。',
-        bound_agents: boundAgents,
+        bound_sessions: boundSessions,
+        bound_agents: boundSessions.map((s) => ({
+          agentId: s.sessionId,
+          agentName: s.sessionName,
+          imGroups: s.imGroups,
+        })),
         bound_main_im_groups: mainImGroups,
+        bound_thread_contexts: threadContextBindings,
       },
       409,
     );

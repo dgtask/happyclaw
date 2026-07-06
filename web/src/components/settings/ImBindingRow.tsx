@@ -15,22 +15,24 @@ interface ImBindingRowProps {
 }
 
 export function ImBindingRow({ group, isActioning, onRebind, onUnbind, onResetAllowlist, onActivationModeChange, onDelete }: ImBindingRowProps) {
-  const hasBound = !!group.bound_agent_id || !!group.bound_main_jid;
+  const boundSessionId = group.bound_session_id ?? group.bound_agent_id;
+  const boundWorkspaceJid = group.bound_workspace_jid ?? group.bound_main_jid;
+  const hasBound = !!boundSessionId || !!boundWorkspaceJid;
   // Empty array = "owner-locked trap": bot was added before Feishu owner DM'd it,
   // so nobody (not even the owner) can trigger the bot until allowlist is reset
   // or owner sends a DM (which auto-backfills via learnFeishuOwner).
   const isAllowlistLocked = group.sender_allowlist_locked === true;
 
   const bindingLabel = (): string => {
-    if (group.bound_agent_id && group.bound_target_name) {
+    if (boundSessionId && group.bound_target_name) {
       return group.bound_workspace_name && group.bound_workspace_name !== group.bound_target_name
         ? `${group.bound_workspace_name} / ${group.bound_target_name}`
         : group.bound_target_name;
     }
-    if (group.bound_main_jid && group.bound_target_name) {
-      return `${group.bound_target_name} / 主对话`;
+    if (boundWorkspaceJid && group.bound_target_name) {
+      return `${group.bound_target_name} / 主会话`;
     }
-    return '默认（主工作区）';
+    return '默认（默认 Agent 的主会话）';
   };
 
   return (

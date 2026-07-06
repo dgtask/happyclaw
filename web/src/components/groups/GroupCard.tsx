@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronDown, ChevronUp, Users } from 'lucide-react';
+import { Bot, ChevronDown, ChevronUp, Users } from 'lucide-react';
 import { Card } from '@/components/ui/card';
 import { GroupInfo } from '../../stores/groups';
 import { GroupDetail } from './GroupDetail';
@@ -57,6 +57,20 @@ export function GroupCard({ group }: GroupCardProps) {
                   {group.folder}
                 </span>
               </div>
+              {group.agent_profile_name && (
+                <div className="flex items-center gap-2">
+                  <span className="text-muted-foreground">Agent:</span>
+                  <span className="inline-flex min-w-0 items-center gap-1 text-foreground font-medium">
+                    <Bot className="h-3.5 w-3.5 text-muted-foreground" />
+                    <span className="truncate">{group.agent_profile_name}</span>
+                    {group.agent_profile_version && (
+                      <span className="text-xs text-muted-foreground">
+                        v{group.agent_profile_version}
+                      </span>
+                    )}
+                  </span>
+                </div>
+              )}
             </div>
           </div>
 

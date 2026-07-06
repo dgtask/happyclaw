@@ -1,8 +1,9 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   ChevronDown,
   ChevronRight,
   AlertTriangle,
+  Bot,
   Monitor,
   Box,
   FolderInput,
@@ -19,9 +20,17 @@ import {
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { DirectoryBrowser } from '../shared/DirectoryBrowser';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
+import { useAgentProfilesStore } from '../../stores/agent-profiles';
 
 interface CreateContainerDialogProps {
   open: boolean;
@@ -42,9 +51,23 @@ export function CreateContainerDialog({
   const [initMode, setInitMode] = useState<'empty' | 'local' | 'git'>('empty');
   const [initSourcePath, setInitSourcePath] = useState('');
   const [initGitUrl, setInitGitUrl] = useState('');
+  const [selectedAgentProfileId, setSelectedAgentProfileId] = useState('');
 
   const createFlow = useChatStore((s) => s.createFlow);
   const canHostExec = useAuthStore((s) => s.user?.role === 'admin');
+  const profiles = useAgentProfilesStore((s) => s.profiles);
+  const profilesLoading = useAgentProfilesStore((s) => s.loading);
+  const loadProfiles = useAgentProfilesStore((s) => s.loadProfiles);
+
+  useEffect(() => {
+    if (open) void loadProfiles();
+  }, [open, loadProfiles]);
+
+  useEffect(() => {
+    if (!open || selectedAgentProfileId || profiles.length === 0) return;
+    const defaultProfile = profiles.find((profile) => profile.is_default) ?? profiles[0];
+    setSelectedAgentProfileId(defaultProfile.id);
+  }, [open, profiles, selectedAgentProfileId]);
 
   const reset = () => {
     setName('');
@@ -54,6 +77,7 @@ export function CreateContainerDialog({
     setInitMode('empty');
     setInitSourcePath('');
     setInitGitUrl('');
+    setSelectedAgentProfileId('');
   };
 
   const handleClose = () => {
@@ -78,6 +102,7 @@ export function CreateContainerDialog({
           options.init_git_url = initGitUrl.trim();
         }
       }
+      if (selectedAgentProfileId) options.agent_profile_id = selectedAgentProfileId;
       const created = await createFlow(trimmed, Object.keys(options).length ? options : undefined);
       if (created) {
         onCreated(created.jid, created.folder);
@@ -96,10 +121,43 @@ export function CreateContainerDialog({
     <Dialog open={open} onOpenChange={(v) => !v && handleClose()}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>新建工作区</DialogTitle>
+          <DialogTitle>为 Agent 新建工作区</DialogTitle>
         </DialogHeader>
 
         <div className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium mb-2">Agent</label>
+            <Select
+              value={selectedAgentProfileId}
+              onValueChange={setSelectedAgentProfileId}
+              disabled={profilesLoading || profiles.length === 0}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder={profilesLoading ? '正在加载 Agent...' : '选择 Agent'} />
+              </SelectTrigger>
+              <SelectContent>
+                {profiles.map((profile) => (
+                  <SelectItem key={profile.id} value={profile.id}>
+                    <span className="flex min-w-0 items-center gap-2">
+                      <Bot className="w-3.5 h-3.5 text-muted-foreground" />
+                      <span className="truncate">{profile.name}</span>
+                      {profile.is_default && (
+                        <span className="text-[10px] text-muted-foreground">默认</span>
+                      )}
+                      <span className="text-[10px] text-muted-foreground">v{profile.version}</span>
+                    </span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {profiles.length > 0 && (
+              <p className="mt-1 text-xs text-muted-foreground line-clamp-2">
+                {profiles.find((profile) => profile.id === selectedAgentProfileId)?.identity_prompt ||
+                  '使用默认 Agent 行为，不追加额外身份提示词。'}
+              </p>
+            )}
+          </div>
+
           {/* Name input */}
           <div>
             <label className="block text-sm font-medium mb-2">工作区名称</label>
@@ -107,7 +165,7 @@ export function CreateContainerDialog({
               value={name}
               onChange={(e) => setName(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter') handleConfirm(); }}
-              placeholder="输入工作区名称"
+              placeholder="输入这个 Agent 工作区的名称"
               autoFocus
             />
           </div>

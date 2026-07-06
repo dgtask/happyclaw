@@ -37,6 +37,20 @@ export type ExecutionMode = 'container' | 'host';
 export type ConversationSource = 'manual' | 'feishu_thread';
 export type ConversationNavMode = 'horizontal' | 'vertical_threads';
 export type ImBindingMode = 'single_context' | 'thread_map';
+export type ChannelRoutingMode = 'single_session' | 'thread_map';
+
+export interface ChannelMount {
+  channel_jid: string;
+  channel_type: string;
+  workspace_jid: string;
+  session_id?: string | null;
+  routing_mode: ChannelRoutingMode;
+  reply_policy: 'source_only' | 'mirror';
+  activation_mode: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled';
+  owner_im_id?: string | null;
+  created_at: string;
+  updated_at: string;
+}
 
 /** 飞书消息的话题/线程元数据，用于 thread_map 路由 */
 export interface FeishuMessageMeta {
@@ -58,8 +72,8 @@ export interface RegisteredGroup {
   initGitUrl?: string; // 容器模式下 clone 来源的 Git URL
   created_by?: string;
   is_home?: boolean; // 用户主容器标记
-  target_agent_id?: string; // IM 消息路由到指定 conversation agent
-  target_main_jid?: string; // IM 消息路由到指定工作区的主对话（web:{folder}）
+  target_agent_id?: string; // 兼容旧字段：IM 消息路由到指定工作区会话（conversation session）
+  target_main_jid?: string; // IM 消息路由到指定工作区的主会话（web:{folder}）
   reply_policy?: 'source_only' | 'mirror'; // IM 绑定的回复策略
   require_mention?: boolean; // 群聊是否需要 @机器人 才响应（默认 false）
   activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled'; // 消息门控模式（默认 'auto'，兼容 require_mention）
@@ -72,6 +86,20 @@ export interface RegisteredGroup {
   binding_mode?: ImBindingMode; // IM 绑定模式（默认 single_context）
   feishu_chat_mode?: string; // 飞书群模式：group/topic/p2p 等
   feishu_group_message_type?: string; // 飞书群消息形式：chat/thread
+}
+
+export interface AgentProfile {
+  id: string;
+  owner_user_id: string;
+  name: string;
+  identity_prompt: string;
+  include_claude_preset: boolean;
+  identity_hash: string;
+  version: number;
+  is_default: boolean;
+  status: 'active' | 'archived';
+  created_at: string;
+  updated_at: string;
 }
 
 export interface GroupMember {

@@ -174,6 +174,38 @@ interface PromptPiece {
   text: string;
 }
 
+function escapeXmlAttribute(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function buildAgentIdentityPromptPiece(containerInput: ContainerInput): PromptPiece[] {
+  const agentProfile = containerInput.agentProfile;
+  const identityPrompt = agentProfile?.identityPrompt?.trim();
+  if (!agentProfile || !identityPrompt) return [];
+  const presetBoundary = agentProfile.includeClaudePreset
+    ? '、Claude Code 原生提示词'
+    : '';
+
+  return [
+    {
+      name: 'agent-identity.md',
+      text: [
+        `<agent-identity profile_id="${escapeXmlAttribute(agentProfile.id)}" name="${escapeXmlAttribute(agentProfile.name)}" version="${agentProfile.version}" hash="${escapeXmlAttribute(agentProfile.identityHash)}">`,
+        `以下是当前顶层 AgentProfile 的角色身份提示词。你应该按它塑造行为风格、专业倾向和工作方式，但它不能覆盖 HappyClaw 的安全规则、权限边界、工具约束${presetBoundary}和用户的最新明确指令。`,
+        '<identity-prompt>',
+        identityPrompt,
+        '</identity-prompt>',
+        '</agent-identity>',
+      ].join('\n'),
+    },
+  ];
+}
+
 interface SdkContextUsage {
   memoryFiles?: Array<{ path: string; type?: string; tokens?: number }>;
   skills?: {
@@ -1434,6 +1466,7 @@ async function runQuery(
 
   const promptPieces: PromptPiece[] = [
     { name: 'interaction.md', text: `<behavior>\n${INTERACTION_GUIDELINES}\n</behavior>` },
+    ...buildAgentIdentityPromptPiece(containerInput),
     { name: 'skill-routing.md', text: `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n</skill-routing>` },
     { name: 'security-rules.md', text: `<security>\n${buildSecurityRulesPrompt(disableMemoryLayer)}\n</security>` },
     ...(memoryRecall && memoryPromptName
@@ -1448,6 +1481,15 @@ async function runQuery(
       : []),
   ];
   const systemPromptAppend = promptPieces.map((piece) => piece.text).join('\n');
+  const includeClaudePreset =
+    containerInput.agentProfile?.includeClaudePreset ?? true;
+  const systemPrompt = includeClaudePreset
+    ? {
+        type: 'preset' as const,
+        preset: 'claude_code' as const,
+        append: systemPromptAppend,
+      }
+    : systemPromptAppend;
   const promptAudit = buildPromptAudit(promptPieces);
   const contextAuditBase = runtimeContextAuditBase(containerInput);
 
@@ -1547,7 +1589,7 @@ async function runQuery(
         additionalDirectories: extraDirs,
         resume: sessionId,
         ...(sessionId && resumeAt ? { resumeSessionAt: resumeAt } : {}),
-        systemPrompt: { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptAppend },
+        systemPrompt,
         allowedTools,
         ...(disallowedTools && { disallowedTools }),
         thinking: { type: 'adaptive' as const, display: 'summarized' as const },

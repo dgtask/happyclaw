@@ -13,6 +13,7 @@ import { AppearanceSection } from '../components/settings/AppearanceSection';
 import { SystemSettingsSection } from '../components/settings/SystemSettingsSection';
 import { UserChannelsSection } from '../components/settings/UserChannelsSection';
 import { GroupsPage } from './GroupsPage';
+import { AgentProfilesPage } from './AgentProfilesPage';
 import { MemoryPage } from './MemoryPage';
 import { SkillsPage } from './SkillsPage';
 import { McpServersPage } from './McpServersPage';
@@ -25,9 +26,9 @@ import { MonitorPage } from './MonitorPage';
 import { Card, CardContent } from '@/components/ui/card';
 import type { SettingsTab } from '../components/settings/types';
 
-const VALID_TABS: SettingsTab[] = ['claude', 'registration', 'appearance', 'system', 'profile', 'my-channels', 'security', 'groups', 'memory', 'skills', 'mcp-servers', 'plugins', 'agent-definitions', 'users', 'about', 'bindings', 'usage', 'monitor'];
+const VALID_TABS: SettingsTab[] = ['claude', 'registration', 'appearance', 'system', 'profile', 'my-channels', 'security', 'groups', 'agent-profiles', 'memory', 'skills', 'mcp-servers', 'plugins', 'agent-definitions', 'users', 'about', 'bindings', 'usage', 'monitor'];
 const SYSTEM_TABS: SettingsTab[] = ['claude', 'registration', 'appearance', 'system'];
-const FULLPAGE_TABS: SettingsTab[] = ['groups', 'memory', 'skills', 'mcp-servers', 'plugins', 'agent-definitions', 'users', 'bindings', 'usage', 'monitor'];
+const FULLPAGE_TABS: SettingsTab[] = ['groups', 'agent-profiles', 'memory', 'skills', 'mcp-servers', 'plugins', 'agent-definitions', 'users', 'bindings', 'usage', 'monitor'];
 
 export function SettingsPage() {
   const { user: currentUser } = useAuthStore();
@@ -76,11 +77,12 @@ export function SettingsPage() {
       tabs.push({ key: 'system', label: '系统' });
     }
     tabs.push({ key: 'groups', label: '会话' });
+    tabs.push({ key: 'agent-profiles', label: 'Agent' });
     tabs.push({ key: 'memory', label: '记忆' });
     tabs.push({ key: 'skills', label: '技能' });
     tabs.push({ key: 'mcp-servers', label: 'MCP' });
-    tabs.push({ key: 'agent-definitions', label: 'Agent' });
-    tabs.push({ key: 'bindings', label: 'IM 绑定' });
+    tabs.push({ key: 'agent-definitions', label: '子 Agent' });
+    tabs.push({ key: 'bindings', label: '消息挂载' });
     tabs.push({ key: 'usage', label: '用量' });
     if (canManageSystemConfig) {
       tabs.push({ key: 'monitor', label: '监控' });
@@ -112,14 +114,15 @@ export function SettingsPage() {
     'my-channels': '消息通道',
     security: '安全与设备',
     groups: '会话管理',
+    'agent-profiles': 'Agent',
     memory: '记忆管理',
     skills: '技能(Skill)管理',
     'mcp-servers': 'MCP 服务器',
     plugins: '插件 (Plugins)',
-    'agent-definitions': 'Agent 管理',
+    'agent-definitions': '子 Agent 定义',
     users: '用户管理',
     about: '关于',
-    bindings: 'IM 绑定',
+    bindings: '消息挂载',
     usage: '用量统计',
     monitor: '系统监控',
   };
@@ -183,6 +186,7 @@ export function SettingsPage() {
         {FULLPAGE_TABS.includes(activeTab) ? (
           <>
             {activeTab === 'groups' && <GroupsPage />}
+            {activeTab === 'agent-profiles' && <AgentProfilesPage />}
             {activeTab === 'memory' && <MemoryPage />}
             {activeTab === 'skills' && <SkillsPage />}
             {activeTab === 'mcp-servers' && <McpServersPage />}

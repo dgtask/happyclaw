@@ -50,7 +50,7 @@ describe('resolveBoundChatTarget', () => {
       targetChatJid: 'web:graduation-jid',
       folder: 'flow-graduation',
       agentId: null,
-      locationLine: 'graduation / 主对话',
+      locationLine: 'graduation / 主会话',
     });
   });
 

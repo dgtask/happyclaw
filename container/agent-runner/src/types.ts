@@ -30,6 +30,14 @@ export interface ContainerInput {
    * routes results to the task's configured chat_jid / notify channels. */
   messageTaskId?: string;
   images?: Array<{ data: string; mimeType?: string }>;
+  agentProfile?: {
+    id: string;
+    name: string;
+    version: number;
+    identityHash: string;
+    identityPrompt: string;
+    includeClaudePreset: boolean;
+  };
   agentId?: string;
   agentName?: string;
   /**

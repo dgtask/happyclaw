@@ -113,7 +113,7 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
-          <SelectItem value="__default__">默认（我的主工作区）</SelectItem>
+          <SelectItem value="__default__">默认（默认 Agent 的主会话）</SelectItem>
           {sortedGroupEntries.map(([jid, name]) => (
             <SelectItem key={jid} value={jid}>
               {formatGroupLabel(jid, name)}
@@ -122,7 +122,7 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
         </SelectContent>
       </Select>
       <p className="mt-1 text-xs text-muted-foreground">
-        选择任务结果投递的目标工作区；默认落到你的主工作区
+        选择任务结果投递的目标工作区；默认落到默认 Agent 的主会话
       </p>
     </div>
   );

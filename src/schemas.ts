@@ -24,7 +24,7 @@ export const TaskPatchSchema = z.object({
     .refine((v) => !isNaN(Date.parse(v)), 'next_run must be ISO 8601')
     .optional(),
   notify_channels: z
-    .array(z.enum(['feishu', 'telegram', 'qq', 'wechat', 'dingtalk', 'discord']))
+    .array(z.enum(['feishu', 'telegram', 'qq', 'wechat', 'dingtalk', 'discord', 'whatsapp']))
     .nullable()
     .optional(),
 });
@@ -54,7 +54,7 @@ export const TaskCreateSchema = z
     execution_mode: z.enum(['host', 'container']).optional(),
     script_command: z.string().max(4096).optional(),
     notify_channels: z
-      .array(z.enum(['feishu', 'telegram', 'qq', 'wechat', 'dingtalk', 'discord']))
+      .array(z.enum(['feishu', 'telegram', 'qq', 'wechat', 'dingtalk', 'discord', 'whatsapp']))
       .nullable()
       .optional(),
   })
@@ -157,6 +157,10 @@ export const MessageCreateSchema = z
 
 export const GroupCreateSchema = z.object({
   name: z.string().min(1).max(MAX_GROUP_NAME_LEN),
+  agent_profile_id: z
+    .string()
+    .optional()
+    .transform((val) => (val && val.trim() ? val.trim() : undefined)),
   execution_mode: z.enum(['container', 'host']).optional(),
   custom_cwd: z
     .string()
@@ -170,6 +174,39 @@ export const GroupCreateSchema = z.object({
     .string()
     .optional()
     .transform((val) => (val && val.trim() ? val.trim() : undefined)),
+});
+
+export const GroupAgentProfilePatchSchema = z.object({
+  agent_profile_id: z.string().trim().min(1),
+});
+
+export const AgentProfileCreateSchema = z.object({
+  name: z.string().trim().min(1).max(80),
+  identity_prompt: z
+    .string()
+    .max(20000)
+    .optional()
+    .transform((val) => (val == null ? undefined : val.trim())),
+  include_claude_preset: z.boolean().optional(),
+});
+
+export const AgentProfilePatchSchema = z.object({
+  name: z
+    .string()
+    .trim()
+    .min(1)
+    .max(80)
+    .optional(),
+  identity_prompt: z
+    .string()
+    .max(20000)
+    .optional()
+    .transform((val) => (val == null ? undefined : val.trim())),
+  include_claude_preset: z.boolean().optional(),
+});
+
+export const AgentProfileGenerateSchema = z.object({
+  description: z.string().trim().min(1).max(4000),
 });
 
 export const GroupMemberAddSchema = z.object({

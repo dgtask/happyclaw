@@ -4,12 +4,19 @@ import { useChatStore } from '../../../stores/chat';
 import type { AvailableImGroup, AgentInfo } from '../../../types';
 
 export interface BindingTarget {
-  type: 'main' | 'agent';
+  type: 'main' | 'session';
   groupJid: string;
   groupName: string;
-  agentId?: string;
-  agentName?: string;
+  agentProfileId?: string;
+  agentProfileName?: string;
+  sessionId?: string;
+  sessionName?: string;
 }
+
+type WorkspaceSessionInfo = Omit<AgentInfo, 'kind'> & {
+  kind: AgentInfo['kind'] | 'main';
+  is_main?: boolean;
+};
 
 export function useImBindings() {
   const [bindings, setBindings] = useState<AvailableImGroup[]>([]);
@@ -57,7 +64,7 @@ export function useImBindings() {
     try {
       const currentGroups = groupsRef.current;
       const webGroups = Object.entries(currentGroups).filter(
-        ([jid, g]) => jid.startsWith('web:') && !g.is_home,
+        ([jid]) => jid.startsWith('web:'),
       );
 
       const allTargets: BindingTarget[] = [];
@@ -67,32 +74,35 @@ export function useImBindings() {
           type: 'main',
           groupJid: jid,
           groupName: group.name,
+          agentProfileId: group.agent_profile_id,
+          agentProfileName: group.agent_profile_name || 'Default Agent',
         });
       }
 
-      // Load conversation agents for each workspace
-      const agentPromises = webGroups.map(async ([jid, group]) => {
+      const sessionPromises = webGroups.map(async ([jid, group]) => {
         try {
-          const data = await api.get<{ agents: AgentInfo[] }>(
-            `/api/groups/${encodeURIComponent(jid)}/agents`,
+          const data = await api.get<{ sessions: WorkspaceSessionInfo[] }>(
+            `/api/groups/${encodeURIComponent(jid)}/sessions`,
           );
-          return data.agents
-            .filter((a) => a.kind === 'conversation')
+          return data.sessions
+            .filter((a) => a.kind === 'conversation' && a.id !== 'main')
             .map((a) => ({
-              type: 'agent' as const,
+              type: 'session' as const,
               groupJid: jid,
               groupName: group.name,
-              agentId: a.id,
-              agentName: a.name,
+              agentProfileId: group.agent_profile_id,
+              agentProfileName: group.agent_profile_name || 'Default Agent',
+              sessionId: a.id,
+              sessionName: a.name,
             }));
         } catch {
           return [];
         }
       });
 
-      const agentResults = await Promise.all(agentPromises);
-      for (const agents of agentResults) {
-        allTargets.push(...agents);
+      const sessionResults = await Promise.all(sessionPromises);
+      for (const sessions of sessionResults) {
+        allTargets.push(...sessions);
       }
 
       setTargets(allTargets);
@@ -123,6 +133,7 @@ export function useImBindings() {
       imJid: string,
       target: {
         target_main_jid?: string;
+        target_session_id?: string;
         target_agent_id?: string;
         unbind?: boolean;
         force?: boolean;

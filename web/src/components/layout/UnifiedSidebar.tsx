@@ -70,7 +70,7 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
     return { mainGroup: main, otherGroups: others };
   }, [groups]);
 
-  const { pinnedGroups, mySections, collabSections } = useMemo(() => {
+  const { pinnedGroups, myAgentSections, collabSections } = useMemo(() => {
     const pinned: GroupEntry[] = [];
     const my: GroupEntry[] = [];
     const collab: GroupEntry[] = [];
@@ -80,7 +80,33 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
       else my.push(g);
     });
     pinned.sort((a, b) => (a.pinned_at || '').localeCompare(b.pinned_at || ''));
-    return { pinnedGroups: pinned, mySections: groupByDate(my), collabSections: groupByDate(collab) };
+    const byAgent = new Map<
+      string,
+      { id: string; name: string; version?: number; items: GroupEntry[] }
+    >();
+    for (const group of my) {
+      const id = group.agent_profile_id || '__default__';
+      const existing =
+        byAgent.get(id) ||
+        {
+          id,
+          name: group.agent_profile_name || 'Default Agent',
+          version: group.agent_profile_version,
+          items: [],
+        };
+      existing.items.push(group);
+      if (!existing.version && group.agent_profile_version) {
+        existing.version = group.agent_profile_version;
+      }
+      byAgent.set(id, existing);
+    }
+    const myAgentSections = Array.from(byAgent.values())
+      .map((section) => ({
+        ...section,
+        items: section.items.sort(compareByLastActivity),
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
+    return { pinnedGroups: pinned, myAgentSections, collabSections: groupByDate(collab) };
   }, [otherGroups]);
 
   const handleGroupSelect = (jid: string, folder: string) => { selectGroup(jid); navigate(`/chat/${folder}`); };
@@ -95,10 +121,29 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
       const nextFolder = nextJid ? useChatStore.getState().groups[nextJid]?.folder : null;
       navigate(nextFolder ? `/chat/${nextFolder}` : '/chat');
     } catch (err: unknown) {
-      const typed = err as { boundAgents?: Array<{ agentName: string; imGroups: Array<{ name: string }> }> };
-      if (typed.boundAgents) {
-        const details = typed.boundAgents.map((a) => `「${a.agentName}」→ ${a.imGroups.map((g) => g.name).join('、')}`).join('\n');
-        alert(`该工作区下有子对话绑定了 IM 渠道，请先解绑后再删除：\n${details}`);
+      const typed = err as {
+        boundSessions?: Array<{ sessionName: string; imGroups: Array<{ name: string }> }>;
+        boundAgents?: Array<{ agentName: string; imGroups: Array<{ name: string }> }>;
+        boundMainImGroups?: Array<{ name: string }>;
+      };
+      const details: string[] = [];
+      const sessions =
+        typed.boundSessions ??
+        typed.boundAgents?.map((a) => ({
+          sessionName: a.agentName,
+          imGroups: a.imGroups,
+        })) ??
+        [];
+      if (typed.boundMainImGroups?.length) {
+        details.push(`主会话 -> ${typed.boundMainImGroups.map((g) => g.name).join('、')}`);
+      }
+      if (sessions.length) {
+        details.push(
+          ...sessions.map((s) => `会话「${s.sessionName}」 -> ${s.imGroups.map((g) => g.name).join('、')}`),
+        );
+      }
+      if (details.length > 0) {
+        alert(`该工作区仍有消息通道挂载，请先解绑后再删除：\n${details.join('\n')}`);
       } else {
         alert(`删除工作区失败：${err instanceof Error ? err.message : '未知错误'}`);
       }
@@ -162,7 +207,7 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
                   </NavLink>
                 )}
               </TooltipTrigger>
-              <TooltipContent side="right">{isChatItem && isChatRoute ? (collapsed ? '展开工作区' : '收起工作区') : label}</TooltipContent>
+              <TooltipContent side="right">{isChatItem && isChatRoute ? (collapsed ? '展开 Agent 工作台' : '收起 Agent 工作台') : label}</TooltipContent>
             </Tooltip>
           );
         })}
@@ -233,7 +278,7 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
                     {mainGroup && (
                       <div className="mb-1">
                         <div className="px-2 pt-1 pb-1">
-                          <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">主工作区</span>
+                          <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">默认 Agent</span>
                         </div>
                         <ChatGroupItem
                           jid={mainGroup.jid} name={mainGroup.name} folder={mainGroup.folder}
@@ -269,26 +314,53 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
                       </div>
                     )}
 
-                    {mySections.length === 0 && collabSections.length === 0 && pinnedGroups.length === 0 && !mainGroup ? (
+                    {myAgentSections.length === 0 && collabSections.length === 0 && pinnedGroups.length === 0 && !mainGroup ? (
                       <div className="flex flex-col items-center justify-center h-32 px-4">
-                        <p className="text-xs text-muted-foreground text-center">暂无工作区</p>
+                        <p className="text-xs text-muted-foreground text-center">暂无 Agent 工作区</p>
                       </div>
                     ) : (
                       <>
-                        {mySections.length > 0 && (
+                        {myAgentSections.length > 0 && (
                           <div>
                             <div className="mt-1" />
                             <div className="px-2 pt-2 pb-1">
-                              <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">我的工作区</span>
+                              <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">我的 Agent</span>
                             </div>
-                            {renderSections(mySections, false)}
+                            {myAgentSections.map((section) => (
+                              <div key={section.id} className="mb-1">
+                                <div className="px-2 pt-2 pb-1 flex items-center gap-1.5">
+                                  <span className="text-[10px] text-muted-foreground/80 truncate">
+                                    {section.name}
+                                  </span>
+                                  {section.version && (
+                                    <span className="text-[10px] text-muted-foreground/60">
+                                      v{section.version}
+                                    </span>
+                                  )}
+                                </div>
+                                {section.items.map((g) => (
+                                  <ChatGroupItem
+                                    key={g.jid} jid={g.jid} name={g.name} folder={g.folder}
+                                    lastMessage={g.lastMessage}
+                                    isActive={currentGroup === g.jid} isHome={false}
+                                    isRunning={runnerStates[g.jid] === 'running'}
+                                    canModify={g.can_modify}
+                                    onSelect={handleGroupSelect}
+                                    onRename={(jid, name) => setRenameState({ open: true, jid, name })}
+                                    onClearHistory={openClear}
+                                    onDelete={(jid, name) => setDeleteState({ open: true, jid, name })}
+                                    onTogglePin={(jid) => togglePin(jid)}
+                                  />
+                                ))}
+                              </div>
+                            ))}
                           </div>
                         )}
                         {collabSections.length > 0 && (
                           <div>
                             <div className="mt-1" />
                             <div className="px-2 pt-2 pb-1">
-                              <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">协作工作区</span>
+                              <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">协作 Agent 工作区</span>
                             </div>
                             {renderSections(collabSections, true)}
                           </div>

@@ -1,5 +1,5 @@
 import { useState, useMemo, useEffect } from 'react';
-import { Loader2, FolderOpen, MessageSquare, RotateCcw } from 'lucide-react';
+import { Bot, Loader2, FolderOpen, MessageSquare, RotateCcw } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -44,17 +44,32 @@ export function BindingTargetDialog({
     return targets.filter(
       (t) =>
         t.groupName.toLowerCase().includes(q) ||
-        (t.agentName && t.agentName.toLowerCase().includes(q)),
+        (t.sessionName && t.sessionName.toLowerCase().includes(q)),
     );
   }, [targets, filter]);
 
-  // Group targets by workspace
+  // Group targets by Agent profile, then workspace.
   const grouped = useMemo(() => {
-    const map = new Map<string, BindingTarget[]>();
+    const map = new Map<
+      string,
+      {
+        agentName: string;
+        workspaces: Map<string, BindingTarget[]>;
+      }
+    >();
     for (const t of filtered) {
-      const key = t.groupJid;
-      if (!map.has(key)) map.set(key, []);
-      map.get(key)!.push(t);
+      const agentKey = t.agentProfileId || t.agentProfileName || 'default';
+      if (!map.has(agentKey)) {
+        map.set(agentKey, {
+          agentName: t.agentProfileName || 'Default Agent',
+          workspaces: new Map(),
+        });
+      }
+      const agentGroup = map.get(agentKey)!;
+      if (!agentGroup.workspaces.has(t.groupJid)) {
+        agentGroup.workspaces.set(t.groupJid, []);
+      }
+      agentGroup.workspaces.get(t.groupJid)!.push(t);
     }
     return map;
   }, [filtered]);
@@ -64,7 +79,7 @@ export function BindingTargetDialog({
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle className="text-base truncate">
-            选择绑定目标 — {imGroupName}
+            选择挂载目标 — {imGroupName}
           </DialogTitle>
         </DialogHeader>
 
@@ -72,7 +87,7 @@ export function BindingTargetDialog({
           <SearchInput
             value={filter}
             onChange={setFilter}
-            placeholder="搜索工作区..."
+            placeholder="搜索工作区或会话..."
             debounce={150}
           />
         )}
@@ -87,7 +102,7 @@ export function BindingTargetDialog({
 
           {!targetsLoading && targets.length === 0 && (
             <div className="text-center py-8 text-muted-foreground text-sm">
-              暂无可绑定的工作区。请先创建一个非主页的工作区。
+              暂无可挂载的目标。请先创建一个工作区。
             </div>
           )}
 
@@ -98,32 +113,40 @@ export function BindingTargetDialog({
           )}
 
           {!targetsLoading &&
-            Array.from(grouped.entries()).map(([groupJid, items]) => (
-              <div key={groupJid} className="space-y-1">
-                <div className="flex items-center gap-1.5 px-1 text-xs font-medium text-muted-foreground">
-                  <FolderOpen className="w-3 h-3" />
-                  {items[0].groupName}
+            Array.from(grouped.entries()).map(([agentKey, agentGroup]) => (
+              <div key={agentKey} className="space-y-2">
+                <div className="flex items-center gap-1.5 px-1 text-xs font-semibold text-foreground">
+                  <Bot className="w-3.5 h-3.5 text-primary" />
+                  {agentGroup.agentName}
                 </div>
-                {items.map((target) => {
-                  const key = target.agentId || `main:${target.groupJid}`;
-                  const isSelecting = selecting === key;
-                  return (
-                    <button
-                      key={key}
-                      onClick={() => onSelect(target)}
-                      disabled={!!selecting}
-                      className="w-full flex items-center gap-3 px-3 py-2 rounded-lg border border-border hover:border-brand-300 hover:bg-brand-50/50 dark:hover:border-brand-600 dark:hover:bg-brand-700/10 transition-colors text-left cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      <MessageSquare className="w-4 h-4 text-muted-foreground flex-shrink-0" />
-                      <span className="flex-1 text-sm truncate">
-                        {target.type === 'agent'
-                          ? target.agentName || 'Agent'
-                          : '主对话'}
-                      </span>
-                      {isSelecting && <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" />}
-                    </button>
-                  );
-                })}
+                {Array.from(agentGroup.workspaces.entries()).map(([groupJid, items]) => (
+                  <div key={groupJid} className="space-y-1 rounded-md border border-border/60 p-2">
+                    <div className="flex items-center gap-1.5 px-1 text-xs font-medium text-muted-foreground">
+                      <FolderOpen className="w-3 h-3" />
+                      {items[0].groupName}
+                    </div>
+                    {items.map((target) => {
+                      const key = target.sessionId || `main:${target.groupJid}`;
+                      const isSelecting = selecting === key;
+                      return (
+                        <button
+                          key={key}
+                          onClick={() => onSelect(target)}
+                          disabled={!!selecting}
+                          className="w-full flex items-center gap-3 px-3 py-2 rounded-md border border-border hover:border-brand-300 hover:bg-brand-50/50 dark:hover:border-brand-600 dark:hover:bg-brand-700/10 transition-colors text-left cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          <MessageSquare className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                          <span className="flex-1 text-sm truncate">
+                            {target.type === 'session'
+                              ? target.sessionName || '会话'
+                              : '主会话'}
+                          </span>
+                          {isSelecting && <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ))}
               </div>
             ))}
         </div>
