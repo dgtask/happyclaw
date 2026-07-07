@@ -25,6 +25,7 @@ const {
   createTask,
   getTaskById,
   getDueTasks,
+  claimTaskForRun,
   advanceSkippedTask,
   updateTaskAfterRun,
 } = await import('../src/db.js');
@@ -111,10 +112,33 @@ describe('task backfill grace — db helpers', () => {
 
   test('updateTaskAfterRun continues to set last_run (sanity check the helpers stay distinct)', () => {
     const id = makeTask();
-    updateTaskAfterRun(id, new Date(Date.now() + 60_000).toISOString(), 'ran ok');
+    updateTaskAfterRun(
+      id,
+      new Date(Date.now() + 60_000).toISOString(),
+      'ran ok',
+    );
     const after = getTaskById(id)!;
     expect(after.last_run).toBeTruthy(); // contrast with advanceSkippedTask
     expect(after.last_result).toBe('ran ok');
+  });
+
+  test('claimTaskForRun gives a due task to only one scheduler runner and hides it from getDueTasks until released', () => {
+    const id = makeTask({
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+    });
+
+    expect(claimTaskForRun(id, 'runner-a', 60_000)).toBe(true);
+    expect(claimTaskForRun(id, 'runner-b', 60_000)).toBe(false);
+    expect(getDueTasks().map((t) => t.id)).not.toContain(id);
+
+    updateTaskAfterRun(
+      id,
+      new Date(Date.now() + 60_000).toISOString(),
+      'claimed run done',
+    );
+    const after = getTaskById(id)!;
+    expect(after.running_until).toBeNull();
+    expect(after.runner_id).toBeNull();
   });
 });
 
@@ -123,7 +147,9 @@ describe('task backfill grace — decision predicate', () => {
   // breaks the test rather than silently drifting from a local mirror.
 
   test('graceMs=0 disables skipping (legacy behavior preserved)', () => {
-    const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+    const tenDaysAgo = new Date(
+      Date.now() - 10 * 24 * 60 * 60 * 1000,
+    ).toISOString();
     expect(shouldSkipBackfill(tenDaysAgo, Date.now(), 0)).toBe(false);
   });
 

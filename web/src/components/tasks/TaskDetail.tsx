@@ -3,24 +3,55 @@ import { Link } from 'react-router-dom';
 import { Check, Pencil, RefreshCw, X } from 'lucide-react';
 import { ScheduledTask, TaskRunLog, useTasksStore } from '../../stores/tasks';
 import { showToast } from '../../utils/toast';
-import { INTERVAL_UNITS, formatInterval, decomposeInterval, toggleNotifyChannel } from '../../utils/task-utils';
+import {
+  INTERVAL_UNITS,
+  formatContextMode,
+  formatInterval,
+  decomposeInterval,
+  toggleNotifyChannel,
+} from '../../utils/task-utils';
 import { useConnectedChannels } from '../../hooks/useConnectedChannels';
-import { ChannelBadge, CHANNEL_LABEL, formatGroupLabel } from '../settings/channel-meta';
+import {
+  ChannelBadge,
+  CHANNEL_LABEL,
+  formatGroupLabel,
+} from '../settings/channel-meta';
 
 interface TaskDetailProps {
   task: ScheduledTask;
 }
 
-const LOG_STATUS_STYLES: Record<string, { bg: string; text: string; label: string }> = {
-  running: { bg: 'bg-blue-100 dark:bg-blue-900/40', text: 'text-blue-700 dark:text-blue-300', label: '运行中' },
-  success: { bg: 'bg-green-100 dark:bg-green-900/40', text: 'text-green-700 dark:text-green-300', label: '成功' },
-  error: { bg: 'bg-red-100 dark:bg-red-900/40', text: 'text-red-700 dark:text-red-300', label: '失败' },
+const LOG_STATUS_STYLES: Record<
+  string,
+  { bg: string; text: string; label: string }
+> = {
+  running: {
+    bg: 'bg-blue-100 dark:bg-blue-900/40',
+    text: 'text-blue-700 dark:text-blue-300',
+    label: '运行中',
+  },
+  success: {
+    bg: 'bg-green-100 dark:bg-green-900/40',
+    text: 'text-green-700 dark:text-green-300',
+    label: '成功',
+  },
+  error: {
+    bg: 'bg-red-100 dark:bg-red-900/40',
+    text: 'text-red-700 dark:text-red-300',
+    label: '失败',
+  },
 };
 
 function RunLogStatusBadge({ status }: { status: string }) {
-  const style = LOG_STATUS_STYLES[status] || { bg: 'bg-muted', text: 'text-muted-foreground', label: status };
+  const style = LOG_STATUS_STYLES[status] || {
+    bg: 'bg-muted',
+    text: 'text-muted-foreground',
+    label: status,
+  };
   return (
-    <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${style.bg} ${style.text}`}>
+    <span
+      className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${style.bg} ${style.text}`}
+    >
       {style.label}
     </span>
   );
@@ -65,6 +96,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
     schedule_value: task.schedule_value,
     notify_channels: task.notify_channels ?? null,
     chat_jid: task.chat_jid,
+    context_mode: task.context_mode,
   });
 
   // Interval editing: decompose ms into number + unit
@@ -85,6 +117,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
         schedule_value: task.schedule_value,
         notify_channels: task.notify_channels ?? null,
         chat_jid: task.chat_jid,
+        context_mode: task.context_mode,
       });
       const decomposed = decomposeInterval(task.schedule_value);
       setIntervalNum(decomposed.num);
@@ -115,6 +148,8 @@ export function TaskDetail({ task }: TaskDetailProps) {
         fields.notify_channels = editForm.notify_channels;
       if (editForm.chat_jid !== task.chat_jid)
         fields.chat_jid = editForm.chat_jid;
+      if (editForm.context_mode !== task.context_mode)
+        fields.context_mode = editForm.context_mode;
 
       if (Object.keys(fields).length > 0) {
         await updateTask(task.id, fields);
@@ -136,6 +171,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
       schedule_value: task.schedule_value,
       notify_channels: task.notify_channels ?? null,
       chat_jid: task.chat_jid,
+      context_mode: task.context_mode,
     });
     const decomposed = decomposeInterval(task.schedule_value);
     setIntervalNum(decomposed.num);
@@ -150,7 +186,11 @@ export function TaskDetail({ task }: TaskDetailProps) {
   const toggleChannel = (ch: string) => {
     setEditForm((prev) => ({
       ...prev,
-      notify_channels: toggleNotifyChannel(prev.notify_channels, ch, connectedKeys),
+      notify_channels: toggleNotifyChannel(
+        prev.notify_channels,
+        ch,
+        connectedKeys,
+      ),
     }));
   };
 
@@ -430,7 +470,30 @@ export function TaskDetail({ task }: TaskDetailProps) {
         )}
 
         <div>
-          <div className="text-xs text-muted-foreground mb-1">消息目标</div>
+          <div className="text-xs text-muted-foreground mb-1">会话模式</div>
+          {editing ? (
+            <select
+              value={editForm.context_mode}
+              onChange={(e) =>
+                setEditForm({
+                  ...editForm,
+                  context_mode: e.target.value as 'group' | 'isolated',
+                })
+              }
+              className="w-full text-sm text-foreground bg-card px-2 py-1 rounded border border-border focus:outline-none focus:ring-1 focus:ring-primary"
+            >
+              <option value="isolated">独立任务会话</option>
+              <option value="group">主会话执行</option>
+            </select>
+          ) : (
+            <div className="text-sm text-foreground">
+              {formatContextMode(task.context_mode)}
+            </div>
+          )}
+        </div>
+
+        <div>
+          <div className="text-xs text-muted-foreground mb-1">所属工作区</div>
           {editing ? (
             <select
               value={editForm.chat_jid}
@@ -449,14 +512,28 @@ export function TaskDetail({ task }: TaskDetailProps) {
             <div className="text-sm text-foreground inline-flex items-center gap-1.5">
               <ChannelBadge channelType={task.chat_jid.split(':')[0]} />
               <span>{groupNames[task.chat_jid] || task.chat_jid}</span>
-              <span className="text-xs text-muted-foreground">({task.chat_jid.split(':').slice(1).join(':')})</span>
+              <span className="text-xs text-muted-foreground">
+                ({task.chat_jid.split(':').slice(1).join(':')})
+              </span>
             </div>
           )}
         </div>
 
-        {task.workspace_folder && (
+        <div>
+          <div className="text-xs text-muted-foreground mb-1">工作区目录</div>
+          <Link
+            to={`/chat/${task.group_folder}`}
+            className="text-sm text-primary hover:underline"
+          >
+            {task.group_folder}
+          </Link>
+        </div>
+
+        {task.workspace_folder?.startsWith('task-') && (
           <div>
-            <div className="text-xs text-muted-foreground mb-1">任务工作区</div>
+            <div className="text-xs text-muted-foreground mb-1">
+              旧版任务工作区
+            </div>
             <Link
               to={`/chat/${task.workspace_folder}`}
               className="text-sm text-primary hover:underline"
@@ -515,15 +592,17 @@ export function TaskDetail({ task }: TaskDetailProps) {
             className="p-1 text-muted-foreground hover:text-foreground transition-colors cursor-pointer disabled:opacity-50"
             title="刷新日志"
           >
-            <RefreshCw className={`w-4 h-4 ${logsLoading ? 'animate-spin' : ''}`} />
+            <RefreshCw
+              className={`w-4 h-4 ${logsLoading ? 'animate-spin' : ''}`}
+            />
           </button>
         </div>
 
         {taskLogs.length === 0 ? (
           <p className="text-xs text-muted-foreground">暂无执行记录</p>
         ) : (
-          <div className="border border-border rounded-lg overflow-hidden">
-            <table className="w-full text-sm">
+          <div className="overflow-x-auto rounded-lg border border-border">
+            <table className="w-full min-w-[720px] text-sm">
               <thead>
                 <tr className="bg-brand-50 text-primary text-xs">
                   <th className="text-left px-4 py-2 font-medium">运行时间</th>
@@ -539,14 +618,21 @@ export function TaskDetail({ task }: TaskDetailProps) {
                       {formatDate(log.run_at)}
                     </td>
                     <td className="px-4 py-2.5 text-foreground whitespace-nowrap">
-                      {log.status === 'running' ? '-' : formatDuration(log.duration_ms)}
+                      {log.status === 'running'
+                        ? '-'
+                        : formatDuration(log.duration_ms)}
                     </td>
                     <td className="px-4 py-2.5">
                       <RunLogStatusBadge status={log.status} />
                     </td>
-                    <td className="px-4 py-2.5 text-foreground truncate max-w-xs" title={log.error || log.result || ''}>
+                    <td
+                      className="px-4 py-2.5 text-foreground truncate max-w-xs"
+                      title={log.error || log.result || ''}
+                    >
                       {log.error ? (
-                        <span className="text-red-600 dark:text-red-400">{log.error.slice(0, 100)}</span>
+                        <span className="text-red-600 dark:text-red-400">
+                          {log.error.slice(0, 100)}
+                        </span>
                       ) : log.result ? (
                         log.result.slice(0, 100)
                       ) : log.status === 'running' ? (

@@ -46,7 +46,12 @@ export interface ChannelMount {
   session_id?: string | null;
   routing_mode: ChannelRoutingMode;
   reply_policy: 'source_only' | 'mirror';
-  activation_mode: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled';
+  activation_mode:
+    | 'auto'
+    | 'always'
+    | 'when_mentioned'
+    | 'owner_mentioned'
+    | 'disabled';
   owner_im_id?: string | null;
   created_at: string;
   updated_at: string;
@@ -76,7 +81,12 @@ export interface RegisteredGroup {
   target_main_jid?: string; // IM 消息路由到指定工作区的主会话（web:{folder}）
   reply_policy?: 'source_only' | 'mirror'; // IM 绑定的回复策略
   require_mention?: boolean; // 群聊是否需要 @机器人 才响应（默认 false）
-  activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled'; // 消息门控模式（默认 'auto'，兼容 require_mention）
+  activation_mode?:
+    | 'auto'
+    | 'always'
+    | 'when_mentioned'
+    | 'owner_mentioned'
+    | 'disabled'; // 消息门控模式（默认 'auto'，兼容 require_mention）
   owner_im_id?: string; // activation_mode 为 'owner_mentioned' 时，仅此 IM 标识符的发送者被响应
   sender_allowlist?: string[] | null; // null/undefined = 不限制，[] = 仅 owner 可触发（未 /claim 时无人可触发），[ids] = 白名单
   mcp_mode?: 'inherit' | 'custom'; // MCP 配置模式（默认 'inherit' 继承用户配置）
@@ -172,6 +182,8 @@ export interface ScheduledTask {
   execution_mode?: 'host' | 'container' | null;
   workspace_jid?: string | null;
   workspace_folder?: string | null;
+  running_until?: string | null;
+  runner_id?: string | null;
   next_run: string | null;
   last_run: string | null;
   last_result: string | null;
@@ -447,12 +459,7 @@ export type WsMessageOut =
   | {
       type: 'whatsapp_status';
       userId: string;
-      status:
-        | 'connecting'
-        | 'qr'
-        | 'connected'
-        | 'disconnected'
-        | 'logged_out';
+      status: 'connecting' | 'qr' | 'connected' | 'disconnected' | 'logged_out';
       qr?: string;
       qrDataUrl?: string;
       error?: string;
@@ -482,12 +489,30 @@ export type WsMessageOut =
           id: string;
           timestamp: number;
           text: string;
-          kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'debug' | 'context' | 'permission';
+          kind:
+            | 'tool'
+            | 'skill'
+            | 'hook'
+            | 'status'
+            | 'task'
+            | 'memory'
+            | 'debug'
+            | 'context'
+            | 'permission';
         }>;
         traceEvents?: Array<{
           id: string;
           timestamp: number;
-          kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'debug' | 'context' | 'permission';
+          kind:
+            | 'tool'
+            | 'skill'
+            | 'hook'
+            | 'status'
+            | 'task'
+            | 'memory'
+            | 'debug'
+            | 'context'
+            | 'permission';
           scope?: StreamEvent['agentScope'];
           title: string;
           summary?: string;

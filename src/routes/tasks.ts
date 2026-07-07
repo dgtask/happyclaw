@@ -36,15 +36,20 @@ import { getRunningTaskIds } from '../task-scheduler.js';
 import { getChannelType, extractChatId } from '../im-channel.js';
 
 const tasksRoutes = new Hono<{ Variables: Variables }>();
+const MIN_INTERVAL_MS = 60 * 1000;
 
 /**
- * 防止共享工作区里 member A 改 / 跑 / 删 member B 的任务。admin 例外、
- * 历史 task.created_by=null 的也放行（兼容老数据；管理员可视情况手动迁移）。
+ * 防止共享工作区里 member A 改 / 跑 / 删 member B 的任务。admin 例外。
+ * 历史 task.created_by=null 的任务只对 admin 可见，避免在共享工作区泄漏 prompt / logs。
  * 返回 null = 通过；返回 Response = 404（统一伪装为 not_found，避免泄漏存在性）。
  */
-function denyForeignTask(c: any, existing: { created_by?: string | null }, authUser: AuthUser): Response | null {
+function denyForeignTask(
+  c: any,
+  existing: { created_by?: string | null },
+  authUser: AuthUser,
+): Response | null {
   if (authUser.role === 'admin') return null;
-  if (!existing.created_by) return null; // legacy task without owner — admin-only effectively
+  if (!existing.created_by) return c.json({ error: 'Task not found' }, 404);
   if (existing.created_by === authUser.id) return null;
   return c.json({ error: 'Task not found' }, 404);
 }
@@ -59,17 +64,29 @@ tasksRoutes.get('/', authMiddleware, async (c) => {
     if (task.execution_mode === 'host' && authUser.role !== 'admin') {
       return false;
     }
+    // Tasks are user-owned. Shared workspace membership does not grant
+    // visibility into another member's task prompt, logs, or run status.
+    if (authUser.role !== 'admin' && task.created_by !== authUser.id) {
+      return false;
+    }
     const group = allGroups[task.chat_jid];
     // Conservative: if group can't be resolved, only admin can see (may be orphaned task)
     if (!group) return authUser.role === 'admin';
-    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, { ...group, jid: task.chat_jid }))
+    if (
+      !canAccessGroup(
+        { id: authUser.id, role: authUser.role },
+        { ...group, jid: task.chat_jid },
+      )
+    )
       return false;
     if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser))
       return false;
     return true;
   });
   const visibleTaskIds = new Set(tasks.map((t) => t.id));
-  const filteredRunningIds = getRunningTaskIds().filter((id) => visibleTaskIds.has(id));
+  const filteredRunningIds = getRunningTaskIds().filter((id) =>
+    visibleTaskIds.has(id),
+  );
 
   // Build jid → name mapping for all registered groups (including IM channels).
   // Mirror the visibility rule used by GET /api/groups (src/routes/groups.ts:190-192):
@@ -79,8 +96,15 @@ tasksRoutes.get('/', authMiddleware, async (c) => {
   // write; this filter is purely for surface consistency.
   const groupNames: Record<string, string> = {};
   for (const [jid, group] of Object.entries(allGroups)) {
-    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, { ...group, jid })) continue;
-    if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) continue;
+    if (
+      !canAccessGroup(
+        { id: authUser.id, role: authUser.role },
+        { ...group, jid },
+      )
+    )
+      continue;
+    if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser))
+      continue;
     groupNames[jid] = group.name || jid;
   }
 
@@ -194,11 +218,16 @@ tasksRoutes.post('/', authMiddleware, async (c) => {
   let nextRun: string;
   if (schedule_type === 'cron') {
     try {
-      const cronNext = CronExpressionParser.parse(schedule_value, { tz: TIMEZONE })
+      const cronNext = CronExpressionParser.parse(schedule_value, {
+        tz: TIMEZONE,
+      })
         .next()
         .toISOString();
       if (!cronNext) {
-        return c.json({ error: 'Cron expression produced no next run time' }, 400);
+        return c.json(
+          { error: 'Cron expression produced no next run time' },
+          400,
+        );
       }
       nextRun = cronNext;
     } catch {
@@ -218,7 +247,7 @@ tasksRoutes.post('/', authMiddleware, async (c) => {
     prompt: prompt || '',
     schedule_type,
     schedule_value,
-    context_mode: validation.data.context_mode || 'group',
+    context_mode: validation.data.context_mode || 'isolated',
     execution_type: execType,
     execution_mode: taskExecutionMode,
     script_command: script_command ?? null,
@@ -266,6 +295,28 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
     );
   }
 
+  if (getRunningTaskIds().includes(id)) {
+    const unsafeWhileRunning: Array<keyof typeof validation.data> = [
+      'chat_jid',
+      'prompt',
+      'schedule_type',
+      'schedule_value',
+      'context_mode',
+      'execution_type',
+      'execution_mode',
+      'script_command',
+      'next_run',
+    ];
+    if (
+      unsafeWhileRunning.some((field) => validation.data[field] !== undefined)
+    ) {
+      return c.json(
+        { error: '任务正在运行中，请等待本次执行完成后再修改配置。' },
+        409,
+      );
+    }
+  }
+
   // Only admin can create/modify script tasks
   const isScriptTask =
     validation.data.execution_type === 'script' ||
@@ -281,14 +332,18 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
   }
 
   // Validate chat_jid if being changed
-  const patchData = { ...validation.data } as typeof validation.data & { group_folder?: string };
+  const patchData = { ...validation.data } as typeof validation.data & {
+    group_folder?: string;
+  };
   let effectiveTargetGroup: ReturnType<typeof getRegisteredGroup> = group;
   if (validation.data.chat_jid !== undefined) {
     const targetGroup = getRegisteredGroup(validation.data.chat_jid);
     if (!targetGroup) {
       return c.json({ error: '目标群组不存在' }, 404);
     }
-    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, targetGroup)) {
+    if (
+      !canAccessGroup({ id: authUser.id, role: authUser.role }, targetGroup)
+    ) {
       return c.json({ error: '无权访问目标群组' }, 403);
     }
     // Keep group_folder in sync with chat_jid
@@ -360,15 +415,19 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
     const schedValue = patchData.schedule_value ?? existing.schedule_value;
     try {
       if (schedType === 'cron') {
-        patchData.next_run = CronExpressionParser.parse(schedValue, { tz: TIMEZONE })
-          .next()
-          .toISOString() || new Date().toISOString();
+        patchData.next_run =
+          CronExpressionParser.parse(schedValue, { tz: TIMEZONE })
+            .next()
+            .toISOString() || new Date().toISOString();
       } else if (schedType === 'interval') {
         // Number() not parseInt(): parseInt('1e16',10) === 1 silently truncates
         // and the patch ends up with a 1ms interval. Same upper bound as create.
         const ms = Number(schedValue);
-        if (!Number.isFinite(ms) || ms <= 0) {
-          return c.json({ error: 'Invalid interval value' }, 400);
+        if (!Number.isFinite(ms) || ms < MIN_INTERVAL_MS) {
+          return c.json(
+            { error: 'Interval must be at least 60000 milliseconds' },
+            400,
+          );
         }
         const MAX_INTERVAL_MS = 365 * 24 * 60 * 60 * 1000;
         if (ms > MAX_INTERVAL_MS) {
@@ -388,7 +447,10 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
         patchData.next_run = new Date(ts).toISOString();
       }
     } catch {
-      return c.json({ error: 'Invalid schedule value for the given schedule type' }, 400);
+      return c.json(
+        { error: 'Invalid schedule value for the given schedule type' },
+        400,
+      );
     }
   }
 
@@ -431,8 +493,13 @@ tasksRoutes.delete('/:id', authMiddleware, (c) => {
     return c.json({ error: '任务正在运行中，请先等待完成或停止任务' }, 409);
   }
 
-  // Clean up dedicated workspace if exists
-  if (existing.workspace_jid && existing.workspace_folder) {
+  // Clean up only legacy dedicated task workspaces. New scheduled tasks run
+  // inside their source workspace and must never delete that workspace here.
+  if (
+    existing.workspace_jid &&
+    existing.workspace_folder &&
+    existing.workspace_folder.startsWith('task-')
+  ) {
     const wsGroup = getRegisteredGroup(existing.workspace_jid);
     if (wsGroup) {
       deleteGroupData(existing.workspace_jid, existing.workspace_folder);
@@ -450,7 +517,7 @@ tasksRoutes.delete('/:id', authMiddleware, (c) => {
         workspaceJid: existing.workspace_jid,
         workspaceFolder: existing.workspace_folder,
       },
-      'Task workspace deleted',
+      'Legacy task workspace deleted',
     );
   }
 
@@ -550,7 +617,7 @@ function buildParsePrompt(description: string): string {
   - cron 类型: cron 表达式（推荐 5 段：分 时 日 月 周，也支持 6 段含秒）
   - interval 类型: 毫秒数字符串（如 "3600000" 表示 1 小时）
   - once 类型: ISO 8601 日期时间字符串
-- "context_mode": "group" | "isolated" — 上下文模式（大多数情况推荐 "group"）
+- "context_mode": "group" | "isolated" — 上下文模式（默认推荐 "isolated"，表示工作区内独立任务会话，不影响主会话）
 - "summary": string — 用一句话解释你的理解（中文）
 
 注意：
@@ -573,7 +640,12 @@ function buildParsePrompt(description: string): string {
 function parseAiResult(
   result: string,
   description: string,
-): { prompt: string; schedule_type: string; schedule_value: string; summary: string } | null {
+): {
+  prompt: string;
+  schedule_type: string;
+  schedule_value: string;
+  summary: string;
+} | null {
   try {
     let jsonStr = result;
     const fenced = result.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -596,7 +668,8 @@ function parseAiResult(
 tasksRoutes.post('/ai', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
   const body = await c.req.json().catch(() => ({}));
-  const description = typeof body.description === 'string' ? body.description.trim() : '';
+  const description =
+    typeof body.description === 'string' ? body.description.trim() : '';
   if (!description) {
     return c.json({ error: '请输入任务描述' }, 400);
   }
@@ -660,7 +733,7 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
     prompt: description,
     schedule_type: 'cron',
     schedule_value: '0 0 * * *', // placeholder, will be updated after parsing
-    context_mode: requestedContextMode ?? 'group',
+    context_mode: requestedContextMode ?? 'isolated',
     execution_type: 'agent',
     execution_mode: taskExecutionMode,
     script_command: null,
@@ -671,7 +744,10 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
     notify_channels: notifyChannels,
   });
 
-  logger.info({ taskId, description: description.slice(0, 80) }, 'AI task created, parsing in background');
+  logger.info(
+    { taskId, description: description.slice(0, 80) },
+    'AI task created, parsing in background',
+  );
 
   // Background: parse with SDK and update task
   void (async () => {
@@ -707,11 +783,17 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
       let nextRun: string | null = null;
       try {
         if (parsed.schedule_type === 'cron') {
-          nextRun = CronExpressionParser.parse(parsed.schedule_value, { tz: TIMEZONE })
+          nextRun = CronExpressionParser.parse(parsed.schedule_value, {
+            tz: TIMEZONE,
+          })
             .next()
             .toISOString();
         } else if (parsed.schedule_type === 'interval') {
-          nextRun = new Date(Date.now() + Number(parsed.schedule_value)).toISOString();
+          const ms = Number(parsed.schedule_value);
+          if (!Number.isFinite(ms) || ms < MIN_INTERVAL_MS) {
+            throw new Error('Interval must be at least 60000 milliseconds');
+          }
+          nextRun = new Date(Date.now() + ms).toISOString();
         } else {
           nextRun = new Date(parsed.schedule_value).toISOString();
         }
@@ -723,7 +805,10 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
           status: 'paused',
           prompt: parsed.prompt,
         });
-        logger.warn({ taskId, scheduleValue: parsed.schedule_value }, 'AI parsed schedule invalid, task paused');
+        logger.warn(
+          { taskId, scheduleValue: parsed.schedule_value },
+          'AI parsed schedule invalid, task paused',
+        );
         return;
       }
 
@@ -738,7 +823,11 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
       });
 
       logger.info(
-        { taskId, scheduleType: parsed.schedule_type, scheduleValue: parsed.schedule_value },
+        {
+          taskId,
+          scheduleType: parsed.schedule_type,
+          scheduleValue: parsed.schedule_value,
+        },
         'AI task parse complete, activated',
       );
     } catch (err) {
@@ -748,7 +837,9 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
         updateTask(taskId, { status: 'paused' });
       }
     }
-  })().catch((err) => logger.error({ taskId, err }, 'Unhandled AI task parse error'));
+  })().catch((err) =>
+    logger.error({ taskId, err }, 'Unhandled AI task parse error'),
+  );
 
   return c.json({ success: true, taskId });
 });
@@ -758,14 +849,18 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
  */
 tasksRoutes.post('/parse', authMiddleware, async (c) => {
   const body = await c.req.json().catch(() => ({}));
-  const description = typeof body.description === 'string' ? body.description.trim() : '';
+  const description =
+    typeof body.description === 'string' ? body.description.trim() : '';
   if (!description) {
     return c.json({ error: '请输入任务描述' }, 400);
   }
 
   try {
     const model = process.env.RECALL_MODEL || undefined;
-    const result = await sdkQuery(buildParsePrompt(description), { model, timeout: 30_000 });
+    const result = await sdkQuery(buildParsePrompt(description), {
+      model,
+      timeout: 30_000,
+    });
 
     if (!result) {
       return c.json({ error: 'AI 解析失败，请重试或切换到手动模式' }, 502);

@@ -311,6 +311,7 @@ async function paintImageOverlays(canvas: HTMLCanvasElement, root: HTMLElement, 
 export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
   const [state, setState] = useState<GenerateState>('generating');
   const [dataUrl, setDataUrl] = useState<string | null>(null);
+  const [previewWidth, setPreviewWidth] = useState<number | null>(null);
   const [errorMsg, setErrorMsg] = useState('');
   const cardRef = useRef<HTMLDivElement>(null);
   const currentUser = useAuthStore((s) => s.user);
@@ -335,6 +336,7 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
   const generate = useCallback(async () => {
     setState('generating');
     setDataUrl(null);
+    setPreviewWidth(null);
     setErrorMsg('');
 
     // Wait a tick for offscreen card to mount
@@ -372,6 +374,8 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
       await new Promise((r) => requestAnimationFrame(r));
 
       await waitForRenderComplete(el);
+      const previewRect = el.getBoundingClientRect();
+      setPreviewWidth(Math.ceil(previewRect.width || cardWidth));
       const imageOverlays = collectImageOverlays(el);
       const canvas = await toCanvas(el, {
         pixelRatio: computeExportPixelRatio(el),
@@ -427,11 +431,12 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
     >
       {/* Dialog card */}
       <div
-        className="relative bg-card rounded-2xl shadow-2xl border border-border w-[90vw] max-w-2xl max-h-[85vh] flex flex-col animate-in zoom-in-95 fade-in duration-200"
+        className="relative flex max-h-[88vh] flex-col rounded-2xl border border-border bg-card shadow-2xl animate-in zoom-in-95 fade-in duration-200"
+        style={{ width: 'min(94vw, 1280px)' }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-border">
+        <div className="flex items-center justify-between border-b border-border px-4 py-3 sm:px-5 sm:py-4">
           <h2 className="text-base font-semibold text-foreground">生成分享图片</h2>
           <button
             onClick={onClose}
@@ -442,7 +447,7 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
         </div>
 
         {/* Body */}
-        <div className="flex-1 overflow-auto p-5">
+        <div className="flex-1 overflow-auto p-3 sm:p-5">
           {state === 'generating' && (
             <div className="flex flex-col items-center justify-center py-16 gap-3">
               <RefreshCw className="w-6 h-6 text-primary animate-spin" />
@@ -463,17 +468,24 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
           )}
 
           {state === 'preview' && dataUrl && (
-            <img
-              src={dataUrl}
-              alt="分享预览"
-              className="w-full rounded-lg border border-border"
-            />
+            <div className="flex justify-center">
+              <img
+                src={dataUrl}
+                alt="分享预览"
+                className="block rounded-lg border border-border shadow-sm"
+                style={{
+                  width: previewWidth ? `${previewWidth}px` : undefined,
+                  maxWidth: '100%',
+                  height: 'auto',
+                }}
+              />
+            </div>
           )}
         </div>
 
         {/* Footer */}
         {state === 'preview' && (
-          <div className="flex gap-3 px-5 py-4 border-t border-border">
+          <div className="flex flex-col gap-2 border-t border-border px-4 py-3 sm:flex-row sm:gap-3 sm:px-5 sm:py-4">
             <button
               onClick={handleCopy}
               className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium border border-border rounded-lg hover:bg-accent transition-colors cursor-pointer"
@@ -492,8 +504,11 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
         )}
       </div>
 
-      {/* Hidden render area — keep it paintable for iOS PWA image rasterization. */}
-      <div style={{ position: 'fixed', left: 0, top: 0, zIndex: -1, pointerEvents: 'none' }}>
+      {/* Hidden render area — offscreen but still layouted/paintable for iOS PWA rasterization. */}
+      <div
+        aria-hidden="true"
+        style={{ position: 'fixed', left: -10000, top: 0, pointerEvents: 'none' }}
+      >
         <ShareCardRenderer
           ref={cardRef}
           content={message.content}

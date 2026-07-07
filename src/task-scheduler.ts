@@ -1,5 +1,5 @@
 import { ChildProcess } from 'child_process';
-import crypto from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 import path from 'path';
@@ -18,14 +18,14 @@ import {
   writeTasksSnapshot,
 } from './container-runner.js';
 import {
-  addGroupMember,
   advanceSkippedTask,
   getAllTasks,
   cleanupOldTaskRunLogs,
   cleanupStaleRunningLogs,
+  claimTaskForRun,
   deleteGroupData,
-  ensureChatExists,
   getDueTasks,
+  getSession,
   getTaskById,
   getUserById,
   getUserHomeGroup,
@@ -35,21 +35,22 @@ import {
   logTaskRunStart,
   updateTaskRunLog,
   pauseTaskAfterRun,
-  setRegisteredGroup,
   setSession,
   deleteSession,
-  updateChatName,
   updateTaskAfterRun,
-  updateTaskWorkspace,
   updateTask,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { logger } from './logger.js';
-import { resolveTaskOwner } from './task-utils.js';
 import { removeFlowArtifacts } from './file-manager.js';
 import { hasScriptCapacity, runScript } from './script-runner.js';
 import type { StreamEvent } from './stream-event.types.js';
-import { AgentProfile, ExecutionMode, RegisteredGroup, ScheduledTask } from './types.js';
+import {
+  AgentProfile,
+  ExecutionMode,
+  RegisteredGroup,
+  ScheduledTask,
+} from './types.js';
 import { checkBillingAccessFresh, isBillingEnabled } from './billing.js';
 import { checkOwnerActive } from './owner-gate.js';
 import { stripAgentInternalTags } from './utils.js';
@@ -111,9 +112,10 @@ function toRunnerAgentProfile(profile: AgentProfile | undefined) {
 function taskSessionNeedsAgentProfileReset(
   groupFolder: string,
   profile: AgentProfile | undefined,
+  sessionAgentId?: string | null,
 ): boolean {
   if (!profile) return false;
-  const current = getSessionAgentIdentity(groupFolder);
+  const current = getSessionAgentIdentity(groupFolder, sessionAgentId);
   if (!current) return false;
   if (
     !current.agent_profile_id &&
@@ -127,106 +129,51 @@ function taskSessionNeedsAgentProfileReset(
   return !!current.agent_profile_id && current.agent_profile_id !== profile.id;
 }
 
-function ensureTaskWorkspace(
+function resolveTaskWorkspace(
   task: ScheduledTask,
   deps: SchedulerDependencies,
-): { jid: string; folder: string } {
-  // If workspace already exists and is registered, reuse it
-  if (task.workspace_jid && task.workspace_folder) {
-    const groups = deps.registeredGroups();
-    if (groups[task.workspace_jid]) {
-      return { jid: task.workspace_jid, folder: task.workspace_folder };
-    }
-    // Workspace was deleted externally — clean up orphaned filesystem directory before recreating
-    const oldDir = path.join(GROUPS_DIR, task.workspace_folder);
-    try {
-      fs.rmSync(oldDir, { recursive: true, force: true });
-    } catch { /* ignore if already gone */ }
-  }
-
-  const jid = `web:${crypto.randomUUID()}`;
-  // Strip existing 'task-' prefix from IPC-originated IDs to avoid 'task-task-...'
-  const idBase = task.id.startsWith('task-') ? task.id.slice(5) : task.id;
-  // 用完整 task id 而不是 slice(0,12)：12 字符的截断只有 ~32 bit 熵，会让两个
-  // 同时创建的隔离任务指向同一个 folder，互相覆盖工作区文件。task id 已经是
-  // randomUUID 形态、不超长，直接用。registerGroup 的 folder 校验允许 . - _。
-  const folder = `task-${idBase}`;
-  // 从 prompt 提取简短名称（取第一行前 12 个字符）
-  const firstLine = task.prompt.split('\n')[0].trim();
-  const shortName = firstLine.slice(0, 12).trim() || task.id.slice(0, 6);
-  const name = shortName;
-
-  const executionMode = resolveTaskExecutionMode(task, deps);
-
-  const sourceGroup = Object.values(deps.registeredGroups()).find(
-    (g) => g.folder === task.group_folder,
+): { jid: string; folder: string; group: RegisteredGroup } | null {
+  const groups = deps.registeredGroups();
+  const sameFolder = Object.entries(groups).filter(
+    ([, g]) => g.folder === task.group_folder,
   );
-  const ownerId = resolveTaskOwner(task, sourceGroup);
-
-  const group: RegisteredGroup = {
-    name,
-    folder,
-    added_at: new Date().toISOString(),
-    executionMode,
-    created_by: ownerId,
-  };
-
-  setRegisteredGroup(jid, group);
-  ensureChatExists(jid);
-  updateChatName(jid, name);
-  if (ownerId) {
-    addGroupMember(folder, ownerId, 'owner', ownerId);
-  }
-  deps.registeredGroups()[jid] = group;
-
-  // Create filesystem directory
-  const groupDir = path.join(GROUPS_DIR, folder);
-  fs.mkdirSync(groupDir, { recursive: true });
-
-  // Persist workspace info back to the task record
-  updateTaskWorkspace(task.id, jid, folder);
-  // Also update the in-memory task object
-  task.workspace_jid = jid;
-  task.workspace_folder = folder;
-
-  logger.info(
-    { taskId: task.id, folder, jid, executionMode, ownerId },
-    'Created task workspace',
-  );
-
-  // Notify frontend via WebSocket so sidebar refreshes (scoped to task owner)
-  deps.onWorkspaceCreated?.(jid, folder, name, ownerId);
-
-  return { jid, folder };
+  const preferred =
+    sameFolder.find(([jid]) => jid.startsWith('web:')) ||
+    (groups[task.chat_jid]
+      ? ([task.chat_jid, groups[task.chat_jid]] as const)
+      : undefined) ||
+    sameFolder[0];
+  if (!preferred) return null;
+  const [jid, group] = preferred;
+  return { jid, folder: group.folder, group };
 }
 
 /**
  * Compute the queue JID for an isolated (non-group, non-script) task run.
- * Materializes the workspace BEFORE enqueueing so the queue JID matches the
- * effectiveJid runTaskInner derives from workspace.jid (runTaskInner re-runs
- * ensureTaskWorkspace, which reuses the now-persisted workspace_jid).
+ * The queue key is a virtual task chat under the source workspace. That keeps
+ * scheduler execution out of the main session while still using the same
+ * workspace directory and environment.
  *
- * Returns null if ensureTaskWorkspace throws (transient SQLITE_BUSY, ENOSPC,
- * etc.): we MUST NOT fall back to a different base JID, because runTaskInner
- * would then succeed and register under `${web:newUuid}#task:${id}` while the
- * queue tracked `${...}#task:${id}` — an orphaned GroupState closeStdin/stopGroup
- * can never reach (leaked slot). The caller skips this run instead; the task
- * stays active and retries on the next tick. Shared by the scheduler loop and
- * triggerTaskNow so both derive the JID identically.
+ * Returns null when the source workspace cannot be resolved. The caller skips
+ * the run and retries later instead of falling back to another workspace.
  */
 function computeIsolatedTaskQueueJid(
   task: ScheduledTask,
   deps: SchedulerDependencies,
 ): string | null {
-  try {
-    return `${ensureTaskWorkspace(task, deps).jid}#task:${task.id}`;
-  } catch (err) {
+  const workspace = resolveTaskWorkspace(task, deps);
+  if (!workspace) {
     logger.error(
-      { taskId: task.id, err },
-      'Failed to ensure task workspace before enqueue; skipping this run (retries next tick)',
+      {
+        taskId: task.id,
+        groupFolder: task.group_folder,
+        chatJid: task.chat_jid,
+      },
+      'Failed to resolve task workspace before enqueue; skipping this run (retries next tick)',
     );
     return null;
   }
+  return `${workspace.jid}#task:${task.id}`;
 }
 
 export interface SchedulerDependencies {
@@ -248,9 +195,20 @@ export interface SchedulerDependencies {
     options?: { source?: string },
   ) => Promise<string | undefined | void>;
   broadcastStreamEvent?: (chatJid: string, event: StreamEvent) => void;
-  onWorkspaceCreated?: (jid: string, folder: string, name: string, userId?: string) => void;
+  onWorkspaceCreated?: (
+    jid: string,
+    folder: string,
+    name: string,
+    userId?: string,
+  ) => void;
   /** Store task prompt as a user-visible message in the workspace chat */
-  storePromptMessage?: (chatJid: string, senderId: string, senderName: string, text: string, taskId?: string) => void;
+  storePromptMessage?: (
+    chatJid: string,
+    senderId: string,
+    senderName: string,
+    text: string,
+    taskId?: string,
+  ) => void;
   /** Store task result in workspace chat and push to owner's IM channels */
   storeResultAndNotify?: (
     chatJid: string,
@@ -340,8 +298,10 @@ export function computeNextRunForSchedule(
   }
   if (type === 'interval') {
     const ms = Number(value);
-    if (!Number.isFinite(ms) || ms <= 0) {
-      throw new Error(`Invalid interval (must be positive milliseconds): ${value}`);
+    if (!Number.isFinite(ms) || ms < MIN_INTERVAL_MS) {
+      throw new Error(
+        `Invalid interval (must be at least ${MIN_INTERVAL_MS} milliseconds): ${value}`,
+      );
     }
     return new Date(Date.now() + ms).toISOString();
   }
@@ -353,8 +313,20 @@ export function computeNextRunForSchedule(
   return d.toISOString();
 }
 
-function safeComputeNextRun(task: ScheduledTask, manualRun?: boolean): string | null {
-  if (manualRun) return task.next_run ?? null;
+function safeComputeNextRun(
+  task: ScheduledTask,
+  manualRun?: boolean,
+): string | null {
+  if (manualRun) {
+    if (
+      task.schedule_type === 'once' &&
+      task.next_run &&
+      new Date(task.next_run).getTime() <= Date.now()
+    ) {
+      return null;
+    }
+    return task.next_run ?? null;
+  }
   try {
     return computeNextRun(task);
   } catch (err) {
@@ -433,6 +405,32 @@ function isTaskStillActive(taskId: string, label?: string): boolean {
   return true;
 }
 
+const SCHEDULER_RUNNER_ID = `${process.pid}:${randomUUID()}`;
+const MIN_INTERVAL_MS = 60 * 1000;
+
+function getTaskLeaseMs(): number {
+  const settings = getSystemSettings();
+  return (
+    Math.max(settings.containerTimeout, settings.idleTimeout) +
+    SCHEDULER_POLL_INTERVAL
+  );
+}
+
+function claimScheduledRun(taskId: string, label: string): boolean {
+  const claimed = claimTaskForRun(
+    taskId,
+    SCHEDULER_RUNNER_ID,
+    getTaskLeaseMs(),
+  );
+  if (!claimed) {
+    logger.info(
+      { taskId, runnerId: SCHEDULER_RUNNER_ID },
+      `Skipping ${label}: another scheduler runner already claimed it`,
+    );
+  }
+  return claimed;
+}
+
 async function runTask(
   staleTask: ScheduledTask,
   deps: SchedulerDependencies,
@@ -443,6 +441,7 @@ async function runTask(
   // Refresh task from DB to avoid stale closure data
   const task = getTaskById(staleTask.id);
   if (!task) return;
+  if (!options?.manualRun && !claimScheduledRun(task.id, 'task')) return;
 
   runningTaskIds.add(task.id);
   // 顶层兜底 finally：runningTaskIds.add 之后到 inner runTask 真正进入 try
@@ -465,27 +464,38 @@ async function runTaskInner(
   const startTime = Date.now();
   const runLogId = logTaskRunStart(task.id);
 
-  // Ensure task has a dedicated workspace (Agent tasks only)
-  const workspace = ensureTaskWorkspace(task, deps);
-  const workspaceGroups = deps.registeredGroups();
-  const workspaceGroup = workspaceGroups[workspace.jid];
+  // Agent tasks run in the source workspace directory, but use a task-scoped
+  // virtual chat/session so scheduled automation does not pollute the main chat.
+  const workspace = resolveTaskWorkspace(task, deps);
+  const workspaceGroup = workspace?.group;
 
-  if (!workspaceGroup) {
+  if (!workspace || !workspaceGroup) {
     logger.error(
-      { taskId: task.id, workspaceJid: workspace.jid },
-      'Workspace group not found after creation',
+      {
+        taskId: task.id,
+        groupFolder: task.group_folder,
+        chatJid: task.chat_jid,
+      },
+      'Workspace group not found for scheduled task',
     );
     safeUpdateTaskRunLog(task.id, runLogId, {
       duration_ms: Date.now() - startTime,
       status: 'error',
       result: null,
-      error: `Workspace group not found: ${workspace.jid}`,
+      error: `Workspace group not found: ${task.chat_jid}`,
     });
     try {
       const nextRun = safeComputeNextRun(task, options?.manualRun);
-      finalizeRecurringRun(task, nextRun, `Error: Workspace group not found: ${workspace.jid}`);
+      finalizeRecurringRun(
+        task,
+        nextRun,
+        `Error: Workspace group not found: ${task.chat_jid}`,
+      );
     } catch (err) {
-      logger.error({ taskId: task.id, err }, 'updateTaskAfterRun failed in early-exit');
+      logger.error(
+        { taskId: task.id, err },
+        'updateTaskAfterRun failed in early-exit',
+      );
     } finally {
       runningTaskIds.delete(task.id);
     }
@@ -495,6 +505,7 @@ async function runTaskInner(
   const effectiveJid = options?.taskRunId
     ? `${workspace.jid}#task:${options.taskRunId}`
     : workspace.jid;
+  const taskOwnerId = task.created_by || workspaceGroup.created_by || null;
 
   const groupDir = path.join(GROUPS_DIR, workspace.folder);
   fs.mkdirSync(groupDir, { recursive: true });
@@ -507,13 +518,13 @@ async function runTaskInner(
   // Owner gate before running task: a disabled/deleted owner's scheduled
   // tasks must stop firing (billing only checks balance, not status, and is
   // skipped for admins — so it can't cover this). See `src/owner-gate.ts`.
-  if (workspaceGroup.created_by) {
-    const ownerGate = checkOwnerActive(getUserById(workspaceGroup.created_by));
+  if (taskOwnerId) {
+    const ownerGate = checkOwnerActive(getUserById(taskOwnerId));
     if (!ownerGate.allowed) {
       logger.info(
         {
           taskId: task.id,
-          userId: workspaceGroup.created_by,
+          userId: taskOwnerId,
           ownerStatus: ownerGate.status,
         },
         'Owner not active, blocking scheduled task',
@@ -528,7 +539,10 @@ async function runTaskInner(
         const nextRun = safeComputeNextRun(task, options?.manualRun);
         finalizeRecurringRun(task, nextRun, 'Error: 账户已禁用');
       } catch (err) {
-        logger.error({ taskId: task.id, err }, 'updateTaskAfterRun failed in owner-gate');
+        logger.error(
+          { taskId: task.id, err },
+          'updateTaskAfterRun failed in owner-gate',
+        );
       } finally {
         runningTaskIds.delete(task.id);
       }
@@ -537,16 +551,16 @@ async function runTaskInner(
   }
 
   // Billing quota check before running task
-  if (isBillingEnabled() && workspaceGroup.created_by) {
-    const owner = getUserById(workspaceGroup.created_by);
+  if (isBillingEnabled() && taskOwnerId) {
+    const owner = getUserById(taskOwnerId);
     if (owner && owner.role !== 'admin') {
-      const accessResult = checkBillingAccessFresh(workspaceGroup.created_by, owner.role);
+      const accessResult = checkBillingAccessFresh(taskOwnerId, owner.role);
       if (!accessResult.allowed) {
         const reason = accessResult.reason || '当前账户不可用';
         logger.info(
           {
             taskId: task.id,
-            userId: workspaceGroup.created_by,
+            userId: taskOwnerId,
             reason,
             blockType: accessResult.blockType,
           },
@@ -563,7 +577,10 @@ async function runTaskInner(
           const nextRun = safeComputeNextRun(task, options?.manualRun);
           finalizeRecurringRun(task, nextRun, `Error: 计费限制: ${reason}`);
         } catch (err) {
-          logger.error({ taskId: task.id, err }, 'updateTaskAfterRun failed in billing-gate');
+          logger.error(
+            { taskId: task.id, err },
+            'updateTaskAfterRun failed in billing-gate',
+          );
         } finally {
           runningTaskIds.delete(task.id);
         }
@@ -573,8 +590,8 @@ async function runTaskInner(
   }
 
   // Update tasks snapshot for container to read (filtered by group)
-  const isHome = false; // Task workspaces are never home
-  const isAdminHome = false;
+  const isHome = !!workspaceGroup.is_home;
+  const isAdminHome = isHome && workspace.folder === 'main';
   const tasks = getAllTasks();
   writeTasksSnapshot(
     workspace.folder,
@@ -592,9 +609,15 @@ async function runTaskInner(
 
   // Store task prompt as a user message in workspace chat so it's visible in conversation
   if (deps.storePromptMessage) {
-    const owner = workspaceGroup.created_by ? getUserById(workspaceGroup.created_by) : null;
+    const owner = taskOwnerId ? getUserById(taskOwnerId) : null;
     const senderName = owner?.display_name || owner?.username || '定时任务';
-    deps.storePromptMessage(workspace.jid, owner?.id || 'system', senderName, task.prompt, task.id);
+    deps.storePromptMessage(
+      effectiveJid,
+      owner?.id || 'system',
+      senderName,
+      task.prompt,
+      task.id,
+    );
   }
 
   let result: string | null = null;
@@ -622,25 +645,31 @@ async function runTaskInner(
     deps.queue.closeStdin(effectiveJid);
   };
 
-  // Use persistent session for task workspace
-  const sessions = deps.getSessions();
+  // Use a task-scoped Claude session in the same workspace folder.
+  const taskSessionAgentId = `task:${task.id}`;
   const agentProfile = getAgentProfileForWorkspace(
     workspace.folder,
-    workspaceGroup.created_by,
+    taskOwnerId,
   );
-  if (taskSessionNeedsAgentProfileReset(workspace.folder, agentProfile)) {
-    deleteSession(workspace.folder);
-    delete sessions[workspace.folder];
+  if (
+    taskSessionNeedsAgentProfileReset(
+      workspace.folder,
+      agentProfile,
+      taskSessionAgentId,
+    )
+  ) {
+    deleteSession(workspace.folder, taskSessionAgentId);
     logger.info(
       {
         taskId: task.id,
         groupFolder: workspace.folder,
+        sessionAgentId: taskSessionAgentId,
         agentProfileId: agentProfile?.id,
       },
       'Cleared scheduled task Claude session after AgentProfile identity changed',
     );
   }
-  const sessionId = sessions[workspace.folder];
+  const sessionId = getSession(workspace.folder, taskSessionAgentId);
 
   // Idle timer: writes _close sentinel after idleTimeout of no output,
   // so the container exits instead of hanging at waitForIpcMessage forever.
@@ -663,8 +692,8 @@ async function runTaskInner(
       executionMode === 'host' ? runHostAgent : runContainerAgent;
 
     // Resolve owner's home folder for correct volume mounts (skills, memory, CLAUDE.md)
-    const ownerHomeFolder = workspaceGroup.created_by
-      ? getUserHomeGroup(workspaceGroup.created_by)?.folder || workspace.folder
+    const ownerHomeFolder = taskOwnerId
+      ? getUserHomeGroup(taskOwnerId)?.folder || workspace.folder
       : workspace.folder;
 
     const output = await runAgent(
@@ -679,6 +708,7 @@ async function runTaskInner(
         isAdminHome,
         isScheduledTask: true,
         taskRunId: options?.taskRunId,
+        sessionAgentId: taskSessionAgentId,
         agentProfile: toRunnerAgentProfile(agentProfile),
       },
       (proc, identifier, selectedProviderId) =>
@@ -694,7 +724,7 @@ async function runTaskInner(
       async (streamedOutput: ContainerOutput) => {
         // Broadcast stream events to WebSocket clients viewing the task workspace
         if (streamedOutput.status === 'stream' && streamedOutput.streamEvent) {
-          deps.broadcastStreamEvent?.(workspace.jid, streamedOutput.streamEvent);
+          deps.broadcastStreamEvent?.(effectiveJid, streamedOutput.streamEvent);
         }
         if (streamedOutput.result) {
           result = streamedOutput.result;
@@ -710,11 +740,15 @@ async function runTaskInner(
           streamedOutput.status !== 'error' &&
           !streamedOutput.providerFailure
         ) {
-          sessions[workspace.folder] = streamedOutput.newSessionId;
-          setSession(workspace.folder, streamedOutput.newSessionId, undefined, {
-            agentProfileId: agentProfile?.id,
-            identityHash: agentProfile?.identity_hash,
-          });
+          setSession(
+            workspace.folder,
+            streamedOutput.newSessionId,
+            taskSessionAgentId,
+            {
+              agentProfileId: agentProfile?.id,
+              identityHash: agentProfile?.identity_hash,
+            },
+          );
         }
         // Finalize run log on first non-stream output (success/error/closed).
         // Don't wait for the process to exit — idle timeout can be very long.
@@ -740,8 +774,7 @@ async function runTaskInner(
       output.status !== 'error' &&
       !output.providerFailure
     ) {
-      sessions[workspace.folder] = output.newSessionId;
-      setSession(workspace.folder, output.newSessionId, undefined, {
+      setSession(workspace.folder, output.newSessionId, taskSessionAgentId, {
         agentProfileId: agentProfile?.id,
         identityHash: agentProfile?.identity_hash,
       });
@@ -803,19 +836,16 @@ async function runTaskInner(
   }
 
   if (deps.storeResultAndNotify && (result || error)) {
-    const text = error
-      ? `执行出错: ${error}`
-      : stripAgentInternalTags(result!);
+    const text = error ? `执行出错: ${error}` : stripAgentInternalTags(result!);
 
     if (text) {
       try {
-        await deps.storeResultAndNotify(workspace.jid, text, {
-          ownerId: workspaceGroup.created_by || undefined,
+        await deps.storeResultAndNotify(effectiveJid, text, {
+          ownerId: taskOwnerId || undefined,
           notifyChannels: task.notify_channels,
           sourceKind: 'sdk_final',
-          // Use source workspace folder for IM routing — isolated tasks run in
-          // ephemeral workspaces (task-xxxxxx) that have no IM group bindings.
-          // task.group_folder is the workspace where the task was created.
+          // Use source workspace folder for IM routing; task sessions are virtual
+          // chats under that workspace and should inherit its channel bindings.
           workspaceFolder: task.group_folder || undefined,
         });
       } catch (err) {
@@ -827,8 +857,15 @@ async function runTaskInner(
     }
   }
 
-  // Auto-cleanup once-task workspace after completion
-  if (task.schedule_type === 'once' && !options?.manualRun && task.workspace_jid && task.workspace_folder) {
+  // Legacy cleanup: old isolated tasks may still point at task-* workspaces.
+  // New tasks run inside the source workspace, which must never be deleted here.
+  if (
+    task.schedule_type === 'once' &&
+    !options?.manualRun &&
+    task.workspace_jid &&
+    task.workspace_folder &&
+    task.workspace_folder.startsWith('task-')
+  ) {
     setTimeout(() => {
       try {
         const groups = deps.registeredGroups();
@@ -836,10 +873,16 @@ async function runTaskInner(
           deleteGroupData(task.workspace_jid!, task.workspace_folder!);
           delete groups[task.workspace_jid!];
           removeFlowArtifacts(task.workspace_folder!);
-          logger.info({ taskId: task.id, folder: task.workspace_folder }, 'Cleaned up once-task workspace');
+          logger.info(
+            { taskId: task.id, folder: task.workspace_folder },
+            'Cleaned up once-task workspace',
+          );
         }
       } catch (err) {
-        logger.error({ taskId: task.id, err }, 'Failed to cleanup once-task workspace');
+        logger.error(
+          { taskId: task.id, err },
+          'Failed to cleanup once-task workspace',
+        );
       }
     }, 60_000);
   }
@@ -856,6 +899,7 @@ async function runScriptTask(
   // Refresh task from DB to avoid stale closure data
   const task = getTaskById(staleTask.id);
   if (!task) return;
+  if (!manualRun && !claimScheduledRun(task.id, 'script task')) return;
 
   runningTaskIds.add(task.id);
   // 顶层兜底 finally（同 runTask）。
@@ -884,7 +928,8 @@ async function runScriptTaskInner(
   // disabled/deleted owner's scheduled scripts must stop firing regardless of
   // billing toggle or role. See `src/owner-gate.ts`.
   {
-    const ownerId = deps.registeredGroups()[groupJid]?.created_by;
+    const ownerId =
+      task.created_by || deps.registeredGroups()[groupJid]?.created_by;
     if (ownerId) {
       const ownerGate = checkOwnerActive(getUserById(ownerId));
       if (!ownerGate.allowed) {
@@ -903,7 +948,10 @@ async function runScriptTaskInner(
         try {
           finalizeRecurringRun(task, nextRun, 'Error: 账户已禁用');
         } catch (err) {
-          logger.error({ taskId: task.id, err }, 'updateTaskAfterRun failed in script owner-gate');
+          logger.error(
+            { taskId: task.id, err },
+            'updateTaskAfterRun failed in script owner-gate',
+          );
         }
         return;
       }
@@ -914,16 +962,17 @@ async function runScriptTaskInner(
   if (isBillingEnabled() && task.group_folder) {
     const groups = deps.registeredGroups();
     const group = groups[groupJid];
-    if (group?.created_by) {
-      const owner = getUserById(group.created_by);
+    const ownerId = task.created_by || group?.created_by;
+    if (ownerId) {
+      const owner = getUserById(ownerId);
       if (owner && owner.role !== 'admin') {
-        const accessResult = checkBillingAccessFresh(group.created_by, owner.role);
+        const accessResult = checkBillingAccessFresh(ownerId, owner.role);
         if (!accessResult.allowed) {
           const reason = accessResult.reason || '当前账户不可用';
           logger.info(
             {
               taskId: task.id,
-              userId: group.created_by,
+              userId: ownerId,
               reason,
               blockType: accessResult.blockType,
             },
@@ -940,7 +989,10 @@ async function runScriptTaskInner(
           try {
             finalizeRecurringRun(task, nextRun, `Error: 计费限制: ${reason}`);
           } catch (err) {
-            logger.error({ taskId: task.id, err }, 'updateTaskAfterRun failed in script billing-gate');
+            logger.error(
+              { taskId: task.id, err },
+              'updateTaskAfterRun failed in script billing-gate',
+            );
           }
           return;
         }
@@ -966,7 +1018,10 @@ async function runScriptTaskInner(
       const nextRun = safeComputeNextRun(task, manualRun);
       finalizeRecurringRun(task, nextRun, 'Error: script_command is empty');
     } catch (err) {
-      logger.error({ taskId: task.id, err }, 'updateTaskAfterRun failed in script no-command');
+      logger.error(
+        { taskId: task.id, err },
+        'updateTaskAfterRun failed in script no-command',
+      );
     } finally {
       runningTaskIds.delete(task.id);
     }
@@ -1003,10 +1058,11 @@ async function runScriptTaskInner(
       if (deps.storeResultAndNotify) {
         const groups = deps.registeredGroups();
         const group = groups[groupJid];
-        if (group?.created_by) {
+        const ownerId = task.created_by || group?.created_by;
+        if (ownerId) {
           try {
             await deps.storeResultAndNotify(groupJid, fullText, {
-              ownerId: group.created_by,
+              ownerId,
               notifyChannels: task.notify_channels,
               skipStore: true,
               workspaceFolder: task.group_folder,
@@ -1095,6 +1151,7 @@ async function runGroupModeTask(
   manualRun = false,
 ): Promise<void> {
   const startTime = Date.now();
+  if (!manualRun && !claimScheduledRun(task.id, 'group-mode task')) return;
   runningTaskIds.add(task.id);
   let resultSummary = '已注入到源工作区';
 
@@ -1135,7 +1192,10 @@ async function runGroupModeTask(
     });
   } catch (err) {
     resultSummary = `Error: ${err instanceof Error ? err.message : String(err)}`;
-    logger.error({ taskId: task.id, error: resultSummary }, 'Group-mode task injection failed');
+    logger.error(
+      { taskId: task.id, error: resultSummary },
+      'Group-mode task injection failed',
+    );
 
     logTaskRun({
       task_id: task.id,
@@ -1150,7 +1210,10 @@ async function runGroupModeTask(
       const nextRun = safeComputeNextRun(task, manualRun);
       finalizeRecurringRun(task, nextRun, resultSummary);
     } catch (err) {
-      logger.error({ taskId: task.id, err }, 'updateTaskAfterRun failed in group-mode');
+      logger.error(
+        { taskId: task.id, err },
+        'updateTaskAfterRun failed in group-mode',
+      );
     } finally {
       runningTaskIds.delete(task.id);
     }
@@ -1173,14 +1236,19 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
   try {
     const cleaned = cleanupStaleRunningLogs();
     if (cleaned > 0) {
-      logger.info({ cleaned }, 'Cleaned up stale running task logs from previous session');
+      logger.info(
+        { cleaned },
+        'Cleaned up stale running task logs from previous session',
+      );
     }
   } catch (err) {
     logger.error({ err }, 'Failed to cleanup stale running task logs');
   }
 
-  // Clean up orphaned workspaces from completed once-tasks
-  // (covers the case where process restarted before setTimeout cleanup fired)
+  // Clean up orphaned legacy task-* workspaces from completed once-tasks
+  // (covers the case where process restarted before setTimeout cleanup fired).
+  // New scheduled tasks run inside the source workspace and must never delete
+  // the source workspace during task cleanup.
   try {
     const allTasks = getAllTasks();
     const groups = deps.registeredGroups();
@@ -1191,6 +1259,7 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
         t.status === 'completed' &&
         t.workspace_jid &&
         t.workspace_folder &&
+        t.workspace_folder.startsWith('task-') &&
         groups[t.workspace_jid]
       ) {
         deleteGroupData(t.workspace_jid, t.workspace_folder);
@@ -1200,7 +1269,10 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
       }
     }
     if (cleaned > 0) {
-      logger.info({ cleaned }, 'Cleaned up orphaned once-task workspaces from previous session');
+      logger.info(
+        { cleaned },
+        'Cleaned up orphaned once-task workspaces from previous session',
+      );
     }
   } catch (err) {
     logger.error({ err }, 'Failed to cleanup orphaned once-task workspaces');
@@ -1252,7 +1324,8 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
         }
 
         if (shouldSkipBackfill(currentTask.next_run, Date.now(), graceMs)) {
-          const overdueMs = Date.now() - new Date(currentTask.next_run!).getTime();
+          const overdueMs =
+            Date.now() - new Date(currentTask.next_run!).getTime();
           // Once-tasks 行为：用户明确希望它至少跑一次。跳过 backfill 会让
           // computeNextRun 返回 null，advanceSkippedTask(null) 把 status 翻为
           // completed —— 用户重启系统后 once-task 直接消失，没运行过。改为
@@ -1272,7 +1345,11 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
               // task — the same trap runTaskInner pauses to avoid. Pause here too
               // (don't touch last_run; this skip wasn't an actual run).
               logger.error(
-                { taskId: currentTask.id, scheduleType: currentTask.schedule_type, scheduleValue: currentTask.schedule_value },
+                {
+                  taskId: currentTask.id,
+                  scheduleType: currentTask.schedule_type,
+                  scheduleValue: currentTask.schedule_value,
+                },
                 'Overdue recurring task has null next_run; pausing instead of completing',
               );
               updateTask(currentTask.id, { status: 'paused', next_run: null });
@@ -1282,7 +1359,8 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
                 duration_ms: 0,
                 status: 'error',
                 result: null,
-                error: 'Paused: schedule produces no next run (fix schedule_value to re-activate)',
+                error:
+                  'Paused: schedule produces no next run (fix schedule_value to re-activate)',
               });
               continue;
             }
@@ -1296,7 +1374,12 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
               error: null,
             });
             logger.info(
-              { taskId: currentTask.id, overdueMs, graceMs, nextRun: advancedNextRun },
+              {
+                taskId: currentTask.id,
+                overdueMs,
+                graceMs,
+                nextRun: advancedNextRun,
+              },
               'Skipping overdue task: exceeds backfill grace window',
             );
             continue;
@@ -1326,7 +1409,10 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
                 error: `Target group not registered: ${currentTask.chat_jid ?? currentTask.group_folder}`,
               });
             } catch (err) {
-              logger.error({ taskId: currentTask.id, err }, 'Failed to mark once-task as completed after missing target');
+              logger.error(
+                { taskId: currentTask.id, err },
+                'Failed to mark once-task as completed after missing target',
+              );
             }
           }
           continue;
@@ -1356,7 +1442,7 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
             );
           });
         } else {
-          // Isolated mode (default): each agent task has a dedicated workspace.
+          // Isolated mode (default): task-scoped session in the source workspace.
           const taskQueueJid = computeIsolatedTaskQueueJid(currentTask, deps);
           if (!taskQueueJid) {
             // Workspace not ready (transient error); skip and retry next tick.
@@ -1391,8 +1477,8 @@ export function triggerTaskNow(
   if (!task) return { success: false, error: 'Task not found' };
   if (task.status === 'completed')
     return { success: false, error: 'Task already completed' };
-  if (task.status === 'paused')
-    return { success: false, error: '任务已暂停，请先恢复后再运行' };
+  if (task.status === 'parsing')
+    return { success: false, error: '任务仍在解析中，请稍后再运行' };
   if (runningTaskIds.has(taskId))
     return { success: false, error: 'Task is already running' };
 
@@ -1417,8 +1503,11 @@ export function triggerTaskNow(
     if (!taskQueueJid) {
       return { success: false, error: 'Failed to prepare task workspace' };
     }
-    deps.queue.enqueueTask(taskQueueJid, task.id, () =>
-      runTask(task, deps, opts),
+    deps.queue.enqueueTask(
+      taskQueueJid,
+      task.id,
+      () => runTask(task, deps, opts),
+      { allowInactive: true },
     );
   }
 

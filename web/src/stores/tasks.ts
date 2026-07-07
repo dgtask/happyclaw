@@ -79,7 +79,11 @@ export const useTasksStore = create<TasksState>((set, get) => ({
   loadTasks: async () => {
     set({ loading: true });
     try {
-      const data = await api.get<{ tasks: ScheduledTask[]; runningTaskIds?: string[]; groupNames?: Record<string, string> }>('/api/tasks');
+      const data = await api.get<{
+        tasks: ScheduledTask[];
+        runningTaskIds?: string[];
+        groupNames?: Record<string, string>;
+      }>('/api/tasks');
       set({
         tasks: data.tasks,
         runningTaskIds: new Set(data.runningTaskIds || []),
@@ -175,7 +179,9 @@ export const useTasksStore = create<TasksState>((set, get) => ({
 
   loadLogs: async (taskId: string) => {
     try {
-      const data = await api.get<{ logs: TaskRunLog[] }>(`/api/tasks/${taskId}/logs`);
+      const data = await api.get<{ logs: TaskRunLog[] }>(
+        `/api/tasks/${taskId}/logs`,
+      );
       set((s) => ({
         logs: { ...s.logs, [taskId]: data.logs },
         error: null,
@@ -193,6 +199,7 @@ export const useTasksStore = create<TasksState>((set, get) => ({
       await get().loadTasks();
     } catch (err) {
       set({ error: extractErrorMessage(err) });
+      throw err;
     }
   },
 }));

@@ -13,6 +13,8 @@ interface QueuedTask {
   id: string;
   groupJid: string;
   fn: () => Promise<void>;
+  /** Manual runs may execute even when the task config is paused. */
+  allowInactive?: boolean;
 }
 
 const MAX_RETRIES = 5;
@@ -256,7 +258,7 @@ export class GroupQueue {
     const isHost = this.isHostMode(groupJid);
     const systemCapacity = isHost
       ? this.activeHostProcessCount <
-          getSystemSettings().maxConcurrentHostProcesses
+        getSystemSettings().maxConcurrentHostProcesses
       : this.activeContainerCount < getSystemSettings().maxConcurrentContainers;
     if (!systemCapacity) return false;
 
@@ -554,7 +556,12 @@ export class GroupQueue {
     this.runForGroup(groupJid, 'messages');
   }
 
-  enqueueTask(groupJid: string, taskId: string, fn: () => Promise<void>): void {
+  enqueueTask(
+    groupJid: string,
+    taskId: string,
+    fn: () => Promise<void>,
+    options?: { allowInactive?: boolean },
+  ): void {
     if (this.shuttingDown) return;
 
     const state = this.getGroup(groupJid);
@@ -567,7 +574,12 @@ export class GroupQueue {
 
     const activeRunner = this.findActiveRunnerFor(groupJid);
     if (state.active || (activeRunner && activeRunner !== groupJid)) {
-      state.pendingTasks.push({ id: taskId, groupJid, fn });
+      state.pendingTasks.push({
+        id: taskId,
+        groupJid,
+        fn,
+        allowInactive: options?.allowInactive,
+      });
       this.waitingGroups.add(groupJid);
       logger.debug(
         { groupJid, taskId, activeRunner: activeRunner || groupJid },
@@ -578,7 +590,12 @@ export class GroupQueue {
 
     if (!this.hasCapacityFor(groupJid)) {
       const isHost = this.isHostMode(groupJid);
-      state.pendingTasks.push({ id: taskId, groupJid, fn });
+      state.pendingTasks.push({
+        id: taskId,
+        groupJid,
+        fn,
+        allowInactive: options?.allowInactive,
+      });
       this.waitingGroups.add(groupJid);
       logger.debug(
         {
@@ -595,7 +612,12 @@ export class GroupQueue {
 
     // Run immediately
     this.waitingGroups.delete(groupJid);
-    this.runTask(groupJid, { id: taskId, groupJid, fn });
+    this.runTask(groupJid, {
+      id: taskId,
+      groupJid,
+      fn,
+      allowInactive: options?.allowInactive,
+    });
   }
 
   registerProcess(
@@ -786,7 +808,14 @@ export class GroupQueue {
       return;
     }
     try {
-      if (!this.hasRemainingIpcMessages(state.groupFolder, state.agentId, state.taskRunId)) return;
+      if (
+        !this.hasRemainingIpcMessages(
+          state.groupFolder,
+          state.agentId,
+          state.taskRunId,
+        )
+      )
+        return;
 
       if (state.agentId && this.onUnconsumedAgentIpcFn) {
         logger.warn(
@@ -818,7 +847,7 @@ export class GroupQueue {
         : path.join(DATA_DIR, 'ipc', groupFolder, 'input');
     try {
       const files = fs.readdirSync(inputDir);
-      return files.some(f => f.endsWith('.json'));
+      return files.some((f) => f.endsWith('.json'));
     } catch {
       return false;
     }
@@ -929,7 +958,6 @@ export class GroupQueue {
       return false;
     }
   }
-
 
   /**
    * Force-stop a group's active container and clear queued work.
@@ -1207,7 +1235,11 @@ export class GroupQueue {
         : false;
       if (state.groupFolder) {
         try {
-          this.cleanupIpcSentinels(state.groupFolder, state.agentId, state.taskRunId);
+          this.cleanupIpcSentinels(
+            state.groupFolder,
+            state.agentId,
+            state.taskRunId,
+          );
         } catch (err) {
           logger.warn({ groupJid, err }, 'Failed to clean up IPC sentinels');
         }
@@ -1331,7 +1363,11 @@ export class GroupQueue {
       // Clean up stale sentinel files before clearing groupFolder/agentId
       if (state.groupFolder) {
         try {
-          this.cleanupIpcSentinels(state.groupFolder, state.agentId, state.taskRunId);
+          this.cleanupIpcSentinels(
+            state.groupFolder,
+            state.agentId,
+            state.taskRunId,
+          );
         } catch (err) {
           logger.warn({ groupJid, err }, 'Failed to clean up IPC sentinels');
         }
@@ -1440,7 +1476,7 @@ export class GroupQueue {
       // Dynamic tasks (agent conversations, etc.) don't have DB entries
       // and must always be allowed to run.
       const dbTask = getTaskById(task.id);
-      if (dbTask && dbTask.status !== 'active') {
+      if (dbTask && dbTask.status !== 'active' && !task.allowInactive) {
         logger.info(
           { groupJid, taskId: task.id },
           'Skipping cancelled/deleted task during drain',
@@ -1523,7 +1559,11 @@ export class GroupQueue {
         while (state.pendingTasks.length > 0) {
           const candidate = state.pendingTasks.shift()!;
           const dbTask = getTaskById(candidate.id);
-          if (dbTask && dbTask.status !== 'active') {
+          if (
+            dbTask &&
+            dbTask.status !== 'active' &&
+            !candidate.allowInactive
+          ) {
             logger.info(
               { groupJid: jid, taskId: candidate.id },
               'Skipping cancelled/deleted task during drainWaiting',
@@ -1623,9 +1663,23 @@ export class GroupQueue {
     for (const [, state] of this.groups) {
       if (!state.active || !state.groupFolder) continue;
       const inputDir = state.taskRunId
-        ? path.join(DATA_DIR, 'ipc', state.groupFolder, 'tasks-run', state.taskRunId, 'input')
+        ? path.join(
+            DATA_DIR,
+            'ipc',
+            state.groupFolder,
+            'tasks-run',
+            state.taskRunId,
+            'input',
+          )
         : state.agentId
-          ? path.join(DATA_DIR, 'ipc', state.groupFolder, 'agents', state.agentId, 'input')
+          ? path.join(
+              DATA_DIR,
+              'ipc',
+              state.groupFolder,
+              'agents',
+              state.agentId,
+              'input',
+            )
           : path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
       try {
         fs.mkdirSync(inputDir, { recursive: true });

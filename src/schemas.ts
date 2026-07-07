@@ -24,7 +24,17 @@ export const TaskPatchSchema = z.object({
     .refine((v) => !isNaN(Date.parse(v)), 'next_run must be ISO 8601')
     .optional(),
   notify_channels: z
-    .array(z.enum(['feishu', 'telegram', 'qq', 'wechat', 'dingtalk', 'discord', 'whatsapp']))
+    .array(
+      z.enum([
+        'feishu',
+        'telegram',
+        'qq',
+        'wechat',
+        'dingtalk',
+        'discord',
+        'whatsapp',
+      ]),
+    )
     .nullable()
     .optional(),
 });
@@ -38,6 +48,7 @@ const CRON_REGEX =
 // `new Date(Date.now() + ms).toISOString()` 会抛 RangeError。1 年内任何场景
 // 都该用 cron 而不是 interval，所以这是合理的硬上限。
 const MAX_INTERVAL_MS = 365 * 24 * 60 * 60 * 1000;
+const MIN_INTERVAL_MS = 60 * 1000;
 
 // JS Date 安全上限（约 8.64e15ms after 1970）。once 任务给 100 年余量足够。
 const MAX_ONCE_TIMESTAMP_MS = 100 * 365 * 24 * 60 * 60 * 1000;
@@ -54,7 +65,17 @@ export const TaskCreateSchema = z
     execution_mode: z.enum(['host', 'container']).optional(),
     script_command: z.string().max(4096).optional(),
     notify_channels: z
-      .array(z.enum(['feishu', 'telegram', 'qq', 'wechat', 'dingtalk', 'discord', 'whatsapp']))
+      .array(
+        z.enum([
+          'feishu',
+          'telegram',
+          'qq',
+          'wechat',
+          'dingtalk',
+          'discord',
+          'whatsapp',
+        ]),
+      )
       .nullable()
       .optional(),
   })
@@ -84,11 +105,11 @@ export const TaskCreateSchema = z
       }
     } else if (data.schedule_type === 'interval') {
       const num = Number(data.schedule_value);
-      if (!Number.isFinite(num) || num <= 0) {
+      if (!Number.isFinite(num) || num < MIN_INTERVAL_MS) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['schedule_value'],
-          message: 'Interval must be a positive number (milliseconds)',
+          message: 'Interval must be at least 60000 milliseconds',
         });
       } else if (num > MAX_INTERVAL_MS) {
         // 防止 `new Date(Date.now() + ms).toISOString()` 抛 RangeError 让请求 500
@@ -191,12 +212,7 @@ export const AgentProfileCreateSchema = z.object({
 });
 
 export const AgentProfilePatchSchema = z.object({
-  name: z
-    .string()
-    .trim()
-    .min(1)
-    .max(80)
-    .optional(),
+  name: z.string().trim().min(1).max(80).optional(),
   identity_prompt: z
     .string()
     .max(20000)
@@ -486,13 +502,16 @@ export const FeishuConfigSchema = z
       .max(2000)
       // refine 内先 trim 再匹配,与下游 routes/config.ts 的 trim() 行为对齐
       // (per PR #572 review minor):粘贴带首尾空白的合法 appId 不被误拒
-      .refine((v) => {
-        const trimmed = v.trim();
-        return trimmed === '' || FEISHU_APP_ID_REGEX.test(trimmed);
-      }, {
-        message:
-          'appId must be in Feishu/Lark official format (cli_ prefix + lowercase alphanumeric)',
-      })
+      .refine(
+        (v) => {
+          const trimmed = v.trim();
+          return trimmed === '' || FEISHU_APP_ID_REGEX.test(trimmed);
+        },
+        {
+          message:
+            'appId must be in Feishu/Lark official format (cli_ prefix + lowercase alphanumeric)',
+        },
+      )
       .optional(),
     appSecret: z.string().max(2000).optional(),
     clearAppSecret: z.boolean().optional(),
@@ -686,11 +705,7 @@ export const RedeemCodeSchema = z.object({
 });
 
 // Memory types
-export type MemoryType =
-  | 'global'
-  | 'session'
-  | 'date'
-  | 'conversation';
+export type MemoryType = 'global' | 'session' | 'date' | 'conversation';
 
 export interface MemorySource {
   path: string;

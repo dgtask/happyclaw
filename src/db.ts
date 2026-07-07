@@ -383,7 +383,9 @@ export function initDatabase(): void {
       status TEXT DEFAULT 'active',
       created_at TEXT NOT NULL,
       created_by TEXT,
-      notify_channels TEXT
+      notify_channels TEXT,
+      running_until TEXT,
+      runner_id TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_next_run ON scheduled_tasks(next_run);
     CREATE INDEX IF NOT EXISTS idx_status ON scheduled_tasks(status);
@@ -832,6 +834,8 @@ export function initDatabase(): void {
   ensureColumn('scheduled_tasks', 'execution_mode', 'TEXT');
   ensureColumn('scheduled_tasks', 'workspace_jid', 'TEXT');
   ensureColumn('scheduled_tasks', 'workspace_folder', 'TEXT');
+  ensureColumn('scheduled_tasks', 'running_until', 'TEXT');
+  ensureColumn('scheduled_tasks', 'runner_id', 'TEXT');
   ensureColumn('registered_groups', 'selected_skills', 'TEXT');
   ensureColumn('sessions', 'agent_id', "TEXT NOT NULL DEFAULT ''");
   ensureColumn('agents', 'kind', "TEXT NOT NULL DEFAULT 'task'");
@@ -1167,19 +1171,7 @@ export function initDatabase(): void {
         db.prepare(
           `INSERT OR IGNORE INTO billing_plans (id, name, description, tier, monthly_cost_usd, allow_overage, features, is_default, is_active, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).run(
-          'free',
-          '免费版',
-          '基础免费套餐',
-          0,
-          0,
-          0,
-          '[]',
-          1,
-          1,
-          now,
-          now,
-        );
+        ).run('free', '免费版', '基础免费套餐', 0, 0, 0, '[]', 1, 1, now, now);
       }
 
       // Initialize balances for all existing users
@@ -1247,7 +1239,9 @@ export function initDatabase(): void {
   );
   ensureColumn('balance_transactions', 'notes', 'TEXT');
   // Create unique index only if it doesn't exist
-  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_bal_tx_idempotency ON balance_transactions(idempotency_key) WHERE idempotency_key IS NOT NULL`);
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_bal_tx_idempotency ON balance_transactions(idempotency_key) WHERE idempotency_key IS NOT NULL`,
+  );
 
   // v26→v27 migration: wallet-first commercialization baseline
   const v27Ver = getRouterStateInternal('schema_version');
@@ -1457,7 +1451,7 @@ export function initDatabase(): void {
         .prepare(
           // ORDER BY 让多次 dry-run 结果稳定 + 让"早创建的真账号"优先被
           // lowercase 化，避免后注册的混淆账号顶替原账号。
-          "SELECT id, username FROM users WHERE username != lower(username) ORDER BY created_at ASC, id ASC",
+          'SELECT id, username FROM users WHERE username != lower(username) ORDER BY created_at ASC, id ASC',
         )
         .all() as Array<{ id: string; username: string }>;
       if (mixedCaseRows.length > 0) {
@@ -1496,7 +1490,7 @@ export function initDatabase(): void {
   backfillAgentProfileDefaultsAndWorkspaceMappings();
   syncAllChannelMountsFromRegisteredGroups();
 
-	  const SCHEMA_VERSION = '42';
+  const SCHEMA_VERSION = '42';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -1607,7 +1601,11 @@ function toUtf8String(value: unknown, warnField?: string): string {
     const decoded = Buffer.from(value as Uint8Array).toString('utf8');
     if (warnField) {
       logger.warn(
-        { field: warnField, byteLen: (value as Uint8Array).byteLength, sample: decoded.slice(0, 80) },
+        {
+          field: warnField,
+          byteLen: (value as Uint8Array).byteLength,
+          sample: decoded.slice(0, 80),
+        },
         'toUtf8String: Buffer on TEXT column, decoded as UTF-8',
       );
     }
@@ -1636,7 +1634,9 @@ function normalizeMessageRow(
   row: NewMessage & { is_from_me: number },
 ): NewMessage & { is_from_me: boolean };
 function normalizeMessageRow(row: NewMessage): NewMessage;
-function normalizeMessageRow(row: NewMessage & { is_from_me?: number }): NewMessage & { is_from_me?: boolean } {
+function normalizeMessageRow(
+  row: NewMessage & { is_from_me?: number },
+): NewMessage & { is_from_me?: boolean } {
   const { is_from_me, content, ...rest } = row;
   const out: NewMessage & { is_from_me?: boolean } = {
     ...rest,
@@ -1680,9 +1680,12 @@ export function storeMessageDirect(
   // truncation_continue 与 sdk_final 同属"最终回复"：截断自动续写的后续 turn
   // 复用挂起序列的 turnId 时必须命中同一行（全渠道一条回复的 DB 合并基础）。
   const existingFinalRow =
-    (meta?.sourceKind === 'sdk_final' || meta?.sourceKind === 'truncation_continue') &&
+    (meta?.sourceKind === 'sdk_final' ||
+      meta?.sourceKind === 'truncation_continue') &&
     meta.turnId
-      ? (stmts().storeMessageSelect.get(chatJid, meta.turnId) as { id: string } | undefined)
+      ? (stmts().storeMessageSelect.get(chatJid, meta.turnId) as
+          | { id: string }
+          | undefined)
       : undefined;
   const effectiveMsgId = existingFinalRow?.id || msgId;
   stmts().storeMessageInsert.run(
@@ -1754,7 +1757,12 @@ export function updateLatestMessageTokenUsage(
   costUsd?: number,
 ): void {
   if (msgId) {
-    stmts().updateTokenUsageById.run(tokenUsage, costUsd ?? null, msgId, chatJid);
+    stmts().updateTokenUsageById.run(
+      tokenUsage,
+      costUsd ?? null,
+      msgId,
+      chatJid,
+    );
   } else {
     stmts().updateTokenUsageLatest.run(tokenUsage, costUsd ?? null, chatJid);
   }
@@ -2234,7 +2242,7 @@ export function createTask(
     toUtf8String(task.prompt, 'scheduled_tasks.prompt'),
     task.schedule_type,
     task.schedule_value,
-    task.context_mode || 'group',
+    task.context_mode || 'isolated',
     task.execution_type || 'agent',
     task.script_command == null
       ? null
@@ -2266,7 +2274,8 @@ function mapTaskRow(row: unknown): ScheduledTask {
   if (r.workspace_folder === undefined) r.workspace_folder = null;
   // Defensive: legacy BLOB cells in TEXT-affinity columns come back as Buffer.
   r.prompt = toUtf8String(r.prompt);
-  if (r.script_command !== undefined) r.script_command = toUtf8StringOrNull(r.script_command);
+  if (r.script_command !== undefined)
+    r.script_command = toUtf8StringOrNull(r.script_command);
   return r as ScheduledTask;
 }
 
@@ -2343,7 +2352,10 @@ export function updateTask(
     values.push(
       updates.script_command == null
         ? null
-        : toUtf8String(updates.script_command, 'scheduled_tasks.script_command'),
+        : toUtf8String(
+            updates.script_command,
+            'scheduled_tasks.script_command',
+          ),
     );
   }
   if (updates.next_run !== undefined) {
@@ -2356,7 +2368,11 @@ export function updateTask(
   }
   if (updates.notify_channels !== undefined) {
     fields.push('notify_channels = ?');
-    values.push(updates.notify_channels != null ? JSON.stringify(updates.notify_channels) : null);
+    values.push(
+      updates.notify_channels != null
+        ? JSON.stringify(updates.notify_channels)
+        : null,
+    );
   }
   if (updates.chat_jid !== undefined) {
     fields.push('chat_jid = ?');
@@ -2413,13 +2429,40 @@ export function getDueTasks(): ScheduledTask[] {
   return db
     .prepare(
       `
-    SELECT * FROM scheduled_tasks
-    WHERE status = 'active' AND next_run IS NOT NULL AND next_run <= ?
-    ORDER BY next_run
+	    SELECT * FROM scheduled_tasks
+	    WHERE status = 'active'
+	      AND next_run IS NOT NULL
+	      AND next_run <= ?
+	      AND (running_until IS NULL OR running_until <= ?)
+	    ORDER BY next_run
+	  `,
+    )
+    .all(now, now)
+    .map(mapTaskRow);
+}
+
+export function claimTaskForRun(
+  id: string,
+  runnerId: string,
+  leaseMs: number,
+): boolean {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const leaseUntil = new Date(now.getTime() + leaseMs).toISOString();
+  const result = db
+    .prepare(
+      `
+    UPDATE scheduled_tasks
+    SET runner_id = ?, running_until = ?
+    WHERE id = ?
+      AND status = 'active'
+      AND next_run IS NOT NULL
+      AND next_run <= ?
+      AND (running_until IS NULL OR running_until <= ?)
   `,
     )
-    .all(now)
-    .map(mapTaskRow);
+    .run(runnerId, leaseUntil, id, nowIso, nowIso);
+  return result.changes === 1;
 }
 
 export function updateTaskAfterRun(
@@ -2431,7 +2474,8 @@ export function updateTaskAfterRun(
   db.prepare(
     `
     UPDATE scheduled_tasks
-    SET next_run = ?, last_run = ?, last_result = ?, status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END
+	    SET next_run = ?, last_run = ?, last_result = ?, status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END,
+	        running_until = NULL, runner_id = NULL
     WHERE id = ?
   `,
   ).run(nextRun, now, lastResult, nextRun, id);
@@ -2444,7 +2488,8 @@ export function advanceSkippedTask(id: string, nextRun: string | null): void {
   db.prepare(
     `
     UPDATE scheduled_tasks
-    SET next_run = ?, status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END
+	    SET next_run = ?, status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END,
+	        running_until = NULL, runner_id = NULL
     WHERE id = ?
   `,
   ).run(nextRun, nextRun, id);
@@ -2460,7 +2505,8 @@ export function pauseTaskAfterRun(id: string, lastResult: string): void {
   db.prepare(
     `
     UPDATE scheduled_tasks
-    SET next_run = NULL, last_run = ?, last_result = ?, status = 'paused'
+	    SET next_run = NULL, last_run = ?, last_result = ?, status = 'paused',
+	        running_until = NULL, runner_id = NULL
     WHERE id = ?
   `,
   ).run(now, lastResult, id);
@@ -2496,7 +2542,12 @@ export function logTaskRunStart(taskId: string): number {
 
 export function updateTaskRunLog(
   id: number,
-  updates: { duration_ms: number; status: 'success' | 'error'; result: string | null; error: string | null },
+  updates: {
+    duration_ms: number;
+    status: 'success' | 'error';
+    result: string | null;
+    error: string | null;
+  },
 ): void {
   db.prepare(
     `
@@ -2529,9 +2580,9 @@ export function cleanupOldTaskRunLogs(retentionDays = 30): number {
 }
 
 export function cleanupOldDailyUsage(retentionDays = 90): number {
-  const cutoff = new Date(
-    Date.now() - retentionDays * 24 * 60 * 60 * 1000,
-  ).toISOString().slice(0, 10);
+  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
   const result = db
     .prepare('DELETE FROM daily_usage WHERE date < ?')
     .run(cutoff);
@@ -2594,7 +2645,10 @@ export function setSession(
   groupFolder: string,
   sessionId: string,
   agentId?: string | null,
-  agentIdentity?: { agentProfileId?: string | null; identityHash?: string | null },
+  agentIdentity?: {
+    agentProfileId?: string | null;
+    identityHash?: string | null;
+  },
 ): void {
   const effectiveAgentId = agentId || '';
   db.prepare(
@@ -2820,7 +2874,11 @@ export function createAgentProfile(input: {
 export function updateAgentProfile(
   profileId: string,
   ownerUserId: string,
-  updates: { name?: string; identityPrompt?: string; includeClaudePreset?: boolean },
+  updates: {
+    name?: string;
+    identityPrompt?: string;
+    includeClaudePreset?: boolean;
+  },
 ): AgentProfile | undefined {
   const existing = getAgentProfileForUser(profileId, ownerUserId);
   if (!existing) return undefined;
@@ -3146,7 +3204,12 @@ function parseActivationMode(
   raw: string | null,
 ): 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled' {
   if (raw && VALID_ACTIVATION_MODES.has(raw))
-    return raw as 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled';
+    return raw as
+      | 'auto'
+      | 'always'
+      | 'when_mentioned'
+      | 'owner_mentioned'
+      | 'disabled';
   return 'auto';
 }
 
@@ -3190,7 +3253,9 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.binding_mode ?? 'single_context',
     group.feishu_chat_mode ?? null,
     group.feishu_group_message_type ?? null,
-    group.sender_allowlist != null ? JSON.stringify(group.sender_allowlist) : null,
+    group.sender_allowlist != null
+      ? JSON.stringify(group.sender_allowlist)
+      : null,
   );
   syncChannelMountFromRegisteredGroup(jid, group);
 }
@@ -3206,7 +3271,9 @@ export function deleteRegisteredGroup(jid: string): void {
  * the bot. Created by buildOnNewChat when a Feishu group is auto-registered
  * before the owner has DM'd the bot. Used by Feishu owner backfill.
  */
-export function findEmptyAllowlistFeishuGroupsForUser(userId: string): string[] {
+export function findEmptyAllowlistFeishuGroupsForUser(
+  userId: string,
+): string[] {
   const rows = db
     .prepare(
       "SELECT jid FROM registered_groups WHERE created_by = ? AND jid LIKE 'feishu:%' AND sender_allowlist = '[]'",
@@ -3524,7 +3591,9 @@ export function getImContextBinding(
     .prepare(
       'SELECT * FROM im_context_bindings WHERE source_jid = ? AND context_type = ? AND context_id = ?',
     )
-    .get(sourceJid, contextType, contextId) as Record<string, unknown> | undefined;
+    .get(sourceJid, contextType, contextId) as
+    | Record<string, unknown>
+    | undefined;
   return row ? mapImContextBindingRow(row) : undefined;
 }
 
@@ -3799,9 +3868,9 @@ export function deleteGroupData(jid: string, folder: string): void {
     // 2. 删除成员记录
     db.prepare('DELETE FROM group_members WHERE group_folder = ?').run(folder);
     // 3. 删除 workspace -> AgentProfile 归属映射
-    db.prepare('DELETE FROM workspace_agent_profiles WHERE group_folder = ?').run(
-      folder,
-    );
+    db.prepare(
+      'DELETE FROM workspace_agent_profiles WHERE group_folder = ?',
+    ).run(folder);
     // 4. 删除注册信息
     db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
     // 5. 删除会话与 workspace-owned agents
@@ -4130,8 +4199,7 @@ function mapUserRow(row: Record<string, unknown>): User {
       typeof row.avatar_emoji === 'string' ? row.avatar_emoji : null,
     avatar_color:
       typeof row.avatar_color === 'string' ? row.avatar_color : null,
-    avatar_url:
-      typeof row.avatar_url === 'string' ? row.avatar_url : null,
+    avatar_url: typeof row.avatar_url === 'string' ? row.avatar_url : null,
     ai_name: typeof row.ai_name === 'string' ? row.ai_name : null,
     ai_avatar_emoji:
       typeof row.ai_avatar_emoji === 'string' ? row.ai_avatar_emoji : null,
@@ -4592,7 +4660,9 @@ export function createUserSession(session: UserSession): void {
 export function getSessionWithUser(
   sessionId: string,
 ): UserSessionWithUser | undefined {
-  const row = stmts().getSessionWithUser.get(sessionId) as Record<string, unknown> | undefined;
+  const row = stmts().getSessionWithUser.get(sessionId) as
+    | Record<string, unknown>
+    | undefined;
   if (!row) return undefined;
   const role = parseUserRole(row.role);
   return {
@@ -5321,8 +5391,7 @@ function mapAgentRow(row: Record<string, unknown>): SubAgent {
       typeof row.completed_at === 'string' ? row.completed_at : null,
     result_summary:
       typeof row.result_summary === 'string' ? row.result_summary : null,
-    last_im_jid:
-      typeof row.last_im_jid === 'string' ? row.last_im_jid : null,
+    last_im_jid: typeof row.last_im_jid === 'string' ? row.last_im_jid : null,
     spawned_from_jid:
       typeof row.spawned_from_jid === 'string' ? row.spawned_from_jid : null,
     source_kind:
@@ -5582,9 +5651,9 @@ export function updateBillingPlan(
   db.transaction(() => {
     // Clear old default BEFORE setting new one to avoid brief dual-default state
     if (updates.is_default) {
-      db.prepare(
-        'UPDATE billing_plans SET is_default = 0 WHERE id != ?',
-      ).run(id);
+      db.prepare('UPDATE billing_plans SET is_default = 0 WHERE id != ?').run(
+        id,
+      );
     }
     db.prepare(
       `UPDATE billing_plans SET ${fields.join(', ')} WHERE id = ?`,
@@ -5598,9 +5667,7 @@ export function deleteBillingPlan(id: string): boolean {
   // SQLITE_CONSTRAINT_FOREIGNKEY 把请求 500；先在应用层校验给 caller 一个
   // 干净的 false 返回，运维需要手动迁移残留订阅再删 plan。
   const hasReferences = db
-    .prepare(
-      'SELECT COUNT(*) as cnt FROM user_subscriptions WHERE plan_id = ?',
-    )
+    .prepare('SELECT COUNT(*) as cnt FROM user_subscriptions WHERE plan_id = ?')
     .get(id) as { cnt: number };
   if (hasReferences.cnt > 0) return false;
   const result = db.prepare('DELETE FROM billing_plans WHERE id = ?').run(id);
@@ -5627,8 +5694,7 @@ function mapBillingPlanRow(row: Record<string, unknown>): BillingPlan {
     weekly_token_quota:
       row.weekly_token_quota != null ? Number(row.weekly_token_quota) : null,
     rate_multiplier: Number(row.rate_multiplier) || 1.0,
-    trial_days:
-      row.trial_days != null ? Number(row.trial_days) : null,
+    trial_days: row.trial_days != null ? Number(row.trial_days) : null,
     sort_order: Number(row.sort_order) || 0,
     display_price:
       typeof row.display_price === 'string' ? row.display_price : null,
@@ -5723,9 +5789,9 @@ export function cancelUserSubscription(userId: string): void {
   db.prepare(
     "UPDATE user_subscriptions SET status = 'cancelled', cancelled_at = ? WHERE user_id = ? AND status = 'active'",
   ).run(now, userId);
-  db.prepare(
-    'UPDATE users SET subscription_plan_id = NULL WHERE id = ?',
-  ).run(userId);
+  db.prepare('UPDATE users SET subscription_plan_id = NULL WHERE id = ?').run(
+    userId,
+  );
 }
 
 export function expireSubscriptions(): number {
@@ -5821,9 +5887,17 @@ export function expireSubscriptions(): number {
         `INSERT INTO user_subscriptions (id, user_id, plan_id, status, started_at, expires_at, cancelled_at, trial_ends_at, notes, auto_renew, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
-        newSub.id, newSub.user_id, newSub.plan_id, newSub.status,
-        newSub.started_at, newSub.expires_at, newSub.cancelled_at,
-        newSub.trial_ends_at, newSub.notes, newSub.auto_renew, newSub.created_at,
+        newSub.id,
+        newSub.user_id,
+        newSub.plan_id,
+        newSub.status,
+        newSub.started_at,
+        newSub.expires_at,
+        newSub.cancelled_at,
+        newSub.trial_ends_at,
+        newSub.notes,
+        newSub.auto_renew,
+        newSub.created_at,
       );
 
       logBillingAudit('subscription_assigned', userId, null, {
@@ -5939,9 +6013,7 @@ export function adjustUserBalance(
   // Idempotency check: if key already used, return the existing transaction
   if (idempotencyKey) {
     const existing = db
-      .prepare(
-        'SELECT * FROM balance_transactions WHERE idempotency_key = ?',
-      )
+      .prepare('SELECT * FROM balance_transactions WHERE idempotency_key = ?')
       .get(idempotencyKey) as Record<string, unknown> | undefined;
     if (existing) {
       return {
@@ -5950,10 +6022,20 @@ export function adjustUserBalance(
         type: String(existing.type) as BalanceTransactionType,
         amount_usd: Number(existing.amount_usd),
         balance_after: Number(existing.balance_after),
-        description: typeof existing.description === 'string' ? existing.description : null,
-        reference_type: typeof existing.reference_type === 'string' ? existing.reference_type as BalanceReferenceType : null,
-        reference_id: typeof existing.reference_id === 'string' ? existing.reference_id : null,
-        actor_id: typeof existing.actor_id === 'string' ? existing.actor_id : null,
+        description:
+          typeof existing.description === 'string'
+            ? existing.description
+            : null,
+        reference_type:
+          typeof existing.reference_type === 'string'
+            ? (existing.reference_type as BalanceReferenceType)
+            : null,
+        reference_id:
+          typeof existing.reference_id === 'string'
+            ? existing.reference_id
+            : null,
+        actor_id:
+          typeof existing.actor_id === 'string' ? existing.actor_id : null,
         source:
           typeof existing.source === 'string'
             ? (existing.source as BalanceTransactionSource)
@@ -6010,26 +6092,28 @@ export function adjustUserBalance(
     const balanceAfter = Number(newRow.balance_usd);
 
     // Record transaction
-    const result = db.prepare(
-      `INSERT INTO balance_transactions (
+    const result = db
+      .prepare(
+        `INSERT INTO balance_transactions (
         user_id, type, amount_usd, balance_after, description, reference_type,
         reference_id, actor_id, source, operator_type, notes, created_at, idempotency_key
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      userId,
-      type,
-      amount,
-      balanceAfter,
-      description,
-      referenceType,
-      referenceId,
-      actorId,
-      source,
-      operatorType,
-      notes,
-      now,
-      idempotencyKey ?? null,
-    );
+      )
+      .run(
+        userId,
+        type,
+        amount,
+        balanceAfter,
+        description,
+        referenceType,
+        referenceId,
+        actorId,
+        source,
+        operatorType,
+        notes,
+        now,
+        idempotencyKey ?? null,
+      );
 
     return {
       id: Number(result.lastInsertRowid),
@@ -6084,11 +6168,11 @@ export function getBalanceTransactions(
       amount_usd: Number(r.amount_usd),
       balance_after: Number(r.balance_after),
       description: typeof r.description === 'string' ? r.description : null,
-      reference_type: typeof r.reference_type === 'string'
-        ? (r.reference_type as BalanceReferenceType)
-        : null,
-      reference_id:
-        typeof r.reference_id === 'string' ? r.reference_id : null,
+      reference_type:
+        typeof r.reference_type === 'string'
+          ? (r.reference_type as BalanceReferenceType)
+          : null,
+      reference_id: typeof r.reference_id === 'string' ? r.reference_id : null,
       actor_id: typeof r.actor_id === 'string' ? r.actor_id : null,
       source:
         typeof r.source === 'string'
@@ -6126,9 +6210,7 @@ export function getMonthlyUsage(
   month: string,
 ): MonthlyUsage | undefined {
   const row = db
-    .prepare(
-      'SELECT * FROM monthly_usage WHERE user_id = ? AND month = ?',
-    )
+    .prepare('SELECT * FROM monthly_usage WHERE user_id = ? AND month = ?')
     .get(userId, month) as Record<string, unknown> | undefined;
   if (!row) return undefined;
   return mapMonthlyUsageRow(row);
@@ -6191,9 +6273,9 @@ export function getUserMonthlyUsageHistory(
 // --- Redeem Codes ---
 
 export function getRedeemCode(code: string): RedeemCode | undefined {
-  const row = db.prepare('SELECT * FROM redeem_codes WHERE code = ?').get(code) as
-    | Record<string, unknown>
-    | undefined;
+  const row = db
+    .prepare('SELECT * FROM redeem_codes WHERE code = ?')
+    .get(code) as Record<string, unknown> | undefined;
   if (!row) return undefined;
   return mapRedeemCodeRow(row);
 }
@@ -6237,14 +6319,13 @@ export function incrementRedeemCodeUsage(code: string, userId: string): void {
 }
 
 export function deleteRedeemCode(code: string): boolean {
-  const result = db.prepare('DELETE FROM redeem_codes WHERE code = ?').run(code);
+  const result = db
+    .prepare('DELETE FROM redeem_codes WHERE code = ?')
+    .run(code);
   return result.changes > 0;
 }
 
-export function hasUserRedeemedCode(
-  userId: string,
-  code: string,
-): boolean {
+export function hasUserRedeemedCode(userId: string, code: string): boolean {
   const row = db
     .prepare(
       'SELECT COUNT(*) as cnt FROM redeem_code_usage WHERE user_id = ? AND code = ?',
@@ -6259,8 +6340,7 @@ function mapRedeemCodeRow(row: Record<string, unknown>): RedeemCode {
     type: String(row.type) as RedeemCode['type'],
     value_usd: row.value_usd != null ? Number(row.value_usd) : null,
     plan_id: typeof row.plan_id === 'string' ? row.plan_id : null,
-    duration_days:
-      row.duration_days != null ? Number(row.duration_days) : null,
+    duration_days: row.duration_days != null ? Number(row.duration_days) : null,
     max_uses: Number(row.max_uses) || 1,
     used_count: Number(row.used_count) || 0,
     expires_at: typeof row.expires_at === 'string' ? row.expires_at : null,
@@ -6306,7 +6386,8 @@ export function getBillingAuditLog(
     conditions.push('event_type = ?');
     params.push(eventType);
   }
-  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const where =
+    conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
   const total = (
     db
@@ -6468,9 +6549,10 @@ export function getDailyUsage(
   return mapDailyUsageRow(row);
 }
 
-export function getWeeklyUsageSummary(
-  userId: string,
-): { totalCost: number; totalTokens: number } {
+export function getWeeklyUsageSummary(userId: string): {
+  totalCost: number;
+  totalTokens: number;
+} {
   // Align to calendar week (Monday–Sunday) to match checkQuota() reset logic
   const now = new Date();
   const dayOfWeek = now.getDay(); // 0=Sun, 1=Mon, ...
@@ -6505,11 +6587,17 @@ export function getUserDailyUsageHistory(
 export function getDailyUsageSumForMonth(
   userId: string,
   month: string,
-): { totalInputTokens: number; totalOutputTokens: number; totalCost: number; messageCount: number } {
+): {
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCost: number;
+  messageCount: number;
+} {
   const startDate = `${month}-01`;
   // End date: first day of next month
   const [y, m] = month.split('-').map(Number);
-  const nextMonth = m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, '0')}`;
+  const nextMonth =
+    m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, '0')}`;
   const endDate = `${nextMonth}-01`;
 
   const row = db
@@ -6598,14 +6686,17 @@ export function getDashboardStats(): {
   const month = new Date().toISOString().slice(0, 7);
 
   const totalUsers = (
-    db.prepare("SELECT COUNT(*) as cnt FROM users WHERE status != 'deleted'")
+    db
+      .prepare("SELECT COUNT(*) as cnt FROM users WHERE status != 'deleted'")
       .get() as { cnt: number }
   ).cnt;
 
   const activeUsers = (
-    db.prepare(
-      "SELECT COUNT(DISTINCT user_id) as cnt FROM daily_usage WHERE date = ?",
-    ).get(today) as { cnt: number }
+    db
+      .prepare(
+        'SELECT COUNT(DISTINCT user_id) as cnt FROM daily_usage WHERE date = ?',
+      )
+      .get(today) as { cnt: number }
   ).cnt;
 
   const planDistribution = db
@@ -6621,21 +6712,27 @@ export function getDashboardStats(): {
     .all() as Array<{ plan_name: string; count: number }>;
 
   const todayCost = (
-    db.prepare(
-      'SELECT COALESCE(SUM(total_cost_usd), 0) as total FROM daily_usage WHERE date = ?',
-    ).get(today) as { total: number }
+    db
+      .prepare(
+        'SELECT COALESCE(SUM(total_cost_usd), 0) as total FROM daily_usage WHERE date = ?',
+      )
+      .get(today) as { total: number }
   ).total;
 
   const monthCost = (
-    db.prepare(
-      'SELECT COALESCE(SUM(total_cost_usd), 0) as total FROM monthly_usage WHERE month = ?',
-    ).get(month) as { total: number }
+    db
+      .prepare(
+        'SELECT COALESCE(SUM(total_cost_usd), 0) as total FROM monthly_usage WHERE month = ?',
+      )
+      .get(month) as { total: number }
   ).total;
 
   const activeSubscriptions = (
-    db.prepare(
-      "SELECT COUNT(*) as cnt FROM user_subscriptions WHERE status = 'active'",
-    ).get() as { cnt: number }
+    db
+      .prepare(
+        "SELECT COUNT(*) as cnt FROM user_subscriptions WHERE status = 'active'",
+      )
+      .get() as { cnt: number }
   ).cnt;
 
   return {
@@ -6688,7 +6785,14 @@ export function batchAssignPlan(
       db.prepare(
         `INSERT INTO user_subscriptions (id, user_id, plan_id, status, started_at, expires_at, auto_renew, created_at)
          VALUES (?, ?, ?, 'active', ?, ?, 0, ?)`,
-      ).run(subId, userId, planId, now.toISOString(), expiresAt, now.toISOString());
+      ).run(
+        subId,
+        userId,
+        planId,
+        now.toISOString(),
+        expiresAt,
+        now.toISOString(),
+      );
 
       db.prepare('UPDATE users SET subscription_plan_id = ? WHERE id = ?').run(
         planId,
@@ -6729,7 +6833,6 @@ export function getAllPlanSubscriberCounts(): Record<string, number> {
   }
   return result;
 }
-
 
 /**
  * Atomically increment redeem code usage with optimistic locking.
