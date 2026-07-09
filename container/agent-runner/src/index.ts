@@ -36,7 +36,15 @@ import type {
 import type { ClaudeContextAudit } from './stream-event.types.js';
 export type { StreamEventType, StreamEvent } from './types.js';
 
-import { sanitizeFilename, generateFallbackName, formatLocalNow, isSuspectTruncatedStreamResult, AssistantTextTracker } from './utils.js';
+import {
+  sanitizeFilename,
+  generateFallbackName,
+  formatLocalNow,
+  isSuspectTruncatedStreamResult,
+  shouldForceBackgroundTaskSummary,
+  buildBackgroundTaskSummaryPrompt,
+  AssistantTextTracker,
+} from './utils.js';
 import {
   extractSessionHistory as extractSessionHistoryImpl,
   parseTranscript,
@@ -1336,6 +1344,13 @@ async function runQuery(
   // 零 usage 指纹时置位，healthy result 到达即清空。随返回值交给会话循环
   // 触发自动续写（见 isSuspectTruncatedStreamResult）。
   let suspectTruncatedTail: string | undefined;
+  // 后台 Task 完成保护：一旦本 query 因 pendingBgTasks>0 挂起过，后续
+  // pending 清零的 result 必须是真正汇总，而不能仍是"等待其余 Agent"的
+  // 过期进度文本。命中时压制该 result，并向同一 SDK stream 注入一次
+  // "全部完成，请最终汇总"的内部消息。限制次数防无限自续写。
+  let sawPendingBackgroundTasks = false;
+  let backgroundSummaryForceAttempts = 0;
+  const MAX_BACKGROUND_SUMMARY_FORCE_ATTEMPTS = 2;
   // Usage delta 化基线：SDK result.usage 是 query 级累计值，单 query 多 result
   // 时需做差上报，否则主进程按事件入账会重复计费。
   let lastReportedUsage = { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0, durationMs: 0, numTurns: 0 };
@@ -1896,6 +1911,44 @@ async function runQuery(
       const suspectTruncated =
         emitOutput && !!finalText && isSuspectTruncatedStreamResult(sdkUsage, finalText.length);
       const pendingBgTasks = emitOutput ? processor.getPendingSdkTaskCount() : 0;
+      if (pendingBgTasks > 0) {
+        sawPendingBackgroundTasks = true;
+      }
+      if (shouldForceBackgroundTaskSummary({
+        emitOutput,
+        sawPendingBackgroundTasks,
+        pendingBgTasks,
+        finalText,
+        attempts: backgroundSummaryForceAttempts,
+        maxAttempts: MAX_BACKGROUND_SUMMARY_FORCE_ATTEMPTS,
+      })) {
+        backgroundSummaryForceAttempts++;
+        const forcePrompt = buildBackgroundTaskSummaryPrompt();
+        log(
+          `Result #${resultCount} looked like a stale background-task wait reply after all tasks settled; forcing final summary (${backgroundSummaryForceAttempts}/${MAX_BACKGROUND_SUMMARY_FORCE_ATTEMPTS})`,
+        );
+        emit({
+          status: 'stream',
+          result: null,
+          streamEvent: {
+            eventType: 'status',
+            agentScope: 'system',
+            statusText: '后台任务已全部完成，正在自动汇总最终结果',
+            summary: '后台任务已全部完成，正在自动汇总最终结果',
+            displayLevel: 'primary',
+          },
+        });
+        assistantTextTracker.reset();
+        canonicalAssistantUuid = undefined;
+        suspectTruncatedTail = undefined;
+        const rejected = stream.push(forcePrompt);
+        if (rejected.length === 0) {
+          containerInput.turnId = generateTurnId();
+          resultReceivedAt = null;
+          continue;
+        }
+        log(`Forced background summary prompt was rejected: ${rejected.join('; ')}`);
+      }
       if (suspectTruncated && finalText) {
         log(`Result #${resultCount} suspected truncated stream (zero-usage success, ${finalText.length} chars), will auto-continue`);
         suspectTruncatedTail = finalText.slice(-200);
@@ -2027,6 +2080,8 @@ async function runQuery(
           },
         });
       } else {
+        sawPendingBackgroundTasks = false;
+        backgroundSummaryForceAttempts = 0;
         resultReceivedAt = Date.now();
       }
     }
