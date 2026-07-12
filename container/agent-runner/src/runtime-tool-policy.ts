@@ -1,4 +1,5 @@
 export type AgentToolPolicyMode = 'inherit' | 'readonly' | 'restricted';
+export type AgentMcpPolicyMode = 'inherit' | 'custom' | 'disabled';
 
 export interface ResolvedAgentToolPolicy {
   mode: AgentToolPolicyMode;
@@ -53,17 +54,30 @@ export function parseAgentToolPolicyMode(
   return raw === 'readonly' || raw === 'restricted' ? raw : 'inherit';
 }
 
+export function parseAgentMcpPolicyMode(
+  raw: string | undefined,
+): AgentMcpPolicyMode {
+  return raw === 'custom' || raw === 'disabled' ? raw : 'inherit';
+}
+
 export function resolveAgentToolPolicy(
   mode: AgentToolPolicyMode,
   happyclawToolNames: string[],
+  mcpMode: AgentMcpPolicyMode = 'inherit',
 ): ResolvedAgentToolPolicy {
   if (mode === 'inherit') {
+    const exactUserMcpSet = mcpMode !== 'inherit';
     return {
       mode,
       disallowedTools: [],
-      loadUserPlugins: true,
-      includeUserMcpServers: true,
-      strictMcpConfig: false,
+      // Plugins may declare opaque MCP servers. An exact Agent MCP policy
+      // therefore cannot safely load the plugin bundle as a side channel.
+      loadUserPlugins: !exactUserMcpSet,
+      includeUserMcpServers: mcpMode !== 'disabled',
+      // Keep project/user setting sources for context and managed Skills, but
+      // ignore their MCP declarations. Selected user MCP is supplied through
+      // options.mcpServers by the runner.
+      strictMcpConfig: exactUserMcpSet,
       settingSources: ['project', 'user'],
       disableSkillShellExecution: false,
     };

@@ -22,7 +22,10 @@ export const IM_CHANNEL_ORDER = [
 
 export type ImChannelType = (typeof IM_CHANNEL_ORDER)[number];
 
-export const IM_CHANNEL_CAPABILITIES: Record<ImChannelType, ImChannelCapabilities> = {
+export const IM_CHANNEL_CAPABILITIES: Record<
+  ImChannelType,
+  ImChannelCapabilities
+> = {
   feishu: {
     channel_type: 'feishu',
     label: '飞书',
@@ -37,7 +40,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<ImChannelType, ImChannelCapabilitie
   dingtalk: {
     channel_type: 'dingtalk',
     label: '钉钉',
-    can_bind_workspace: true,
+    can_bind_workspace: false,
     can_bind_session: true,
     supports_thread_map: false,
     supports_activation_modes: true,
@@ -48,7 +51,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<ImChannelType, ImChannelCapabilitie
   telegram: {
     channel_type: 'telegram',
     label: 'Telegram',
-    can_bind_workspace: true,
+    can_bind_workspace: false,
     can_bind_session: true,
     supports_thread_map: false,
     supports_activation_modes: true,
@@ -59,7 +62,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<ImChannelType, ImChannelCapabilitie
   qq: {
     channel_type: 'qq',
     label: 'QQ',
-    can_bind_workspace: true,
+    can_bind_workspace: false,
     can_bind_session: true,
     supports_thread_map: false,
     supports_activation_modes: true,
@@ -70,7 +73,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<ImChannelType, ImChannelCapabilitie
   wechat: {
     channel_type: 'wechat',
     label: '微信',
-    can_bind_workspace: true,
+    can_bind_workspace: false,
     can_bind_session: true,
     supports_thread_map: false,
     supports_activation_modes: true,
@@ -81,7 +84,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<ImChannelType, ImChannelCapabilitie
   discord: {
     channel_type: 'discord',
     label: 'Discord',
-    can_bind_workspace: true,
+    can_bind_workspace: false,
     can_bind_session: true,
     supports_thread_map: false,
     supports_activation_modes: true,
@@ -92,7 +95,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<ImChannelType, ImChannelCapabilitie
   whatsapp: {
     channel_type: 'whatsapp',
     label: 'WhatsApp',
-    can_bind_workspace: true,
+    can_bind_workspace: false,
     can_bind_session: true,
     supports_thread_map: false,
     supports_activation_modes: true,
@@ -105,7 +108,9 @@ export const IM_CHANNEL_CAPABILITIES: Record<ImChannelType, ImChannelCapabilitie
 export function getImChannelCapabilities(
   channelType: string | null | undefined,
 ): ImChannelCapabilities | undefined {
-  return channelType ? IM_CHANNEL_CAPABILITIES[channelType as ImChannelType] : undefined;
+  return channelType
+    ? IM_CHANNEL_CAPABILITIES[channelType as ImChannelType]
+    : undefined;
 }
 
 export function isThreadMapCapableChat(info?: {

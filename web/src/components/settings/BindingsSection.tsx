@@ -82,14 +82,52 @@ export function BindingsSection() {
     return list;
   }, [bindings, channelFilter, search]);
 
+  const bindingSections = useMemo(
+    () => [
+      {
+        key: 'workspace',
+        title: '工作区绑定',
+        description: '话题群按话题自动生成独立会话',
+        items: filtered.filter(
+          (item) =>
+            !(item.bound_session_id ?? item.bound_agent_id) &&
+            !!(item.bound_workspace_jid ?? item.bound_main_jid),
+        ),
+      },
+      {
+        key: 'session',
+        title: '会话绑定',
+        description: '普通群和私聊继续使用指定会话上下文',
+        items: filtered.filter((item) =>
+          Boolean(item.bound_session_id ?? item.bound_agent_id),
+        ),
+      },
+      {
+        key: 'unbound',
+        title: '未绑定',
+        description: '尚未指定工作区或会话',
+        items: filtered.filter(
+          (item) =>
+            !(item.bound_session_id ?? item.bound_agent_id) &&
+            !(item.bound_workspace_jid ?? item.bound_main_jid),
+        ),
+      },
+    ],
+    [filtered],
+  );
+
   const selectedChannelLabel =
     channelFilter === 'all'
       ? null
       : (getImChannelCapabilities(channelFilter)?.label ?? channelFilter);
 
   const selectableTargets = useMemo(() => {
-    if (!rebindGroup?.is_thread_capable) return targets;
-    return targets.filter((target) => target.type === 'main');
+    if (!rebindGroup) return [];
+    return targets.filter((target) =>
+      rebindGroup.is_thread_capable
+        ? target.type === 'main'
+        : target.type === 'session',
+    );
   }, [rebindGroup?.is_thread_capable, targets]);
 
   const handleRebind = useCallback((group: AvailableImGroup) => {
@@ -224,11 +262,10 @@ export function BindingsSection() {
           <div>
             <h1 className="text-2xl font-bold text-foreground flex items-center gap-2">
               <Link2 className="w-6 h-6" />
-              消息挂载管理
+              渠道绑定
             </h1>
             <p className="text-sm text-muted-foreground mt-1">
-              查看和管理 IM 渠道到工作区/会话的路由。未绑定的渠道默认发送到默认
-              Agent 的主会话。
+              话题群绑定工作区并按话题生成会话；普通群和私聊绑定到具体会话。
             </p>
           </div>
           <Button
@@ -330,19 +367,38 @@ export function BindingsSection() {
               : '没有匹配的渠道'}
           </div>
         ) : (
-          <div className="space-y-2">
-            {filtered.map((group) => (
-              <ImBindingRow
-                key={group.jid}
-                group={group}
-                isActioning={actioningJid === group.jid}
-                onRebind={handleRebind}
-                onUnbind={handleUnbind}
-                onResetAllowlist={handleResetAllowlist}
-                onActivationModeChange={handleActivationModeChange}
-                onDelete={handleDelete}
-              />
-            ))}
+          <div className="space-y-5">
+            {bindingSections.map((section) =>
+              section.items.length > 0 ? (
+                <section key={section.key} className="space-y-2">
+                  <div className="flex items-end justify-between px-1">
+                    <div>
+                      <h2 className="text-sm font-semibold text-foreground">
+                        {section.title}
+                        <span className="ml-1.5 text-xs font-normal text-muted-foreground">
+                          {section.items.length}
+                        </span>
+                      </h2>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        {section.description}
+                      </p>
+                    </div>
+                  </div>
+                  {section.items.map((group) => (
+                    <ImBindingRow
+                      key={group.jid}
+                      group={group}
+                      isActioning={actioningJid === group.jid}
+                      onRebind={handleRebind}
+                      onUnbind={handleUnbind}
+                      onResetAllowlist={handleResetAllowlist}
+                      onActivationModeChange={handleActivationModeChange}
+                      onDelete={handleDelete}
+                    />
+                  ))}
+                </section>
+              ) : null,
+            )}
           </div>
         )}
       </div>
@@ -353,6 +409,13 @@ export function BindingsSection() {
         imGroupName={rebindGroup?.name || ''}
         targets={selectableTargets}
         targetsLoading={targetsLoading}
+        targetType={rebindGroup?.is_thread_capable ? 'workspace' : 'session'}
+        canUnbind={
+          !!(
+            (rebindGroup?.bound_session_id ?? rebindGroup?.bound_agent_id) ||
+            (rebindGroup?.bound_workspace_jid ?? rebindGroup?.bound_main_jid)
+          )
+        }
         onSelect={handleSelectTarget}
         onRestoreDefault={handleRestoreDefault}
         onClose={() => setRebindGroup(null)}
@@ -367,7 +430,7 @@ export function BindingsSection() {
         title="确认解绑"
         message={
           unbindGroup
-            ? `解绑后，「${unbindGroup.name}」的消息将恢复默认路由到默认 Agent 的主会话。确认解绑？`
+            ? `解绑后，「${unbindGroup.name}」将不再路由到当前目标。已有会话和历史不会被删除。确认解绑？`
             : ''
         }
         confirmText="解绑"
@@ -378,13 +441,13 @@ export function BindingsSection() {
         open={!!restoreConfirmGroup}
         onClose={() => setRestoreConfirmGroup(null)}
         onConfirm={confirmRestoreDefault}
-        title="恢复默认路由"
+        title="确认解除绑定"
         message={
           restoreConfirmGroup
-            ? `确认将「${restoreConfirmGroup.name}」恢复为默认路由（消息发送到默认 Agent 的主会话）？`
+            ? `确认解除「${restoreConfirmGroup.name}」当前的渠道绑定？已有会话和历史不会被删除。`
             : ''
         }
-        confirmText="恢复默认"
+        confirmText="解除绑定"
       />
 
       {/* Reset sender allowlist confirm dialog */}

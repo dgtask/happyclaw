@@ -57,11 +57,8 @@ const catalog = await import('../src/plugin-catalog.js');
 const utils = await import('../src/plugin-utils.js');
 const materializer = await import('../src/plugin-materializer.js');
 
-const {
-  buildVolumeMounts,
-  prepareHostPlugins,
-  replaceHostMcpServersEnv,
-} = containerRunner;
+const { buildVolumeMounts, prepareHostPlugins, replaceHostMcpServersEnv } =
+  containerRunner;
 const { writeCatalogIndex, getCatalogSnapshotDir } = catalog;
 const { CONTAINER_PLUGINS_PATH } = utils;
 const { getUserRuntimeRoot, getUserPluginRuntimeDir } = materializer;
@@ -175,7 +172,11 @@ describe('buildVolumeMounts — Claude Code plugins runtime mount', () => {
       },
     });
 
-    const mounts = buildVolumeMounts(fakeGroup('grp-x', USER) as any, false, true);
+    const mounts = buildVolumeMounts(
+      fakeGroup('grp-x', USER) as any,
+      false,
+      true,
+    );
 
     const pluginMount = mounts.find(
       (m) => m.containerPath === CONTAINER_PLUGINS_PATH,
@@ -196,7 +197,11 @@ describe('buildVolumeMounts — Claude Code plugins runtime mount', () => {
     // The runtime root is created on demand so the bind-mount target exists
     // even for users who haven't enabled anything yet. The mount is a no-op
     // for the CLI (no .claude-plugin/plugin.json under it), but still present.
-    const mounts = buildVolumeMounts(fakeGroup('grp-x', USER) as any, false, true);
+    const mounts = buildVolumeMounts(
+      fakeGroup('grp-x', USER) as any,
+      false,
+      true,
+    );
     const pluginMount = mounts.find(
       (m) => m.containerPath === CONTAINER_PLUGINS_PATH,
     );
@@ -210,10 +215,15 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
   test('admin-owned container mounts external CLAUDE.md, rules, and skills', () => {
     const external = path.join(tmpDataDir, 'external-claude');
     fs.mkdirSync(path.join(external, 'rules'), { recursive: true });
-    fs.mkdirSync(path.join(external, 'skills', 'admin-skill'), { recursive: true });
+    fs.mkdirSync(path.join(external, 'skills', 'admin-skill'), {
+      recursive: true,
+    });
     fs.writeFileSync(path.join(external, 'CLAUDE.md'), '# admin');
     fs.writeFileSync(path.join(external, 'rules', 'r.md'), '# rule');
-    fs.writeFileSync(path.join(external, 'skills', 'admin-skill', 'SKILL.md'), '# skill');
+    fs.writeFileSync(
+      path.join(external, 'skills', 'admin-skill', 'SKILL.md'),
+      '# skill',
+    );
     writeSystemSettings({ externalClaudeDir: external });
 
     const mounts = buildVolumeMounts(
@@ -222,6 +232,24 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
       true,
       undefined,
       'main',
+      undefined,
+      undefined,
+      undefined,
+      {
+        id: 'host-context-agent',
+        name: 'Host Context Agent',
+        version: 1,
+        identityHash: 'hash',
+        identityPrompt: '',
+        includeClaudePreset: true,
+        runtimePolicy: {
+          provider_id: null,
+          context: { source: 'host_claude' },
+          skills: { mode: 'inherit', ids: [] },
+          mcp: { mode: 'inherit', ids: [] },
+          tools: { mode: 'inherit' },
+        },
+      } as any,
     );
 
     expect(mounts).toContainEqual({
@@ -244,7 +272,9 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
   test('ordinary user container does not mount admin external triad', () => {
     const external = path.join(tmpDataDir, 'external-claude');
     fs.mkdirSync(path.join(external, 'rules'), { recursive: true });
-    fs.mkdirSync(path.join(external, 'skills', 'admin-skill'), { recursive: true });
+    fs.mkdirSync(path.join(external, 'skills', 'admin-skill'), {
+      recursive: true,
+    });
     fs.writeFileSync(path.join(external, 'CLAUDE.md'), '# admin');
     writeSystemSettings({ externalClaudeDir: external });
 
@@ -256,9 +286,49 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
       'alice-home',
     );
 
-    expect(mounts.some((m) => m.containerPath === '/workspace/CLAUDE.md')).toBe(false);
-    expect(mounts.some((m) => m.containerPath === '/workspace/.claude/rules')).toBe(false);
-    expect(mounts.some((m) => m.containerPath === '/workspace/external-skills')).toBe(false);
+    expect(mounts.some((m) => m.containerPath === '/workspace/CLAUDE.md')).toBe(
+      false,
+    );
+    expect(
+      mounts.some((m) => m.containerPath === '/workspace/.claude/rules'),
+    ).toBe(false);
+    expect(
+      mounts.some((m) => m.containerPath === '/workspace/external-skills'),
+    ).toBe(false);
+  });
+
+  test('admin managed Agent does not mount host triad without context opt-in', () => {
+    const external = path.join(tmpDataDir, 'external-claude');
+    fs.mkdirSync(path.join(external, 'skills', 'admin-skill'), {
+      recursive: true,
+    });
+    fs.writeFileSync(path.join(external, 'CLAUDE.md'), '# admin');
+    writeSystemSettings({ externalClaudeDir: external });
+
+    const mounts = buildVolumeMounts(
+      fakeGroup('admin-workspace', 'admin') as any,
+      false,
+      true,
+      undefined,
+      'main',
+    );
+
+    expect(
+      mounts.some((mount) => mount.containerPath === '/workspace/CLAUDE.md'),
+    ).toBe(false);
+    expect(
+      mounts.some(
+        (mount) => mount.containerPath === '/workspace/external-skills',
+      ),
+    ).toBe(false);
+    expect(
+      mounts.some(
+        (mount) => mount.containerPath === '/workspace/project-skills',
+      ),
+    ).toBe(true);
+    expect(
+      mounts.some((mount) => mount.containerPath === '/workspace/user-skills'),
+    ).toBe(true);
   });
 });
 
@@ -336,8 +406,12 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
       (mount) => mount.containerPath === '/workspace/user-skills',
     );
     expect(userSkillsMount).toBeTruthy();
-    expect(fs.existsSync(path.join(userSkillsMount!.hostPath, 'review'))).toBe(true);
-    expect(fs.existsSync(path.join(userSkillsMount!.hostPath, 'research'))).toBe(false);
+    expect(fs.existsSync(path.join(userSkillsMount!.hostPath, 'review'))).toBe(
+      true,
+    );
+    expect(
+      fs.existsSync(path.join(userSkillsMount!.hostPath, 'research')),
+    ).toBe(false);
   });
 
   test('custom skill runtimes are immutable and isolated by profile version', () => {
@@ -495,6 +569,10 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
       mcpServers?: Record<string, unknown>;
     };
     expect(Object.keys(settings.mcpServers ?? {})).toEqual(['github']);
+    const envFile = path.join(tmpDataDir, 'env', 'grp-policy-mcp', 'env');
+    expect(fs.readFileSync(envFile, 'utf8')).toContain(
+      "HAPPYCLAW_AGENT_MCP_POLICY='custom'",
+    );
   });
 
   test('host MCP env replaces inherited servers and clears disabled policy', () => {

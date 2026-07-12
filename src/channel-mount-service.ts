@@ -7,10 +7,10 @@ import type {
 import { getChannelType } from './im-channel.js';
 
 export interface ChannelMountResolutionDeps {
-  getAgent: (sessionId: string) => Pick<SubAgent, 'id' | 'chat_jid'> | undefined;
-  getRegisteredGroup: (
-    jid: string,
-  ) => RegisteredGroup | undefined;
+  getAgent: (
+    sessionId: string,
+  ) => Pick<SubAgent, 'id' | 'chat_jid'> | undefined;
+  getRegisteredGroup: (jid: string) => RegisteredGroup | undefined;
   getJidsByFolder?: (folder: string) => string[];
 }
 
@@ -43,13 +43,18 @@ export function isImChannelJid(jid: string): boolean {
   return jid !== '' && !jid.startsWith('web:') && getChannelType(jid) !== null;
 }
 
-export function toRoutingMode(group: Pick<RegisteredGroup, 'binding_mode'>): ChannelRoutingMode {
+export function toRoutingMode(
+  group: Pick<RegisteredGroup, 'binding_mode'>,
+): ChannelRoutingMode {
   return group.binding_mode === 'thread_map' ? 'thread_map' : 'single_session';
 }
 
 export function resolveWorkspaceJid(
   workspaceJid: string | undefined,
-  deps: Pick<ChannelMountResolutionDeps, 'getRegisteredGroup' | 'getJidsByFolder'>,
+  deps: Pick<
+    ChannelMountResolutionDeps,
+    'getRegisteredGroup' | 'getJidsByFolder'
+  >,
 ): string | null {
   if (!workspaceJid) return null;
   if (deps.getRegisteredGroup(workspaceJid)) return workspaceJid;
@@ -197,7 +202,8 @@ export function buildWorkspaceMountUpdate(
     ...group,
     target_agent_id: undefined,
     target_main_jid: workspaceJid,
-    binding_mode: routingMode === 'thread_map' ? 'thread_map' : 'single_context',
+    binding_mode:
+      routingMode === 'thread_map' ? 'thread_map' : 'single_context',
     reply_policy: options.replyPolicy ?? group.reply_policy ?? 'source_only',
     ...(options.activationMode !== undefined
       ? { activation_mode: options.activationMode }
@@ -218,5 +224,20 @@ export function buildUnmountUpdate(
     target_main_jid: undefined,
     binding_mode: 'single_context',
     ...(options.resetActivation ? { activation_mode: 'auto' as const } : {}),
+  };
+}
+
+/**
+ * Stop treating a workspace as a live topic-map target without deleting any
+ * sessions or context mappings created while it was bound. Rebinding the same
+ * topic channel can therefore resume the existing history.
+ */
+export function buildDetachedWorkspaceUpdate(
+  workspace: RegisteredGroup,
+): RegisteredGroup {
+  return {
+    ...workspace,
+    conversation_source: 'manual',
+    conversation_nav_mode: 'horizontal',
   };
 }

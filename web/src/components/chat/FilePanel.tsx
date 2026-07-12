@@ -989,7 +989,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-border">
         <h3 className="font-semibold text-foreground text-sm">
-          工作区文件管理
+          当前上下文文件
         </h3>
         <div className="flex items-center gap-1">
           {canOpenLocalFolder && (

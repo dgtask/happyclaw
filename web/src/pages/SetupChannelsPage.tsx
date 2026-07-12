@@ -120,7 +120,7 @@ export function SetupChannelsPage() {
 
       navigate('/chat', { replace: true });
     } catch (err) {
-      setError(getErrorMessage(err, '保存消息通道配置失败'));
+      setError(getErrorMessage(err, '保存渠道接入配置失败'));
     } finally {
       setSaving(false);
     }
@@ -133,7 +133,7 @@ export function SetupChannelsPage() {
           <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center mx-auto mb-4">
             <MessageSquare className="w-6 h-6 text-primary" />
           </div>
-          <h1 className="text-2xl font-bold text-foreground mb-2">配置消息通道（可选）</h1>
+          <h1 className="text-2xl font-bold text-foreground mb-2">接入消息渠道（可选）</h1>
           <p className="text-sm text-muted-foreground">
             绑定飞书 / Telegram / QQ / Discord / WhatsApp / 微信，即可通过 IM 与 AI 对话。跳过后也可在设置中随时配置。
           </p>
@@ -250,7 +250,7 @@ export function SetupChannelsPage() {
                   WhatsApp
                 </h2>
                 <p className="text-xs text-muted-foreground">
-                  基于 Baileys 协议扫码登录。启用后，请到「设置 → 消息通道」扫码完成绑定。
+                  基于 Baileys 协议扫码登录。启用后，请到「设置 → 渠道接入」扫码完成接入。
                 </p>
               </div>
               <label className="flex items-center gap-2 text-xs text-muted-foreground shrink-0">

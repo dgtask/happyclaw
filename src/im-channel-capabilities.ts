@@ -25,7 +25,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<string, ImChannelCapabilities> = {
   dingtalk: {
     channel_type: 'dingtalk',
     label: '钉钉',
-    can_bind_workspace: true,
+    can_bind_workspace: false,
     can_bind_session: true,
     supports_thread_map: false,
     supports_activation_modes: true,
@@ -36,7 +36,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<string, ImChannelCapabilities> = {
   telegram: {
     channel_type: 'telegram',
     label: 'Telegram',
-    can_bind_workspace: true,
+    can_bind_workspace: false,
     can_bind_session: true,
     supports_thread_map: false,
     supports_activation_modes: true,
@@ -47,7 +47,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<string, ImChannelCapabilities> = {
   qq: {
     channel_type: 'qq',
     label: 'QQ',
-    can_bind_workspace: true,
+    can_bind_workspace: false,
     can_bind_session: true,
     supports_thread_map: false,
     supports_activation_modes: true,
@@ -58,7 +58,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<string, ImChannelCapabilities> = {
   wechat: {
     channel_type: 'wechat',
     label: '微信',
-    can_bind_workspace: true,
+    can_bind_workspace: false,
     can_bind_session: true,
     supports_thread_map: false,
     supports_activation_modes: true,
@@ -69,7 +69,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<string, ImChannelCapabilities> = {
   discord: {
     channel_type: 'discord',
     label: 'Discord',
-    can_bind_workspace: true,
+    can_bind_workspace: false,
     can_bind_session: true,
     supports_thread_map: false,
     supports_activation_modes: true,
@@ -80,7 +80,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<string, ImChannelCapabilities> = {
   whatsapp: {
     channel_type: 'whatsapp',
     label: 'WhatsApp',
-    can_bind_workspace: true,
+    can_bind_workspace: false,
     can_bind_session: true,
     supports_thread_map: false,
     supports_activation_modes: true,

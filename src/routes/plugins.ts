@@ -64,7 +64,7 @@ pluginsRoutes.get('/', authMiddleware, async (c) => {
   const v2 = readUserPluginsV2(authUser.id);
   const catalog = readCatalogIndex();
   // Choose dep-check runtime based on the viewer's home group executionMode:
-  //   admin (host home, folder=main)        → check host PATH
+  //   admin (host home)                     → check host PATH
   //   member (container home, home-{userId}) → check docker image PATH
   // The home is where the plugin will run in the common path; reporting the
   // wrong runtime produces false "缺少 X" badges (admin sees docker missing

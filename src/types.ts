@@ -115,6 +115,9 @@ export interface AgentProfile {
 
 export interface AgentProfileRuntimePolicy {
   provider_id: string | null;
+  context: {
+    source: 'managed' | 'host_claude';
+  };
   skills: {
     mode: 'inherit' | 'custom' | 'disabled';
     ids: string[];
@@ -126,15 +129,6 @@ export interface AgentProfileRuntimePolicy {
   tools: {
     mode: 'inherit' | 'readonly' | 'restricted';
   };
-}
-
-export interface GroupMember {
-  user_id: string;
-  role: 'owner' | 'member';
-  added_at: string;
-  added_by?: string;
-  username: string;
-  display_name: string;
 }
 
 export interface NewMessage {

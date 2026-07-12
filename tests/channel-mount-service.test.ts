@@ -1,6 +1,15 @@
 import { describe, expect, test } from 'vitest';
 
-import { resolveChannelMountTarget } from '../src/channel-mount-service.js';
+import {
+  buildDetachedWorkspaceUpdate,
+  buildSessionMountUpdate,
+  buildWorkspaceMountUpdate,
+  resolveChannelMountTarget,
+} from '../src/channel-mount-service.js';
+import {
+  IM_CHANNEL_CAPABILITIES,
+  isThreadMapCapableChat,
+} from '../src/im-channel-capabilities.js';
 import type { RegisteredGroup, SubAgent } from '../src/types.js';
 
 function makeWorkspace(name: string, folder: string): RegisteredGroup {
@@ -109,6 +118,69 @@ describe('resolveChannelMountTarget', () => {
       status: 'stale',
       reason: 'missing_workspace',
       workspaceJid: 'web:missing-workspace',
+    });
+  });
+});
+
+describe('channel binding product contract', () => {
+  test('only Feishu exposes workspace binding capability', () => {
+    expect(IM_CHANNEL_CAPABILITIES.feishu.can_bind_workspace).toBe(true);
+    expect(
+      Object.values(IM_CHANNEL_CAPABILITIES)
+        .filter((capability) => capability.channel_type !== 'feishu')
+        .every((capability) => !capability.can_bind_workspace),
+    ).toBe(true);
+  });
+
+  test('only Feishu topic or thread chats qualify for workspace binding', () => {
+    expect(
+      isThreadMapCapableChat({ channel_type: 'feishu', chat_mode: 'topic' }),
+    ).toBe(true);
+    expect(
+      isThreadMapCapableChat({
+        channel_type: 'feishu',
+        chat_mode: 'group',
+        group_message_type: 'thread',
+      }),
+    ).toBe(true);
+    expect(
+      isThreadMapCapableChat({ channel_type: 'feishu', chat_mode: 'group' }),
+    ).toBe(false);
+    expect(
+      isThreadMapCapableChat({ channel_type: 'telegram', chat_mode: 'topic' }),
+    ).toBe(false);
+  });
+
+  test('workspace and session targets remain mutually exclusive', () => {
+    const source = makeWorkspace('Channel', 'channel-a');
+    const sessionBound = buildSessionMountUpdate(
+      { ...source, target_main_jid: 'web:old' },
+      'session-a',
+    );
+    expect(sessionBound.target_agent_id).toBe('session-a');
+    expect(sessionBound.target_main_jid).toBeUndefined();
+
+    const workspaceBound = buildWorkspaceMountUpdate(
+      { ...source, target_agent_id: 'old-session' },
+      'web:workspace-a',
+      'thread_map',
+    );
+    expect(workspaceBound.target_agent_id).toBeUndefined();
+    expect(workspaceBound.target_main_jid).toBe('web:workspace-a');
+  });
+
+  test('detaching a topic workspace preserves its data and only resets navigation', () => {
+    const workspace: RegisteredGroup = {
+      ...makeWorkspace('Workspace A', 'workspace-a'),
+      conversation_source: 'feishu_thread',
+      conversation_nav_mode: 'vertical_threads',
+      skill_ids: ['skill-a'],
+    };
+
+    expect(buildDetachedWorkspaceUpdate(workspace)).toEqual({
+      ...workspace,
+      conversation_source: 'manual',
+      conversation_nav_mode: 'horizontal',
     });
   });
 });

@@ -3,7 +3,6 @@ import {
   ChevronDown,
   ChevronRight,
   AlertTriangle,
-  Bot,
   Monitor,
   Box,
   FolderInput,
@@ -14,6 +13,7 @@ import { toast } from 'sonner';
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogFooter,
@@ -31,6 +31,7 @@ import { DirectoryBrowser } from '../shared/DirectoryBrowser';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { useAgentProfilesStore } from '../../stores/agent-profiles';
+import { getAgentContextSource } from '../../types';
 import { workspaceCreationBlockReason } from '../../utils/agent-product';
 
 interface CreateContainerDialogProps {
@@ -62,6 +63,12 @@ export function CreateContainerDialog({
   const profilesLoading = useAgentProfilesStore((s) => s.loading);
   const profilesError = useAgentProfilesStore((s) => s.profilesError);
   const loadProfiles = useAgentProfilesStore((s) => s.loadProfiles);
+  const selectedProfile = profiles.find(
+    (profile) => profile.id === selectedAgentProfileId,
+  );
+  const inheritsHostClaude =
+    canHostExec &&
+    getAgentContextSource(selectedProfile?.runtime_policy) === 'host_claude';
 
   useEffect(() => {
     if (open) void loadProfiles();
@@ -73,6 +80,12 @@ export function CreateContainerDialog({
       profiles.find((profile) => profile.is_default) ?? profiles[0];
     setSelectedAgentProfileId(defaultProfile.id);
   }, [open, profiles, selectedAgentProfileId]);
+
+  useEffect(() => {
+    if (canHostExec || executionMode === 'container') return;
+    setExecutionMode('container');
+    setCustomCwd('');
+  }, [canHostExec, executionMode]);
 
   const reset = () => {
     setName('');
@@ -104,7 +117,7 @@ export function CreateContainerDialog({
     setLoading(true);
     try {
       const options: Record<string, string> = {};
-      if (executionMode === 'host') {
+      if (executionMode === 'host' && canHostExec) {
         options.execution_mode = 'host';
         if (customCwd.trim()) options.custom_cwd = customCwd.trim();
       } else {
@@ -138,6 +151,9 @@ export function CreateContainerDialog({
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>为 Agent 新建工作区</DialogTitle>
+          <DialogDescription>
+            选择 Agent，并分别确认工作区的运行位置和 Agent 上下文。
+          </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-4">
@@ -159,16 +175,12 @@ export function CreateContainerDialog({
                 {profiles.map((profile) => (
                   <SelectItem key={profile.id} value={profile.id}>
                     <span className="flex min-w-0 items-center gap-2">
-                      <Bot className="w-3.5 h-3.5 text-muted-foreground" />
                       <span className="truncate">{profile.name}</span>
                       {profile.is_default && (
                         <span className="text-[10px] text-muted-foreground">
                           默认
                         </span>
                       )}
-                      <span className="text-[10px] text-muted-foreground">
-                        v{profile.version}
-                      </span>
                     </span>
                   </SelectItem>
                 ))}
@@ -198,9 +210,7 @@ export function CreateContainerDialog({
             )}
             {profiles.length > 0 && (
               <p className="mt-1 text-xs text-muted-foreground line-clamp-2">
-                {profiles.find(
-                  (profile) => profile.id === selectedAgentProfileId,
-                )?.identity_prompt ||
+                {selectedProfile?.identity_prompt ||
                   '使用默认 Agent 行为，不追加额外身份提示词。'}
               </p>
             )}
@@ -219,6 +229,41 @@ export function CreateContainerDialog({
               autoFocus
             />
           </div>
+
+          {selectedProfile && (
+            <div className="rounded-lg border bg-muted/20 p-3">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="min-w-0">
+                  <div className="text-[11px] font-medium text-muted-foreground">
+                    运行位置
+                  </div>
+                  <div className="mt-1 flex items-center gap-1.5 text-sm font-medium text-foreground">
+                    {executionMode === 'host' && canHostExec ? (
+                      <Monitor className="h-3.5 w-3.5 text-muted-foreground" />
+                    ) : (
+                      <Box className="h-3.5 w-3.5 text-muted-foreground" />
+                    )}
+                    {executionMode === 'host' && canHostExec
+                      ? '宿主机'
+                      : 'Docker 容器'}
+                  </div>
+                </div>
+                <div className="min-w-0">
+                  <div className="text-[11px] font-medium text-muted-foreground">
+                    Agent 上下文
+                  </div>
+                  <div className="mt-1 text-sm font-medium text-foreground">
+                    {inheritsHostClaude ? '继承 ~/.claude' : 'HappyClaw 管理'}
+                  </div>
+                </div>
+              </div>
+              <p className="mt-2 border-t pt-2 text-[11px] leading-5 text-muted-foreground">
+                {canHostExec
+                  ? '运行位置决定命令在哪里执行；Agent 上下文由所选 Agent 独立决定。HappyClaw Skills 与 MCP 仍会作为附加能力生效。'
+                  : '工作区固定在 Docker 容器中运行，并使用 HappyClaw 管理的 Agent 上下文与附加能力。'}
+              </p>
+            </div>
+          )}
 
           {/* Advanced options */}
           <div className="border rounded-lg overflow-hidden">
@@ -239,7 +284,7 @@ export function CreateContainerDialog({
                 {/* Execution mode */}
                 <div className="pt-3">
                   <label className="block text-sm font-medium mb-2">
-                    执行模式
+                    运行位置
                   </label>
                   <div className="space-y-2">
                     <label className="flex items-start gap-3 p-2 rounded-lg border cursor-pointer hover:bg-accent/50 transition-colors">
@@ -269,39 +314,34 @@ export function CreateContainerDialog({
                         </p>
                       </div>
                     </label>
-                    <label
-                      className={`flex items-start gap-3 p-2 rounded-lg border transition-colors ${canHostExec ? 'cursor-pointer hover:bg-accent/50' : 'opacity-50 cursor-not-allowed'}`}
-                    >
-                      <input
-                        type="radio"
-                        name="execution_mode"
-                        value="host"
-                        checked={executionMode === 'host'}
-                        onChange={() => {
-                          if (canHostExec) {
+                    {canHostExec && (
+                      <label className="flex cursor-pointer items-start gap-3 rounded-lg border p-2 transition-colors hover:bg-accent/50">
+                        <input
+                          type="radio"
+                          name="execution_mode"
+                          value="host"
+                          checked={executionMode === 'host'}
+                          onChange={() => {
                             setExecutionMode('host');
                             setInitMode('empty');
                             setInitSourcePath('');
                             setInitGitUrl('');
-                          }
-                        }}
-                        disabled={!canHostExec}
-                        className="mt-0.5 accent-primary"
-                      />
-                      <div>
-                        <div className="flex items-center gap-1.5">
-                          <Monitor className="w-4 h-4 text-muted-foreground" />
-                          <span className="text-sm font-medium">
-                            宿主机模式
-                          </span>
+                          }}
+                          className="mt-0.5 accent-primary"
+                        />
+                        <div>
+                          <div className="flex items-center gap-1.5">
+                            <Monitor className="w-4 h-4 text-muted-foreground" />
+                            <span className="text-sm font-medium">
+                              宿主机模式
+                            </span>
+                          </div>
+                          <p className="text-xs text-muted-foreground mt-0.5">
+                            直接在服务器上执行
+                          </p>
                         </div>
-                        <p className="text-xs text-muted-foreground mt-0.5">
-                          {canHostExec
-                            ? '直接在服务器上执行'
-                            : '需要管理员权限'}
-                        </p>
-                      </div>
-                    </label>
+                      </label>
+                    )}
                   </div>
                 </div>
 

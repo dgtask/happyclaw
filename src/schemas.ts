@@ -218,6 +218,11 @@ export const AgentProfileRuntimePolicySchema = z
       .transform((val) =>
         val === undefined ? undefined : val && val.trim() ? val.trim() : null,
       ),
+    context: z
+      .object({
+        source: z.enum(['managed', 'host_claude']).optional(),
+      })
+      .optional(),
     skills: z
       .object({
         mode: AgentProfileRuntimePolicyModeSchema.optional(),
@@ -264,8 +269,19 @@ export const AgentProfileGenerateSchema = z.object({
   description: z.string().trim().min(1).max(4000),
 });
 
-export const GroupMemberAddSchema = z.object({
-  user_id: z.string().min(1),
+export const AgentProfileRefinePromptSchema = z.object({
+  message: z.string().trim().min(1).max(4000),
+  current_prompt: z.string().max(20000),
+  history: z
+    .array(
+      z.object({
+        role: z.enum(['user', 'assistant']),
+        content: z.string().trim().min(1).max(4000),
+      }),
+    )
+    .max(12)
+    .optional()
+    .default([]),
 });
 
 // Schema 层 cap：路由 handler 还有 byteLength 校验作为底线。Schema 层 cap

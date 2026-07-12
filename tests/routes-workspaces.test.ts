@@ -43,7 +43,6 @@ const routeModule = await import('../src/routes/workspaces.js');
 const routes = routeModule.default;
 
 const OWNER_ID = 'routes-workspace-owner';
-const MEMBER_ID = 'routes-workspace-member';
 const STRANGER_ID = 'routes-workspace-stranger';
 const OTHER_OWNER_ID = 'routes-workspace-other-owner';
 
@@ -69,7 +68,7 @@ function createUser(id: string): void {
 
 beforeAll(() => {
   db.initDatabase();
-  for (const id of [OWNER_ID, MEMBER_ID, STRANGER_ID, OTHER_OWNER_ID]) {
+  for (const id of [OWNER_ID, STRANGER_ID, OTHER_OWNER_ID]) {
     createUser(id);
   }
 });
@@ -156,98 +155,14 @@ describe('/api/workspaces canonical read routes', () => {
     ]);
   });
 
-  test('shared members can read shared canonical workspaces but strangers cannot', async () => {
-    const sharedProfile = db.createAgentProfile({
-      ownerUserId: OWNER_ID,
-      name: 'Shared Owner Agent',
-      runtimePolicy: {
-        provider_id: 'owner-private-provider',
-        skills: { mode: 'disabled', ids: [] },
-        mcp: { mode: 'disabled', ids: [] },
-        tools: { mode: 'restricted' },
-      },
-    });
-    db.setRegisteredGroup('web:canonical-shared', {
-      name: 'Canonical Shared',
-      folder: 'canonical-shared',
-      added_at: '2026-07-09T00:00:00.000Z',
-      created_by: OWNER_ID,
-      is_home: false,
-    });
-    db.assignWorkspaceAgentProfile('canonical-shared', sharedProfile.id);
-    db.setSessionProviderId('canonical-shared', '', 'owner-private-provider');
-    db.setSession('canonical-shared', 'owner-private-sdk-session', '', {
-      agentProfileId: sharedProfile.id,
-      agentProfileVersion: sharedProfile.version,
-      identityHash: sharedProfile.identity_hash,
-    });
-    db.setRegisteredGroup('telegram:canonical-shared-private-channel', {
-      name: 'Owner Private Telegram',
-      folder: 'owner-home',
-      added_at: '2026-07-09T00:00:00.000Z',
-      created_by: OWNER_ID,
-      target_main_jid: 'web:canonical-shared',
-      owner_im_id: 'owner-private-im-id',
-    });
-    db.addGroupMember('canonical-shared', MEMBER_ID, 'member', OWNER_ID);
-
-    asUser(MEMBER_ID);
-    const memberListRes = await routes.request('/', { method: 'GET' });
-    expect(memberListRes.status).toBe(200);
-    const memberListBody = await memberListRes.json();
-    const sharedSummary = memberListBody.workspaces.find(
-      (workspace: { jid: string }) => workspace.jid === 'web:canonical-shared',
-    );
-    expect(sharedSummary).toMatchObject({
-      jid: 'web:canonical-shared',
-      can_modify: false,
-      can_manage_members: false,
-      agent_profile: {
-        id: sharedProfile.id,
-        name: sharedProfile.name,
-        version: sharedProfile.version,
-      },
-    });
-    expect(sharedSummary).not.toHaveProperty('owner_user_id');
-    expect(sharedSummary).not.toHaveProperty('execution_mode');
-    expect(sharedSummary).not.toHaveProperty('runtime_session_count');
-    expect(sharedSummary).not.toHaveProperty('channel_mount_count');
-    expect(sharedSummary.agent_profile).not.toHaveProperty('runtime_policy');
-    expect(sharedSummary.agent_profile).not.toHaveProperty('identity_hash');
-
-    const memberDetailRes = await routes.request('/web:canonical-shared', {
-      method: 'GET',
-    });
-    expect(memberDetailRes.status).toBe(200);
-    const memberDetail = await memberDetailRes.json();
-    expect(memberDetail).not.toHaveProperty('runtime_sessions');
-    expect(memberDetail).not.toHaveProperty('channel_mounts');
-
-    const runtimeSessionsRes = await routes.request(
-      '/web:canonical-shared/runtime-sessions',
-      { method: 'GET' },
-    );
-    expect(runtimeSessionsRes.status).toBe(403);
-    const channelMountsRes = await routes.request(
-      '/web:canonical-shared/channel-mounts',
-      { method: 'GET' },
-    );
-    expect(channelMountsRes.status).toBe(403);
-    const allMountsRes = await routes.request('/mounts', { method: 'GET' });
-    const allMountsBody = await allMountsRes.json();
-    expect(allMountsBody.channel_mounts).not.toContainEqual(
-      expect.objectContaining({
-        channel_jid: 'telegram:canonical-shared-private-channel',
-      }),
-    );
-
+  test('non-owners cannot list or inspect another account workspace', async () => {
     asUser(STRANGER_ID);
     const strangerListRes = await routes.request('/', { method: 'GET' });
     const strangerListBody = await strangerListRes.json();
     expect(strangerListBody.workspaces).not.toContainEqual(
-      expect.objectContaining({ jid: 'web:canonical-shared' }),
+      expect.objectContaining({ jid: 'web:canonical-owned' }),
     );
-    const strangerDetailRes = await routes.request('/web:canonical-shared', {
+    const strangerDetailRes = await routes.request('/web:canonical-owned', {
       method: 'GET',
     });
     expect(strangerDetailRes.status).toBe(404);

@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
+  buildAgentCapabilitiesHref,
   buildWorkspaceAgentProfilePatch,
+  getCustomAgentProfiles,
+  getAgentNavigationTargets,
+  getAgentProfileDisplayName,
+  getPrimaryAgentWorkspaceRows,
   groupWorkspacesByAgent,
+  isAgentSectionCollapsible,
+  partitionAgentWorkspaceSections,
   workspaceCreationBlockReason,
 } from '../web/src/utils/agent-product';
 import {
@@ -10,6 +17,11 @@ import {
   getAllowedTaskExecutionModes,
 } from '../web/src/utils/task-edit';
 import type { GroupEntry } from '../web/src/utils/group-utils';
+import {
+  getAgentContextSource,
+  withAgentContextSource,
+  type AgentProfileRuntimePolicy,
+} from '../web/src/types';
 
 function workspace(
   jid: string,
@@ -26,10 +38,51 @@ function workspace(
 }
 
 describe('Agent-first frontend product contracts', () => {
+  it('treats managed and host Claude context as an Agent setting independent of execution mode', () => {
+    const managedPolicy: AgentProfileRuntimePolicy = {
+      provider_id: null,
+      context: { source: 'managed' },
+      skills: { mode: 'custom', ids: ['review'] },
+      mcp: { mode: 'custom', ids: ['github'] },
+      tools: { mode: 'readonly' },
+    };
+
+    expect(getAgentContextSource(managedPolicy)).toBe('managed');
+    expect(getAgentContextSource({})).toBe('managed');
+    expect(withAgentContextSource(managedPolicy, 'host_claude')).toEqual({
+      ...managedPolicy,
+      context: { source: 'host_claude' },
+    });
+  });
+
+  it('shows the legacy built-in Agent name as HappyClaw', () => {
+    expect(getAgentProfileDisplayName('Default Agent')).toBe('HappyClaw');
+    expect(getAgentProfileDisplayName(undefined)).toBe('HappyClaw');
+    expect(getAgentProfileDisplayName('代码审查员')).toBe('代码审查员');
+  });
+
+  it('keeps the Agent management page scoped to custom Agents', () => {
+    expect(
+      getCustomAgentProfiles([
+        { id: 'happyclaw', is_default: true },
+        { id: 'reviewer', is_default: false },
+      ]),
+    ).toEqual([{ id: 'reviewer', is_default: false }]);
+  });
+
   it('sends the canonical Agent assignment payload for workspace migration', () => {
     expect(buildWorkspaceAgentProfilePatch('agent-reviewer')).toEqual({
       agent_profile_id: 'agent-reviewer',
     });
+  });
+
+  it('routes capability management to the owning Agent instead of workspace settings', () => {
+    expect(buildAgentCapabilitiesHref('agent/reviewer')).toBe(
+      '/agent-profiles?agent=agent%2Freviewer#agent-capabilities',
+    );
+    expect(buildAgentCapabilitiesHref()).toBe(
+      '/agent-profiles#agent-capabilities',
+    );
   });
 
   it('moves a task from a host workspace to a container workspace atomically', () => {
@@ -68,7 +121,7 @@ describe('Agent-first frontend product contracts', () => {
     ).toBe('Agent 列表加载失败');
   });
 
-  it('preserves Agent hierarchy for pinned and collaboration collections', () => {
+  it('preserves Agent hierarchy for workspace collections', () => {
     expect(
       groupWorkspacesByAgent([
         workspace('web:one', 'agent-a', 'Reviewer'),
@@ -82,5 +135,82 @@ describe('Agent-first frontend product contracts', () => {
       ['Builder', ['web:two']],
       ['Reviewer', ['web:one', 'web:three']],
     ]);
+  });
+
+  it('keeps the default HappyClaw Agent first and retains its internal home context', () => {
+    const home = workspace('web:main', 'agent-happyclaw', 'HappyClaw');
+    home.is_my_home = true;
+
+    const sections = groupWorkspacesByAgent(
+      [
+        workspace('web:review', 'agent-reviewer', '代码审查员'),
+        workspace('web:project', 'agent-happyclaw', 'HappyClaw'),
+        home,
+      ],
+      'agent-happyclaw',
+    );
+
+    expect(sections.map((section) => section.name)).toEqual([
+      'HappyClaw',
+      '代码审查员',
+    ]);
+    expect(sections[0]).toMatchObject({
+      isDefault: true,
+      items: [{ jid: 'web:main', is_my_home: true }, { jid: 'web:project' }],
+    });
+  });
+
+  it('keeps the home context separate from additional Agent workspaces for navigation', () => {
+    const home = workspace('web:main', 'agent-happyclaw', 'HappyClaw');
+    home.is_my_home = true;
+    const [section] = groupWorkspacesByAgent(
+      [workspace('web:project', 'agent-happyclaw', 'HappyClaw'), home],
+      'agent-happyclaw',
+    );
+
+    expect(getAgentNavigationTargets(section)).toMatchObject({
+      directGroup: { jid: 'web:main', is_my_home: true },
+      workspaces: [{ jid: 'web:project' }],
+    });
+  });
+
+  it('presents the home context as the named main workspace of the primary Agent', () => {
+    const home = workspace('web:main', 'agent-happyclaw', 'HappyClaw');
+    home.is_my_home = true;
+    const [section] = groupWorkspacesByAgent(
+      [workspace('web:project', 'agent-happyclaw', 'HappyClaw'), home],
+      'agent-happyclaw',
+    );
+
+    expect(
+      getPrimaryAgentWorkspaceRows(section).map(({ jid, name }) => ({
+        jid,
+        name,
+      })),
+    ).toEqual([
+      { jid: 'web:main', name: 'HappyClaw' },
+      { jid: 'web:project', name: 'web:project' },
+    ]);
+  });
+
+  it('separates HappyClaw as the primary Agent from custom Agents', () => {
+    const sections = groupWorkspacesByAgent(
+      [
+        workspace('web:main', 'agent-happyclaw', 'HappyClaw'),
+        workspace('web:review', 'agent-reviewer', '代码审查员'),
+      ],
+      'agent-happyclaw',
+    );
+
+    const partitioned = partitionAgentWorkspaceSections(sections);
+    expect(partitioned.primary?.name).toBe('HappyClaw');
+    expect(partitioned.custom.map((section) => section.name)).toEqual([
+      '代码审查员',
+    ]);
+  });
+
+  it('keeps the primary HappyClaw Agent fixed open while custom Agents remain collapsible', () => {
+    expect(isAgentSectionCollapsible({ isDefault: true })).toBe(false);
+    expect(isAgentSectionCollapsible({ isDefault: false })).toBe(true);
   });
 });

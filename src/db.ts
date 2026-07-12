@@ -23,7 +23,6 @@ import {
   ChannelMount,
   DailyUsage,
   ExecutionMode,
-  GroupMember,
   InviteCode,
   InviteCodeWithCreator,
   MessageFinalizationReason,
@@ -573,19 +572,6 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_invites_created_at ON invite_codes(created_at);
   `);
 
-  // Group members table for shared workspaces
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS group_members (
-      group_folder TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'member',
-      added_at TEXT NOT NULL,
-      added_by TEXT,
-      PRIMARY KEY (group_folder, user_id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);
-  `);
-
   // User pinned groups (per-user workspace pinning)
   db.exec(`
     CREATE TABLE IF NOT EXISTS user_pinned_groups (
@@ -1099,8 +1085,8 @@ export function initDatabase(): void {
   `);
 
   // Backfill created_by for feishu/telegram groups by matching sibling groups in the same folder.
-  // Only backfill when the folder has exactly one distinct owner; otherwise keep NULL
-  // to avoid misrouting in ambiguous folders (e.g., shared admin main).
+  // Only backfill when the folder has exactly one distinct owner; otherwise
+  // keep NULL to avoid misrouting ambiguous legacy data.
   db.exec(`
     UPDATE registered_groups
     SET created_by = (
@@ -1124,25 +1110,6 @@ export function initDatabase(): void {
     UPDATE registered_groups SET is_home = 1
     WHERE jid = 'web:main' AND folder = 'main' AND is_home = 0
   `);
-
-  // v15 migration: backfill group_members for existing web groups
-  const currentVersion = getRouterStateInternal('schema_version');
-  if (!currentVersion || parseInt(currentVersion, 10) < 15) {
-    db.transaction(() => {
-      // Backfill owner records for all web groups with created_by set
-      const webGroups = db
-        .prepare(
-          "SELECT DISTINCT folder, created_by FROM registered_groups WHERE jid LIKE 'web:%' AND created_by IS NOT NULL",
-        )
-        .all() as Array<{ folder: string; created_by: string }>;
-      for (const g of webGroups) {
-        db.prepare(
-          `INSERT OR IGNORE INTO group_members (group_folder, user_id, role, added_at, added_by)
-           VALUES (?, ?, 'owner', ?, ?)`,
-        ).run(g.folder, g.created_by, new Date().toISOString(), g.created_by);
-      }
-    })();
-  }
 
   // v16→v17 migration: rebuild sessions table with composite primary key
   // Old PK was (group_folder), which cannot store multiple agent sessions per folder.
@@ -1575,10 +1542,13 @@ export function initDatabase(): void {
   // v42 → v43: top-level Agent ownership and canonical workspace/channel
   // projections. Tables are created with CREATE IF NOT EXISTS above; this
   // pass backfills sources and removes any projection-only ghosts.
+  // v45 → v46: workspace sharing was removed. Drop the legacy membership
+  // table so stale grants cannot survive an upgrade.
+  db.exec('DROP TABLE IF EXISTS group_members');
   backfillAgentProfileDefaultsAndWorkspaceMappings();
   reconcileCanonicalRuntimeProjections();
 
-  const SCHEMA_VERSION = '45';
+  const SCHEMA_VERSION = '46';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -2852,6 +2822,7 @@ export function getSessionAgentIdentity(
 
 const DEFAULT_AGENT_PROFILE_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
   provider_id: null,
+  context: { source: 'managed' },
   skills: { mode: 'inherit', ids: [] },
   mcp: { mode: 'inherit', ids: [] },
   tools: { mode: 'inherit' },
@@ -2859,16 +2830,11 @@ const DEFAULT_AGENT_PROFILE_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
 
 type RuntimePolicyInput = Partial<{
   provider_id: string | null;
+  context: Partial<AgentProfileRuntimePolicy['context']> | null;
   skills: Partial<AgentProfileRuntimePolicy['skills']> | null;
   mcp: Partial<AgentProfileRuntimePolicy['mcp']> | null;
   tools: Partial<AgentProfileRuntimePolicy['tools']> | null;
 }>;
-
-function normalizeOptionalText(value: unknown): string | null {
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  return trimmed ? trimmed : null;
-}
 
 function normalizeIdList(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
@@ -2897,7 +2863,14 @@ export function normalizeAgentProfileRuntimePolicy(
 ): AgentProfileRuntimePolicy {
   const raw = (input ?? {}) as RuntimePolicyInput | AgentProfileRuntimePolicy;
   return {
-    provider_id: normalizeOptionalText(raw.provider_id),
+    provider_id: null,
+    context: {
+      source: normalizeMode(
+        raw.context?.source,
+        ['managed', 'host_claude'] as const,
+        'managed',
+      ),
+    },
     skills: {
       mode: normalizeMode(
         raw.skills?.mode,
@@ -2943,6 +2916,13 @@ export function mergeAgentProfileRuntimePolicy(
 
   return normalizeAgentProfileRuntimePolicy({
     provider_id: has('provider_id') ? patch.provider_id : current.provider_id,
+    context: has('context')
+      ? patch.context === null
+        ? DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.context
+        : {
+            source: patch.context?.source ?? current.context.source,
+          }
+      : current.context,
     skills: has('skills') ? mergeCapability('skills') : current.skills,
     mcp: has('mcp') ? mergeCapability('mcp') : current.mcp,
     tools: has('tools')
@@ -3058,26 +3038,84 @@ export function getAgentProfileForUser(
   return row ? mapAgentProfileRow(row) : undefined;
 }
 
+const DEFAULT_AGENT_PROFILE_NAME = 'HappyClaw';
+const LEGACY_DEFAULT_AGENT_PROFILE_NAME = 'Default Agent';
+
+function runtimePolicyHasExplicitContext(raw: unknown): boolean {
+  let parsed = raw;
+  if (typeof raw === 'string') {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return false;
+    }
+  }
+  return (
+    !!parsed &&
+    typeof parsed === 'object' &&
+    Object.prototype.hasOwnProperty.call(parsed, 'context')
+  );
+}
+
 export function getOrCreateDefaultAgentProfile(userId: string): AgentProfile {
+  const owner = db
+    .prepare("SELECT role FROM users WHERE id = ? AND status = 'active'")
+    .get(userId) as { role: string } | undefined;
+  const isAdmin = owner?.role === 'admin';
   const existing = db
     .prepare(
       "SELECT * FROM agent_profiles WHERE owner_user_id = ? AND is_default = 1 AND status = 'active' LIMIT 1",
     )
     .get(userId) as Record<string, unknown> | undefined;
-  if (existing) return mapAgentProfileRow(existing);
+  if (existing) {
+    const profile = mapAgentProfileRow(existing);
+    const migrateHostContext =
+      isAdmin && !runtimePolicyHasExplicitContext(existing.runtime_policy);
+    const migrateName = profile.name === LEGACY_DEFAULT_AGENT_PROFILE_NAME;
+    if (!migrateHostContext && !migrateName) return profile;
+
+    const now = new Date().toISOString();
+    const name = migrateName ? DEFAULT_AGENT_PROFILE_NAME : profile.name;
+    const runtimePolicy = migrateHostContext
+      ? mergeAgentProfileRuntimePolicy(profile.runtime_policy, {
+          context: { source: 'host_claude' },
+        })
+      : profile.runtime_policy;
+    const identityHash = computeAgentProfileIdentityHash(
+      profile.identity_prompt,
+      profile.include_claude_preset,
+      runtimePolicy,
+      name,
+    );
+    db.prepare(
+      `UPDATE agent_profiles
+       SET name = ?, runtime_policy = ?, identity_hash = ?, version = version + 1, updated_at = ?
+       WHERE id = ?`,
+    ).run(
+      name,
+      serializeAgentProfileRuntimePolicy(runtimePolicy),
+      identityHash,
+      now,
+      profile.id,
+    );
+    return getAgentProfile(profile.id)!;
+  }
 
   const now = new Date().toISOString();
   const id = crypto.randomUUID();
-  const name = 'Default Agent';
+  const name = DEFAULT_AGENT_PROFILE_NAME;
   const identityPrompt = '';
   const includeClaudePreset = true;
+  const runtimePolicy = normalizeAgentProfileRuntimePolicy(
+    isAdmin ? { context: { source: 'host_claude' } } : undefined,
+  );
   const identityHash = computeAgentProfileIdentityHash(
     identityPrompt,
     includeClaudePreset,
-    undefined,
+    runtimePolicy,
     name,
   );
-  const runtimePolicyJson = serializeAgentProfileRuntimePolicy();
+  const runtimePolicyJson = serializeAgentProfileRuntimePolicy(runtimePolicy);
   db.prepare(
     `INSERT INTO agent_profiles (
       id, owner_user_id, name, identity_prompt, include_claude_preset, runtime_policy, identity_hash, version,
@@ -3312,20 +3350,6 @@ export function backfillAgentProfileDefaultsAndWorkspaceMappings(): void {
     for (const ws of webWorkspaces) {
       if (getWorkspaceAgentProfileId(ws.folder)) continue;
       const profile = getOrCreateDefaultAgentProfile(ws.created_by);
-      assignWorkspaceAgentProfile(ws.folder, profile.id);
-    }
-
-    const memberOwnedFolders = db
-      .prepare(
-        `SELECT gm.group_folder as folder, MIN(gm.user_id) as owner_user_id
-         FROM group_members gm
-         LEFT JOIN workspace_agent_profiles wap ON wap.group_folder = gm.group_folder
-         WHERE gm.role = 'owner' AND wap.group_folder IS NULL
-         GROUP BY gm.group_folder`,
-      )
-      .all() as Array<{ folder: string; owner_user_id: string }>;
-    for (const ws of memberOwnedFolders) {
-      const profile = getOrCreateDefaultAgentProfile(ws.owner_user_id);
       assignWorkspaceAgentProfile(ws.folder, profile.id);
     }
   });
@@ -4452,42 +4476,24 @@ export function listFeishuThreadAgentIds(workspaceJid: string): string[] {
 
 /**
  * Find a user's home group (is_home=1 + created_by=userId).
- * For admin users, also matches web:main even if created_by differs
- * (all admins share folder=main).
  */
 export function getUserHomeGroup(
   userId: string,
 ): (RegisteredGroup & { jid: string }) | undefined {
-  // First try exact match: is_home=1 AND created_by=userId
-  let row = db
+  const row = db
     .prepare(
       'SELECT * FROM registered_groups WHERE is_home = 1 AND created_by = ?',
     )
     .get(userId) as RegisteredGroupRow | undefined;
-
-  // Fallback for admin users: all admins share web:main (folder=main).
-  // If no exact match, check if the user is an admin and web:main exists.
-  if (!row) {
-    const user = db
-      .prepare("SELECT role FROM users WHERE id = ? AND status = 'active'")
-      .get(userId) as { role: string } | undefined;
-    if (user?.role === 'admin') {
-      row = db
-        .prepare(
-          "SELECT * FROM registered_groups WHERE jid = 'web:main' AND is_home = 1",
-        )
-        .get() as RegisteredGroupRow | undefined;
-    }
-  }
-
   if (!row) return undefined;
   return parseGroupRow(row);
 }
 
 /**
  * Ensure a user has a home group. If not, create one.
- * Admin gets folder='main' with executionMode='host'.
- * Member gets folder='home-{userId}' with executionMode='container'.
+ * The first admin keeps the legacy web:main home. Every other account gets an
+ * owner-specific home workspace. Admin homes use host execution; member homes
+ * use container execution.
  * Returns the JID of the home group.
  */
 export function ensureUserHomeGroup(
@@ -4500,38 +4506,10 @@ export function ensureUserHomeGroup(
 
   const now = new Date().toISOString();
   const isAdmin = role === 'admin';
-  const jid = isAdmin ? 'web:main' : `web:home-${userId}`;
-  const folder = isAdmin ? 'main' : `home-${userId}`;
-
-  // For admin: check if web:main already exists (created by another admin)
-  // In that case, reuse it rather than overwriting created_by
-  if (isAdmin) {
-    const existingMain = getRegisteredGroup(jid);
-    if (existingMain) {
-      // web:main already exists.
-      // Ensure is_home, created_by, and executionMode are correct for owner-based routing.
-      const patched = { ...existingMain };
-      let changed = false;
-      if (!patched.is_home) {
-        patched.is_home = true;
-        changed = true;
-      }
-      if (!patched.created_by) {
-        patched.created_by = userId;
-        changed = true;
-      }
-      // Admin home container must use host mode
-      if (patched.executionMode !== 'host') {
-        patched.executionMode = 'host';
-        changed = true;
-      }
-      if (changed) {
-        setRegisteredGroup(jid, patched);
-      }
-      ensureChatExists(jid);
-      return jid;
-    }
-  }
+  const existingMain = isAdmin ? getRegisteredGroup('web:main') : undefined;
+  const useLegacyMain = isAdmin && (!existingMain || !existingMain.created_by);
+  const jid = useLegacyMain ? 'web:main' : `web:home-${userId}`;
+  const folder = useLegacyMain ? 'main' : `home-${userId}`;
 
   const name = username ? `${username} Home` : isAdmin ? 'Main' : 'Home';
 
@@ -4584,7 +4562,7 @@ export function deleteChatHistory(chatJid: string): void {
 /**
  * Delete an IM group's registered_groups entry and all jid-scoped data
  * (messages, chat record, pinned references). Does NOT touch folder-scoped
- * data (sessions, scheduled_tasks, group_members) because IM groups typically
+ * data (sessions, scheduled_tasks) because IM groups typically
  * share their folder with the owner's home workspace.
  *
  * Used when an IM group is detected as dead (bot removed, group disbanded,
@@ -4650,9 +4628,7 @@ export function deleteGroupData(jid: string, folder: string): void {
     db.prepare('DELETE FROM scheduled_tasks WHERE group_folder = ?').run(
       folder,
     );
-    // 2. 删除成员记录
-    db.prepare('DELETE FROM group_members WHERE group_folder = ?').run(folder);
-    // 3. 删除 workspace -> AgentProfile 归属映射
+    // 2. 删除 workspace -> AgentProfile 归属映射
     db.prepare(
       'DELETE FROM workspace_agent_profiles WHERE group_folder = ?',
     ).run(folder);
@@ -5880,84 +5856,6 @@ export function checkLoginRateLimitFromAudit(
   return { allowed: false, retryAfterSeconds, attempts };
 }
 
-// ===================== Group Members =====================
-
-export function addGroupMember(
-  groupFolder: string,
-  userId: string,
-  role: 'owner' | 'member',
-  addedBy?: string,
-): void {
-  db.prepare(
-    `INSERT INTO group_members (group_folder, user_id, role, added_at, added_by)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(group_folder, user_id) DO UPDATE SET
-       role = CASE WHEN excluded.role = 'owner' THEN 'owner'
-                   WHEN group_members.role = 'owner' THEN 'owner'
-                   ELSE excluded.role END,
-       added_by = COALESCE(excluded.added_by, group_members.added_by)`,
-  ).run(groupFolder, userId, role, new Date().toISOString(), addedBy ?? null);
-}
-
-export function removeGroupMember(groupFolder: string, userId: string): void {
-  db.prepare(
-    'DELETE FROM group_members WHERE group_folder = ? AND user_id = ?',
-  ).run(groupFolder, userId);
-}
-
-export function getGroupMembers(groupFolder: string): GroupMember[] {
-  const rows = db
-    .prepare(
-      `SELECT gm.user_id, gm.role, gm.added_at, gm.added_by,
-              u.username, COALESCE(u.display_name, '') as display_name
-       FROM group_members gm
-       JOIN users u ON gm.user_id = u.id
-       WHERE gm.group_folder = ?
-       ORDER BY gm.role DESC, gm.added_at ASC`,
-    )
-    .all(groupFolder) as Array<{
-    user_id: string;
-    role: string;
-    added_at: string;
-    added_by: string | null;
-    username: string;
-    display_name: string;
-  }>;
-  return rows.map((r) => ({
-    user_id: r.user_id,
-    role: r.role as 'owner' | 'member',
-    added_at: r.added_at,
-    added_by: r.added_by ?? undefined,
-    username: r.username,
-    display_name: r.display_name,
-  }));
-}
-
-export function getGroupMemberRole(
-  groupFolder: string,
-  userId: string,
-): 'owner' | 'member' | null {
-  const row = db
-    .prepare(
-      'SELECT role FROM group_members WHERE group_folder = ? AND user_id = ?',
-    )
-    .get(groupFolder, userId) as { role: string } | undefined;
-  if (!row) return null;
-  return row.role as 'owner' | 'member';
-}
-
-export function getUserMemberFolders(
-  userId: string,
-): Array<{ group_folder: string; role: 'owner' | 'member' }> {
-  const rows = db
-    .prepare('SELECT group_folder, role FROM group_members WHERE user_id = ?')
-    .all(userId) as Array<{ group_folder: string; role: string }>;
-  return rows.map((r) => ({
-    group_folder: r.group_folder,
-    role: r.role as 'owner' | 'member',
-  }));
-}
-
 // ===================== Sub-Agent CRUD =====================
 
 export function createAgent(agent: SubAgent): void {
@@ -6252,13 +6150,6 @@ export function deleteMessage(chatJid: string, messageId: string): boolean {
     .prepare('DELETE FROM messages WHERE id = ? AND chat_jid = ?')
     .run(messageId, chatJid);
   return result.changes > 0;
-}
-
-export function isGroupShared(groupFolder: string): boolean {
-  const row = db
-    .prepare('SELECT COUNT(*) as cnt FROM group_members WHERE group_folder = ?')
-    .get(groupFolder) as { cnt: number };
-  return row.cnt > 1;
 }
 
 // --- Billing CRUD functions ---

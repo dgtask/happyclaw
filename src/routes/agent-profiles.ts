@@ -8,13 +8,16 @@ import {
   AgentProfileCreateSchema,
   AgentProfileGenerateSchema,
   AgentProfilePatchSchema,
+  AgentProfileRefinePromptSchema,
 } from '../schemas.js';
 import type { AuthUser } from '../types.js';
-import { generateAgentProfileDraft } from '../agent-profile-generator.js';
+import {
+  generateAgentProfileDraft,
+  refineAgentProfilePrompt,
+} from '../agent-profile-generator.js';
 import { logger } from '../logger.js';
 import { DATA_DIR } from '../config.js';
 import { loadUserMcpServers } from '../mcp-utils.js';
-import { getEnabledProviders } from '../runtime-config.js';
 import { validateSkillId } from '../skill-utils.js';
 import {
   listWorkspaceGroupsForAgentProfile,
@@ -39,23 +42,27 @@ import {
 
 const agentProfileRoutes = new Hono<{ Variables: Variables }>();
 
+function requestsHostClaudeContext(
+  runtimePolicy: { context?: { source?: string } } | undefined,
+): boolean {
+  return runtimePolicy?.context?.source === 'host_claude';
+}
+
+function isUnauthorizedHostClaudeContext(
+  user: AuthUser,
+  runtimePolicy: { context?: { source?: string } } | undefined,
+): boolean {
+  return user.role !== 'admin' && requestsHostClaudeContext(runtimePolicy);
+}
+
 function validateRuntimePolicyReferences(
   userId: string,
   policy: ReturnType<typeof normalizeAgentProfileRuntimePolicy>,
-): { providers: string[]; skills: string[]; mcp: string[] } {
+): { skills: string[]; mcp: string[] } {
   const invalid = {
-    providers: [] as string[],
     skills: [] as string[],
     mcp: [] as string[],
   };
-  if (
-    policy.provider_id &&
-    !getEnabledProviders().some(
-      (provider) => provider.id === policy.provider_id,
-    )
-  ) {
-    invalid.providers.push(policy.provider_id);
-  }
 
   if (policy.skills.mode === 'custom') {
     const root = path.join(DATA_DIR, 'skills', userId);
@@ -83,9 +90,7 @@ function validateRuntimePolicyReferences(
 function hasInvalidRuntimePolicyReferences(
   invalid: ReturnType<typeof validateRuntimePolicyReferences>,
 ): boolean {
-  return (
-    invalid.providers.length + invalid.skills.length + invalid.mcp.length > 0
-  );
+  return invalid.skills.length + invalid.mcp.length > 0;
 }
 
 agentProfileRoutes.get('/', authMiddleware, (c) => {
@@ -100,6 +105,9 @@ agentProfileRoutes.post('/', authMiddleware, async (c) => {
   const parsed = AgentProfileCreateSchema.safeParse(body);
   if (!parsed.success) {
     return c.json({ error: 'Invalid request body' }, 400);
+  }
+  if (isUnauthorizedHostClaudeContext(user, parsed.data.runtime_policy)) {
+    return c.json({ error: 'host_claude context requires an admin role' }, 403);
   }
   const runtimePolicy = normalizeAgentProfileRuntimePolicy(
     parsed.data.runtime_policy,
@@ -148,6 +156,41 @@ agentProfileRoutes.post('/generate', authMiddleware, async (c) => {
   }
 });
 
+agentProfileRoutes.post('/:id/refine-prompt', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const id = c.req.param('id');
+  const profile = getAgentProfileForUser(id, user.id);
+  if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+
+  const body = await c.req.json().catch(() => ({}));
+  const parsed = AgentProfileRefinePromptSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json({ error: 'Invalid request body' }, 400);
+  }
+
+  try {
+    const refinement = await refineAgentProfilePrompt({
+      agentName: profile.name,
+      currentPrompt: parsed.data.current_prompt,
+      message: parsed.data.message,
+      history: parsed.data.history,
+    });
+    return c.json({ refinement });
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : 'AI 调整失败，请重试或手动修改';
+    logger.warn(
+      {
+        err,
+        agentProfileId: id,
+        messageLen: parsed.data.message.length,
+      },
+      'Failed to refine Agent profile prompt',
+    );
+    return c.json({ error: message }, message.includes('未配置') ? 503 : 502);
+  }
+});
+
 agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
   const id = c.req.param('id');
@@ -155,6 +198,9 @@ agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
   const parsed = AgentProfilePatchSchema.safeParse(body);
   if (!parsed.success) {
     return c.json({ error: 'Invalid request body' }, 400);
+  }
+  if (isUnauthorizedHostClaudeContext(user, parsed.data.runtime_policy)) {
+    return c.json({ error: 'host_claude context requires an admin role' }, 403);
   }
   if (
     parsed.data.name === undefined &&
@@ -271,7 +317,10 @@ agentProfileRoutes.delete('/:id', authMiddleware, async (c) => {
       return c.json({ error: 'Agent profile not found' }, 404);
     }
     if (result === 'is_default') {
-      return c.json({ error: 'Default Agent cannot be deleted' }, 400);
+      return c.json(
+        { error: 'The built-in HappyClaw Agent cannot be deleted' },
+        400,
+      );
     }
     if (result === 'has_workspaces') {
       return c.json(

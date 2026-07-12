@@ -5,7 +5,6 @@ import {
   GroupAgentProfilePatchSchema,
   GroupCreateSchema,
   GroupPatchSchema,
-  GroupMemberAddSchema,
   ContainerEnvSchema,
 } from '../schemas.js';
 import type { AuthUser, RegisteredGroup, ExecutionMode } from '../types.js';
@@ -17,7 +16,6 @@ import {
   canAccessGroup,
   canModifyGroup,
   canDeleteGroup,
-  canManageGroupMembers,
   MAX_GROUP_NAME_LEN,
   getWebDeps,
 } from '../web-context.js';
@@ -39,13 +37,7 @@ import {
   getMessagesAfter,
   getMessagesPageMulti,
   getMessagesAfterMulti,
-  addGroupMember,
-  removeGroupMember,
-  getGroupMembers,
-  getGroupMemberRole,
-  getUserById,
   getAgent,
-  listUsers,
   listAgentsByJid,
   getGroupsByTargetAgent,
   getGroupsByTargetMainJid,
@@ -92,7 +84,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 // SSRF helpers 抽到 ../url-safety.ts；本文件 re-export isPrivateHostname 以保留旧导入路径。
 import { z } from 'zod';
-import { broadcastNewMessage, invalidateAllowedUserCache } from '../web.js';
+import { broadcastNewMessage } from '../web.js';
 import { getStreamingSession } from '../feishu-streaming-card.js';
 
 const execFileAsync = promisify(execFile);
@@ -128,11 +120,7 @@ interface GroupPayloadItem {
   custom_cwd?: string;
   is_home?: boolean;
   is_my_home?: boolean;
-  is_shared?: boolean;
-  member_role?: 'owner' | 'member';
-  member_count?: number;
   can_modify?: boolean;
-  can_manage_members?: boolean;
   pinned_at?: string;
   activation_mode?:
     | 'auto'
@@ -178,7 +166,7 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
     if (isHost && !isAdmin && !(isHome && group.created_by === user.id))
       continue;
 
-    // User isolation: all users only see their own groups + shared groups
+    // User isolation: users only see groups they own.
     if (!canAccessGroup({ id: user.id, role: user.role }, { ...group, jid }))
       continue;
 
@@ -208,29 +196,11 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
   // Fetch user's pinned groups
   const pins = getUserPinnedGroups(user.id);
 
-  // Cache member info per folder (avoid repeated queries)
-  const memberCache = new Map<
-    string,
-    { count: number; role: 'owner' | 'member' | null }
-  >();
-  function getMemberInfo(folder: string) {
-    let cached = memberCache.get(folder);
-    if (!cached) {
-      const members = getGroupMembers(folder);
-      const role = members.find((m) => m.user_id === user.id)?.role ?? null;
-      cached = { count: members.length, role };
-      memberCache.set(folder, cached);
-    }
-    return cached;
-  }
-
   for (const [jid, group] of visibleEntries) {
     const isHome = !!group.is_home;
     const isWeb = jid.startsWith('web:');
 
     const latest = latestByJid.get(jid);
-    const memberInfo = !isHome ? getMemberInfo(group.folder) : null;
-    const isShared = memberInfo ? memberInfo.count > 1 : false;
     const agentProfile = isWeb
       ? getAgentProfileForWorkspace(group.folder, group.created_by)
       : undefined;
@@ -251,14 +221,7 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
       custom_cwd: isAdmin ? group.customCwd : undefined,
       is_home: isHome || undefined,
       is_my_home: (isHome && group.created_by === user.id) || undefined,
-      is_shared: isShared || undefined,
-      member_role: memberInfo?.role ?? undefined,
-      member_count: isShared ? memberInfo?.count : undefined,
       can_modify: canModifyGroup(user, { ...group, jid }),
-      // owner-only, matching the member-management routes' canManageGroupMembers
-      // checks (no admin override — admin is not a workspace owner, consistent
-      // with canModifyGroup / canDeleteGroup).
-      can_manage_members: canManageGroupMembers(user, { ...group, jid }),
       pinned_at: pins[jid] || undefined,
       activation_mode: group.activation_mode ?? 'auto',
       conversation_source: group.conversation_source ?? 'manual',
@@ -633,7 +596,6 @@ groupRoutes.post('/', authMiddleware, async (c) => {
           setRegisteredGroup(jid, group);
           updateChatName(jid, name);
           deps.getRegisteredGroups()[jid] = group;
-          addGroupMember(folder, authUser.id, 'owner', authUser.id);
           return lockedProfile;
         } catch (err) {
           // setRegisteredGroup may fail after the mapping write. Clear both
@@ -670,10 +632,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   }
 
   // Mirror buildGroupsPayload ACL shape so the frontend doesn't need to
-  // refetch /api/groups just to learn the writer can edit Skills/MCP/members.
-  // Creator is always owner of a fresh non-home web group, so both checks
-  // resolve true here; we still go through the helpers to keep one source of
-  // truth and avoid drift if the rules change later.
+  // refetch /api/groups just to learn the writer can edit Skills/MCP.
   const groupWithJid = { ...group, jid };
   const isAdmin = hasHostExecutionPermission(authUser);
   const responseGroup: GroupPayloadItem = {
@@ -688,11 +647,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     execution_mode: group.executionMode || 'container',
     custom_cwd: isAdmin ? group.customCwd : undefined,
     is_my_home: undefined,
-    is_shared: undefined,
-    member_role: 'owner',
-    member_count: undefined,
     can_modify: canModifyGroup(authUser, groupWithJid),
-    can_manage_members: canManageGroupMembers(authUser, groupWithJid),
     activation_mode: group.activation_mode ?? 'auto',
     conversation_source: group.conversation_source ?? 'manual',
     conversation_nav_mode: group.conversation_nav_mode ?? 'horizontal',
@@ -1057,8 +1012,8 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
 
   // IM-prefixed groups (feishu:, telegram:, qq:, etc.) follow a separate
   // cleanup path. They share their folder with the owner's home workspace,
-  // so we must NOT touch folder-scoped data (sessions, scheduled_tasks,
-  // group_members) or the workspace directory.
+  // so we must NOT touch folder-scoped data (sessions, scheduled_tasks) or
+  // the workspace directory.
   if (!jid.startsWith('web:')) {
     if (!getChannelType(jid)) {
       return c.json({ error: 'This group cannot be deleted' }, 403);
@@ -1256,20 +1211,13 @@ groupRoutes.post('/:jid/stop', authMiddleware, async (c) => {
   if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
     return c.json({ error: 'Group not found' }, 404);
   }
-  // Resource-level ACL: the owner (canModifyGroup) can always stop; a shared
-  // member may stop only a run they started themselves (the queue's current-run
-  // initiator), not the owner's. Mirrors the delete-message owner-or-sender model.
   if (
     !canModifyGroup(
       { id: authUser.id, role: authUser.role },
       { ...group, jid },
-    ) &&
-    deps.queue.getActiveRunInitiator(jid) !== authUser.id
+    )
   ) {
-    return c.json(
-      { error: 'Only the workspace owner or the run initiator can stop it' },
-      403,
-    );
+    return c.json({ error: 'Only the workspace owner can stop it' }, 403);
   }
 
   try {
@@ -1297,25 +1245,13 @@ groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
   if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
     return c.json({ error: 'Group not found' }, 404);
   }
-  // Resource-level ACL (see /stop): owner OR the run's initiator. Uses the full
-  // (possibly virtual #agent:) jid so an agent-conversation run resolves to its
-  // own runner. Agent/task runs carry no message initiator (getActiveRunInitiator
-  // excludes activeRunnerIsTask) → owner-only. Known safe-direction limitation:
-  // a member who started their own agent/task run can't interrupt it — only the
-  // owner can; revisit if member-initiated agent interrupt is wanted (see PR notes).
   if (
     !canModifyGroup(
       { id: authUser.id, role: authUser.role },
       { ...group, jid: baseJid },
-    ) &&
-    deps.queue.getActiveRunInitiator(jid) !== authUser.id
+    )
   ) {
-    return c.json(
-      {
-        error: 'Only the workspace owner or the run initiator can interrupt it',
-      },
-      403,
-    );
+    return c.json({ error: 'Only the workspace owner can interrupt it' }, 403);
   }
 
   const interrupted = deps.queue.interruptQuery(jid);
@@ -1694,9 +1630,7 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
     return c.json({ messages, hasMore });
   }
 
-  // is_home 群组合并查询：将同 folder 下所有 JID（web + feishu/telegram IM 通道）的消息合并展示
-  // - admin: merge all siblings in the folder (shared admin home)
-  // - member: merge only siblings with same owner to prevent cross-user leakage
+  // is_home 群组合并查询：将同一 owner、同 folder 下的 Web 与 IM 消息合并展示。
   const queryJids = [jid];
   if (group.is_home) {
     const siblingJids = getJidsByFolder(group.folder);
@@ -1704,12 +1638,8 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
       if (siblingJid === jid) continue;
       const siblingGroup = getRegisteredGroup(siblingJid);
       if (!siblingGroup) continue;
-      // Merge siblings by ownership: same creator, or admin's own IM channels
-      const ownerMatch =
-        group.created_by && siblingGroup.created_by === group.created_by;
-      const adminSelfMatch =
-        authUser.role === 'admin' && siblingGroup.created_by === authUser.id;
-      if (ownerMatch || adminSelfMatch) {
+      const ownerMatch = group.created_by && siblingGroup.created_by === group.created_by;
+      if (ownerMatch) {
         queryJids.push(siblingJid);
       }
     }
@@ -1916,150 +1846,6 @@ groupRoutes.put('/:jid/env', authMiddleware, async (c) => {
     logger.error({ err }, 'Failed to save container env config');
     return c.json({ error: 'Failed to save config' }, 500);
   }
-});
-
-// --- Member Management Routes ---
-
-// GET /api/groups/:jid/members - 列出成员
-groupRoutes.get('/:jid/members', authMiddleware, (c) => {
-  const jid = c.req.param('jid');
-  const group = getRegisteredGroup(jid);
-  if (!group) return c.json({ error: 'Group not found' }, 404);
-
-  const authUser = c.get('user') as AuthUser;
-  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
-    return c.json({ error: 'Group not found' }, 404);
-  }
-
-  const members = getGroupMembers(group.folder);
-  return c.json({ members });
-});
-
-// GET /api/groups/:jid/members/search?q=... - 搜索可添加的用户（owner/admin 权限）
-groupRoutes.get('/:jid/members/search', authMiddleware, (c) => {
-  const jid = c.req.param('jid');
-  const group = getRegisteredGroup(jid);
-  if (!group) return c.json({ error: 'Group not found' }, 404);
-
-  const authUser = c.get('user') as AuthUser;
-  if (
-    !canManageGroupMembers(
-      { id: authUser.id, role: authUser.role },
-      { ...group, jid },
-    )
-  ) {
-    return c.json({ error: 'Forbidden' }, 403);
-  }
-
-  const q = c.req.query('q') || '';
-  if (!q.trim()) return c.json({ users: [] });
-
-  const result = listUsers({ query: q.trim(), status: 'active', pageSize: 10 });
-  const existingIds = new Set(
-    getGroupMembers(group.folder).map((m) => m.user_id),
-  );
-  const users = result.users
-    .filter((u) => !existingIds.has(u.id))
-    .map((u) => ({
-      id: u.id,
-      username: u.username,
-      display_name: u.display_name,
-    }));
-
-  return c.json({ users });
-});
-
-// POST /api/groups/:jid/members - 添加成员
-groupRoutes.post('/:jid/members', authMiddleware, async (c) => {
-  const jid = c.req.param('jid');
-  const group = getRegisteredGroup(jid);
-  if (!group) return c.json({ error: 'Group not found' }, 404);
-
-  const authUser = c.get('user') as AuthUser;
-  if (!canManageGroupMembers({ id: authUser.id, role: authUser.role }, group)) {
-    return c.json({ error: 'Insufficient permissions' }, 403);
-  }
-
-  if (group.is_home) {
-    return c.json({ error: 'Cannot add members to home groups' }, 400);
-  }
-
-  const body = await c.req.json().catch(() => ({}));
-  const validation = GroupMemberAddSchema.safeParse(body);
-  if (!validation.success) {
-    return c.json({ error: 'Invalid request body' }, 400);
-  }
-
-  const { user_id: targetUserId } = validation.data;
-
-  // Check target user exists and is active
-  const targetUser = getUserById(targetUserId);
-  if (!targetUser || targetUser.status !== 'active') {
-    return c.json({ error: 'User not found or inactive' }, 404);
-  }
-
-  // Check if already a member
-  const existingRole = getGroupMemberRole(group.folder, targetUserId);
-  if (existingRole !== null) {
-    return c.json({ error: 'User is already a member' }, 409);
-  }
-
-  addGroupMember(group.folder, targetUserId, 'member', authUser.id);
-  invalidateAllowedUserCache(jid);
-  logger.info(
-    { jid, folder: group.folder, targetUserId, addedBy: authUser.id },
-    'Group member added',
-  );
-
-  const members = getGroupMembers(group.folder);
-  return c.json({ success: true, members });
-});
-
-// DELETE /api/groups/:jid/members/:userId - 移除成员
-groupRoutes.delete('/:jid/members/:userId', authMiddleware, (c) => {
-  const jid = c.req.param('jid');
-  const targetUserId = c.req.param('userId');
-  const group = getRegisteredGroup(jid);
-  if (!group) return c.json({ error: 'Group not found' }, 404);
-
-  const authUser = c.get('user') as AuthUser;
-
-  // Self-removal: any member can leave
-  const isSelfRemoval = targetUserId === authUser.id;
-  if (!isSelfRemoval) {
-    if (
-      !canManageGroupMembers({ id: authUser.id, role: authUser.role }, group)
-    ) {
-      return c.json({ error: 'Insufficient permissions' }, 403);
-    }
-  }
-
-  // Check target is actually a member
-  const targetRole = getGroupMemberRole(group.folder, targetUserId);
-  if (targetRole === null) {
-    return c.json({ error: 'User is not a member' }, 404);
-  }
-
-  // Owner cannot be removed
-  if (targetRole === 'owner') {
-    return c.json({ error: 'Cannot remove the owner' }, 400);
-  }
-
-  removeGroupMember(group.folder, targetUserId);
-  invalidateAllowedUserCache(jid);
-  logger.info(
-    {
-      jid,
-      folder: group.folder,
-      targetUserId,
-      removedBy: authUser.id,
-      isSelfRemoval,
-    },
-    'Group member removed',
-  );
-
-  const members = getGroupMembers(group.folder);
-  return c.json({ success: true, members });
 });
 
 // --- MCP Configuration Routes ---

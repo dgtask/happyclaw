@@ -68,7 +68,7 @@ export function SettingsPage() {
   const mobileTabs = useMemo(() => {
     const tabs: { key: SettingsTab; label: string }[] = [];
     tabs.push({ key: 'profile', label: '个人偏好' });
-    tabs.push({ key: 'my-channels', label: '消息通道' });
+    tabs.push({ key: 'my-channels', label: '渠道接入' });
     tabs.push({ key: 'security', label: '安全' });
     if (canManageSystemConfig) {
       tabs.push({ key: 'claude', label: 'Claude' });
@@ -82,7 +82,7 @@ export function SettingsPage() {
     tabs.push({ key: 'skills', label: '技能' });
     tabs.push({ key: 'mcp-servers', label: 'MCP' });
     tabs.push({ key: 'agent-definitions', label: '子 Agent' });
-    tabs.push({ key: 'bindings', label: '消息挂载' });
+    tabs.push({ key: 'bindings', label: '渠道绑定' });
     tabs.push({ key: 'usage', label: '用量' });
     if (canManageSystemConfig) {
       tabs.push({ key: 'monitor', label: '监控' });
@@ -111,7 +111,7 @@ export function SettingsPage() {
     appearance: '全局外观',
     system: '系统参数',
     profile: '个人偏好',
-    'my-channels': '消息通道',
+    'my-channels': '渠道接入',
     security: '安全与设备',
     groups: '会话管理',
     'agent-profiles': 'Agent',
@@ -122,7 +122,7 @@ export function SettingsPage() {
     'agent-definitions': '子 Agent 定义',
     users: '用户管理',
     about: '关于',
-    bindings: '消息挂载',
+    bindings: '渠道绑定',
     usage: '用量统计',
     monitor: '系统监控',
   };

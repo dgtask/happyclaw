@@ -75,9 +75,7 @@ import {
   storeMessageDirect,
   deleteUserSession,
   updateSessionLastActive,
-  getGroupMembers,
   getAgent,
-  isGroupShared,
   getUserById,
   updateAgentContextInfo,
   updateChatName,
@@ -105,7 +103,6 @@ import { expandPluginSlashCommandIfNeeded } from './plugin-expander-core.js';
 import { makeExpandContext } from './plugin-expander-context.js';
 import type { ExpandContext } from './plugin-expander-context.js';
 import { PLUGIN_EXPANSION_ATTACHMENT_TYPE } from './plugin-expander-sentinel.js';
-import { resolvePerMessageRuntimeOwner } from './runtime-owner.js';
 import { persistPluginExpansion } from './plugin-expander-store.js';
 import { logger } from './logger.js';
 import {
@@ -143,16 +140,6 @@ function normalizeTerminalSize(
  * group. Returns null when the group has no resolvable owner (no plugins to
  * resolve in that case).
  *
- * Plugins are per-user config. On the admin-shared `web:main + isHome`
- * workspace each admin owns a separate runtime, so the message sender wins
- * over `group.created_by` — but only when the sender is an active admin
- * (#24 round-16 P2-1). Non-admin / disabled / unknown senders fall back to
- * `created_by`, mirroring `resolvePerMessageRuntimeOwner` used by the
- * cold-start path; pre-fix the web fast-path blindly returned senderUserId
- * on `web:main + isHome`, so `/foo` from a member resolved to the member's
- * (empty) plugin runtime when the runner was active and to admin's runtime
- * when idle — same command, two different behaviors.
- *
  * Host mode honors `group.customCwd` so inline `!` commands run against the
  * user's real repo (#18 P2-bug-4).
  */
@@ -165,26 +152,13 @@ function buildWebExpandContext(
     customCwd?: string | null;
     is_home?: boolean;
   },
-  senderUserId?: string | null,
 ): ExpandContext | null {
   const deps = getWebDeps();
-  // Default getUserById: when the WebDeps wiring did not inject one (older
-  // tests / partial fixtures), `resolvePerMessageRuntimeOwner` falls back to
-  // `created_by` for any non-empty sender — admin gating is opt-in. The
-  // production wiring in src/index.ts ALWAYS injects the lookup.
-  const getUserById = deps?.getUserById ?? (() => null);
-  const ownerId = resolvePerMessageRuntimeOwner({
-    chatJid: groupJid,
-    isHome: !!group.is_home,
-    fallbackOwner: group.created_by,
-    message: { sender: senderUserId ?? '' },
-    getUserById,
-  });
   const containerName = deps?.queue.getActiveContainerName(groupJid) ?? null;
   return makeExpandContext({
     chatJid: groupJid,
     groupFolder: group.folder,
-    ownerId,
+    ownerId: group.created_by,
     executionMode: group.executionMode,
     customCwd: group.customCwd,
     groupsDir: GROUPS_DIR,
@@ -512,7 +486,7 @@ async function handleWebUserMessage(
     const expandGroup = deps.resolveEffectiveGroup
       ? deps.resolveEffectiveGroup(group).effectiveGroup
       : group;
-    const expandCtx = buildWebExpandContext(chatJid, expandGroup, userId);
+    const expandCtx = buildWebExpandContext(chatJid, expandGroup);
     if (expandCtx) {
       const expansion = await expandPluginSlashCommandIfNeeded(
         expandCtx,
@@ -590,7 +564,6 @@ async function handleWebUserMessage(
   // Idle path: skip expander entirely; cold-start will expand once from the
   // original DB row via `expandMessagesIfNeeded` (handles reply/expanded/miss).
 
-  const shared = !group.is_home && isGroupShared(group.folder);
   const formatted = deps.formatMessages(
     [
       {
@@ -602,7 +575,6 @@ async function handleWebUserMessage(
         timestamp,
       },
     ],
-    shared,
   );
 
   // IPC-inject the message into the running agent process.  For home groups,
@@ -646,10 +618,7 @@ async function handleWebUserMessage(
         'Race: eager-expanded but runner exited before sendMessage; cold-start will re-expand (inline may run twice)',
       );
     }
-    // Pass the sender as the run initiator so the stop/interrupt routes can do
-    // a resource-level "owner OR initiator" check — a shared member can stop /
-    // interrupt the run they started, but not the owner's.
-    deps.queue.enqueueMessageCheck(chatJid, userId);
+    deps.queue.enqueueMessageCheck(chatJid);
   }
 
   // Only advance per-group cursor when we piped directly into a running container.
@@ -788,11 +757,7 @@ async function handleAgentConversationMessage(
       const expandParent = deps.resolveEffectiveGroup
         ? deps.resolveEffectiveGroup(parentGroup).effectiveGroup
         : parentGroup;
-      const expandCtx = buildWebExpandContext(
-        virtualChatJid,
-        expandParent,
-        userId,
-      );
+      const expandCtx = buildWebExpandContext(virtualChatJid, expandParent);
       if (expandCtx) {
         const expansion = await expandPluginSlashCommandIfNeeded(
           expandCtx,
@@ -871,7 +836,6 @@ async function handleAgentConversationMessage(
   // `expandMessagesIfNeeded` (handles reply/expanded/miss uniformly).
 
   // Format for agent
-  const shared = false; // agent conversations are not shared
   const formatted = deps.formatMessages(
     [
       {
@@ -883,7 +847,6 @@ async function handleAgentConversationMessage(
         timestamp,
       },
     ],
-    shared,
   );
 
   // Try to pipe into running agent process
@@ -1703,7 +1666,7 @@ function setupWebSocket(server: any): WebSocketServer {
  *     including admin). 这是有意的硬拒绝，不区分角色，避免 ACL 解析失败时
  *     管理员意外看到本不该看的群组事件。注意先前文档说"only admin can see"
  *     与代码不一致，代码 default-deny 更安全所以保留代码、对齐注释。
- *   - Set<string>: only these users (admin must be an explicit member to see)
+ *   - Set<string>: only these workspace owners
  */
 function safeBroadcast(
   msg: WsMessageOut,
@@ -1751,7 +1714,7 @@ function safeBroadcast(
       continue;
     }
 
-    // Group isolation: only allowed users (owner + shared members) can see this group's events.
+    // Group isolation: only the workspace owner can see this group's events.
     // allowedUserIds === null means ownership unresolvable → default-deny EVERYONE
     // (including admin). 故意这样：解析失败时宁可不广播也不要意外泄漏。
     if (allowedUserIds !== undefined) {
@@ -1770,12 +1733,11 @@ function safeBroadcast(
 
 /**
  * Get the set of user IDs allowed to receive broadcasts for a group.
- * Includes the owner and all shared members. Admin is NOT automatically included
- * — they must be the owner or a shared member to receive broadcasts.
+ * Admin is not automatically included; the account must own the workspace.
  *
  * Returns:
- * - Set<string>: allowed user IDs (owner + shared members)
- * - null: ownership unresolvable → default-deny (admin-only)
+ * - Set<string>: the owner user ID
+ * - null: ownership unresolvable → default-deny
  */
 const allowedUserIdsCache = new Map<
   string,
@@ -1794,20 +1756,6 @@ function getGroupAllowedUserIds(chatJid: string): Set<string> | null {
     expiry: now + ALLOWED_CACHE_TTL,
   });
   return result;
-}
-
-/** Invalidate the allowed-user cache for a group and all sibling JIDs sharing the same folder. */
-export function invalidateAllowedUserCache(chatJid: string): void {
-  allowedUserIdsCache.delete(chatJid);
-  // Also clear cache for sibling JIDs sharing the same folder,
-  // since membership is per-folder, not per-JID.
-  const group = getRegisteredGroup(chatJid);
-  if (group) {
-    const siblingJids = getJidsByFolder(group.folder);
-    for (const jid of siblingJids) {
-      allowedUserIdsCache.delete(jid);
-    }
-  }
 }
 
 function computeGroupAllowedUserIds(chatJid: string): Set<string> | null {
@@ -1832,21 +1780,9 @@ function computeGroupAllowedUserIds(chatJid: string): Set<string> | null {
     }
   }
 
-  if (!ownerId) {
-    if (group.is_home) return null;
-    if (group.folder === 'main') return null;
-    return null; // Unresolvable → deny by default
-  }
+  if (!ownerId) return null;
 
   allowed.add(ownerId);
-
-  // For non-home groups, include shared members
-  if (!group.is_home) {
-    const members = getGroupMembers(group.folder);
-    for (const m of members) {
-      allowed.add(m.user_id);
-    }
-  }
 
   return allowed;
 }

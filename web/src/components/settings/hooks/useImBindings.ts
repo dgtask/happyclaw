@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../../../api/client';
 import { useChatStore } from '../../../stores/chat';
 import type { AvailableImGroup, AgentInfo } from '../../../types';
+import { getAgentProfileDisplayName } from '../../../utils/agent-product';
 
 export interface BindingTarget {
   type: 'main' | 'session';
@@ -83,7 +84,9 @@ export function useImBindings() {
           groupJid: jid,
           groupName: group.name,
           agentProfileId: group.agent_profile_id,
-          agentProfileName: group.agent_profile_name || 'Default Agent',
+          agentProfileName: getAgentProfileDisplayName(
+            group.agent_profile_name,
+          ),
         });
       }
 
@@ -99,7 +102,9 @@ export function useImBindings() {
               groupJid: jid,
               groupName: group.name,
               agentProfileId: group.agent_profile_id,
-              agentProfileName: group.agent_profile_name || 'Default Agent',
+              agentProfileName: getAgentProfileDisplayName(
+                group.agent_profile_name,
+              ),
               sessionId: a.id,
               sessionName: a.name,
             }));

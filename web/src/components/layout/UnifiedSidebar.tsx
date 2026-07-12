@@ -1,12 +1,11 @@
 import { useState, useMemo, useEffect } from 'react';
 import { NavLink, useNavigate, useLocation } from 'react-router-dom';
-import { Plus, PanelLeftClose, Bug, LogOut, UserCog } from 'lucide-react';
+import { PanelLeftClose, Bug, LogOut, Plus, UserCog } from 'lucide-react';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { useBillingStore } from '../../stores/billing';
 import { useGroupsStore } from '../../stores/groups';
 import { useClearWorkspace } from '../../hooks/useClearWorkspace';
-import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/common';
 import { EmojiAvatar } from '../common/EmojiAvatar';
 import { BugReportDialog } from '../common/BugReportDialog';
@@ -22,18 +21,19 @@ import {
   PopoverTrigger,
 } from '@/components/ui/popover';
 import { ChatGroupItem } from '../chat/ChatGroupItem';
+import { AgentWorkspaceGroup } from './AgentWorkspaceGroup';
 import { CreateContainerDialog } from '../chat/CreateContainerDialog';
 import { RenameDialog } from '../chat/RenameDialog';
 import { SkeletonCardList } from '@/components/common/Skeletons';
 import { cn } from '@/lib/utils';
 import { filterNavItems } from './nav-items';
+import { compareByLastActivity } from '../../utils/group-utils';
 import {
-  type GroupEntry,
-  compareByLastActivity,
-} from '../../utils/group-utils';
-import {
+  getAgentNavigationTargets,
+  getPrimaryAgentWorkspaceRows,
   groupWorkspacesByAgent,
-  type AgentWorkspaceSection,
+  isAgentSectionCollapsible,
+  partitionAgentWorkspaceSections,
 } from '../../utils/agent-product';
 
 interface UnifiedSidebarProps {
@@ -98,37 +98,31 @@ export function UnifiedSidebar({
     if (isChatRoute) loadGroups();
   }, [isChatRoute, loadGroups]);
 
-  const { mainGroup, otherGroups } = useMemo(() => {
-    let main: GroupEntry | null = null;
-    const others: GroupEntry[] = [];
-    for (const [jid, info] of Object.entries(groups)) {
-      const entry = { jid, ...info };
-      if (info.is_my_home) main = entry;
-      else others.push(entry);
-    }
-    others.sort(compareByLastActivity);
-    return { mainGroup: main, otherGroups: others };
+  const { allGroups, homeGroup } = useMemo(() => {
+    const entries = Object.entries(groups).map(([jid, info]) => ({
+      jid,
+      ...info,
+    }));
+    entries.sort(compareByLastActivity);
+    return {
+      allGroups: entries,
+      homeGroup: entries.find((entry) => entry.is_my_home) ?? null,
+    };
   }, [groups]);
 
-  const { pinnedAgentSections, myAgentSections, collabAgentSections } =
-    useMemo(() => {
-      const pinned: GroupEntry[] = [];
-      const my: GroupEntry[] = [];
-      const collab: GroupEntry[] = [];
-      otherGroups.forEach((g) => {
-        if (g.pinned_at) pinned.push(g);
-        else if (g.is_shared && (g.member_count ?? 0) >= 2) collab.push(g);
-        else my.push(g);
-      });
-      pinned.sort((a, b) =>
-        (a.pinned_at || '').localeCompare(b.pinned_at || ''),
-      );
-      return {
-        pinnedAgentSections: groupWorkspacesByAgent(pinned),
-        myAgentSections: groupWorkspacesByAgent(my),
-        collabAgentSections: groupWorkspacesByAgent(collab),
-      };
-    }, [otherGroups]);
+  const defaultAgentId = homeGroup?.agent_profile_id || '__default__';
+  const agentSections = useMemo(() => {
+    const prioritized = [...allGroups].sort((a, b) => {
+      if (a.is_my_home) return -1;
+      if (b.is_my_home) return 1;
+      return Number(!!b.pinned_at) - Number(!!a.pinned_at);
+    });
+    return groupWorkspacesByAgent(prioritized, defaultAgentId);
+  }, [allGroups, defaultAgentId]);
+  const agentPartitions = useMemo(
+    () => partitionAgentWorkspaceSections(agentSections),
+    [agentSections],
+  );
 
   const handleGroupSelect = (jid: string, folder: string) => {
     selectGroup(jid);
@@ -171,7 +165,7 @@ export function UnifiedSidebar({
         [];
       if (typed.boundMainImGroups?.length) {
         details.push(
-          `主会话 -> ${typed.boundMainImGroups.map((g) => g.name).join('、')}`,
+          `当前对话 -> ${typed.boundMainImGroups.map((g) => g.name).join('、')}`,
         );
       }
       if (sessions.length) {
@@ -184,7 +178,7 @@ export function UnifiedSidebar({
       }
       if (details.length > 0) {
         alert(
-          `该工作区仍有消息通道挂载，请先解绑后再删除：\n${details.join('\n')}`,
+          `该工作区仍有消息渠道绑定，请先解绑后再删除：\n${details.join('\n')}`,
         );
       } else {
         alert(
@@ -197,35 +191,76 @@ export function UnifiedSidebar({
     }
   };
 
-  const renderAgentSections = (
-    sections: AgentWorkspaceSection[],
-    options: { showCollabBadge?: boolean; showPinned?: boolean } = {},
-  ) =>
-    sections.map((section) => (
-      <div key={section.id} className="mb-1">
-        <div className="flex items-center gap-1.5 px-2 pb-1 pt-2">
-          <span className="truncate text-[10px] text-muted-foreground/80">
-            {section.name}
-          </span>
-          {section.version && (
-            <span className="text-[10px] text-muted-foreground/60">
-              v{section.version}
-            </span>
-          )}
-        </div>
-        {section.items.map((g) => (
+  const renderAgentSection = (section: (typeof agentSections)[number]) => {
+    const { directGroup, workspaces } = getAgentNavigationTargets(section);
+    return (
+      <AgentWorkspaceGroup
+        key={section.id}
+        agentId={section.id}
+        name={section.name}
+        collapsible={isAgentSectionCollapsible(section)}
+        workspaceCount={workspaces.length}
+        workspaceNames={workspaces.map((workspace) => workspace.name)}
+        runningCount={
+          section.items.filter((item) => runnerStates[item.jid] === 'running')
+            .length
+        }
+        isDirectActive={
+          !!directGroup?.is_my_home && directGroup.jid === currentGroup
+        }
+        containsActiveWorkspace={section.items.some(
+          (item) => item.jid === currentGroup,
+        )}
+        onSelect={() => {
+          if (directGroup) {
+            handleGroupSelect(directGroup.jid, directGroup.folder);
+          }
+        }}
+        onRebuild={
+          directGroup?.is_my_home && directGroup.can_modify
+            ? () => openClear(directGroup.jid, section.name)
+            : undefined
+        }
+      >
+        {workspaces.map((g) => (
           <ChatGroupItem
             key={g.jid}
             jid={g.jid}
             name={g.name}
             folder={g.folder}
             lastMessage={g.lastMessage}
-            isShared={options.showCollabBadge ? g.is_shared : undefined}
-            memberRole={options.showCollabBadge ? g.member_role : undefined}
-            memberCount={options.showCollabBadge ? g.member_count : undefined}
             isActive={currentGroup === g.jid}
             isHome={false}
-            isPinned={options.showPinned}
+            isPinned={!!g.pinned_at}
+            isRunning={runnerStates[g.jid] === 'running'}
+            canModify={g.can_modify}
+            onSelect={handleGroupSelect}
+            onRename={(jid, name) => setRenameState({ open: true, jid, name })}
+            onClearHistory={openClear}
+            onDelete={(jid, name) => setDeleteState({ open: true, jid, name })}
+            onTogglePin={(jid) => togglePin(jid)}
+          />
+        ))}
+      </AgentWorkspaceGroup>
+    );
+  };
+
+  const renderPrimaryAgentWorkspaces = (
+    section: (typeof agentSections)[number],
+  ) => {
+    const workspaces = getPrimaryAgentWorkspaceRows(section);
+    return (
+      <div data-hc-primary-agent-workspaces={section.id}>
+        {workspaces.map((g) => (
+          <ChatGroupItem
+            key={g.jid}
+            jid={g.jid}
+            name={g.name}
+            folder={g.folder}
+            lastMessage={g.lastMessage}
+            isActive={currentGroup === g.jid}
+            isHome={!!g.is_my_home}
+            isPinned={!!g.pinned_at}
             isRunning={runnerStates[g.jid] === 'running'}
             canModify={g.can_modify}
             onSelect={handleGroupSelect}
@@ -236,7 +271,8 @@ export function UnifiedSidebar({
           />
         ))}
       </div>
-    ));
+    );
+  };
 
   const panelWidth = showWorkspaceList ? '16.5rem' : '0';
 
@@ -367,106 +403,55 @@ export function UnifiedSidebar({
                 <PanelLeftClose className="w-4 h-4" />
               </button>
             </div>
-            {/* New workspace button */}
             <div className="px-3 pb-2 flex-shrink-0">
-              <Button
-                variant="outline"
-                size="sm"
-                className="w-full justify-start gap-2 text-xs"
+              <button
+                type="button"
                 onClick={() => setCreateOpen(true)}
+                className="flex min-h-9 w-full items-center justify-start gap-2 rounded-md border border-border bg-background px-3 text-xs font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
               >
-                <Plus className="w-3.5 h-3.5" />
-                新工作区
-              </Button>
+                <Plus className="h-3.5 w-3.5" />
+                新建工作区
+              </button>
             </div>
 
             {/* Workspace list */}
             <div className="flex-1 overflow-y-auto px-1.5">
-              {loading && !mainGroup && otherGroups.length === 0 ? (
+              {loading && allGroups.length === 0 ? (
                 <SkeletonCardList count={6} compact />
+              ) : agentSections.length === 0 ? (
+                <div className="flex h-32 flex-col items-center justify-center px-4">
+                  <p className="text-center text-xs text-muted-foreground">
+                    暂无 Agent 工作区
+                  </p>
+                </div>
               ) : (
-                <>
-                  {mainGroup && (
-                    <div className="mb-1">
-                      <div className="px-2 pt-1 pb-1">
-                        <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">
-                          {mainGroup.agent_profile_name || 'Default Agent'}
-                          {mainGroup.agent_profile_version
-                            ? ` · v${mainGroup.agent_profile_version}`
-                            : ''}
-                        </span>
-                      </div>
-                      <ChatGroupItem
-                        jid={mainGroup.jid}
-                        name={mainGroup.name}
-                        folder={mainGroup.folder}
-                        lastMessage={mainGroup.lastMessage}
-                        isActive={currentGroup === mainGroup.jid}
-                        isHome
-                        isRunning={runnerStates[mainGroup.jid] === 'running'}
-                        canModify={mainGroup.can_modify}
-                        onSelect={handleGroupSelect}
-                        onRename={(jid, name) =>
-                          setRenameState({ open: true, jid, name })
-                        }
-                        onClearHistory={openClear}
-                      />
-                    </div>
+                <div className="pt-1">
+                  {agentPartitions.primary && (
+                    <section aria-labelledby="primary-agent-heading">
+                      <h2
+                        id="primary-agent-heading"
+                        className="px-3 pb-1 pt-1 text-[10px] font-medium tracking-[0.08em] text-muted-foreground"
+                      >
+                        主 Agent · {agentPartitions.primary.name}
+                      </h2>
+                      {renderPrimaryAgentWorkspaces(agentPartitions.primary)}
+                    </section>
                   )}
-
-                  {pinnedAgentSections.length > 0 && (
-                    <div className="mb-1">
-                      <div className="mt-1" />
-                      <div className="px-2 pt-2 pb-1">
-                        <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">
-                          已固定
-                        </span>
-                      </div>
-                      {renderAgentSections(pinnedAgentSections, {
-                        showCollabBadge: true,
-                        showPinned: true,
-                      })}
-                    </div>
+                  {agentPartitions.custom.length > 0 && (
+                    <section
+                      aria-labelledby="custom-agent-heading"
+                      className="mt-4 border-t border-border/60 pt-3"
+                    >
+                      <h2
+                        id="custom-agent-heading"
+                        className="px-3 pb-1 text-[10px] font-medium tracking-[0.08em] text-muted-foreground"
+                      >
+                        自定义 Agent
+                      </h2>
+                      {agentPartitions.custom.map(renderAgentSection)}
+                    </section>
                   )}
-
-                  {myAgentSections.length === 0 &&
-                  collabAgentSections.length === 0 &&
-                  pinnedAgentSections.length === 0 &&
-                  !mainGroup ? (
-                    <div className="flex flex-col items-center justify-center h-32 px-4">
-                      <p className="text-xs text-muted-foreground text-center">
-                        暂无 Agent 工作区
-                      </p>
-                    </div>
-                  ) : (
-                    <>
-                      {myAgentSections.length > 0 && (
-                        <div>
-                          <div className="mt-1" />
-                          <div className="px-2 pt-2 pb-1">
-                            <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">
-                              我的 Agent
-                            </span>
-                          </div>
-                          {renderAgentSections(myAgentSections)}
-                        </div>
-                      )}
-                      {collabAgentSections.length > 0 && (
-                        <div>
-                          <div className="mt-1" />
-                          <div className="px-2 pt-2 pb-1">
-                            <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">
-                              协作 Agent 工作区
-                            </span>
-                          </div>
-                          {renderAgentSections(collabAgentSections, {
-                            showCollabBadge: true,
-                          })}
-                        </div>
-                      )}
-                    </>
-                  )}
-                </>
+                </div>
               )}
             </div>
           </div>

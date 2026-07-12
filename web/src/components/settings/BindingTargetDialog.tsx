@@ -1,5 +1,11 @@
 import { useState, useMemo, useEffect } from 'react';
-import { Bot, Loader2, FolderOpen, MessageSquare, RotateCcw } from 'lucide-react';
+import {
+  Bot,
+  Loader2,
+  FolderOpen,
+  MessageSquare,
+  RotateCcw,
+} from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -9,12 +15,15 @@ import {
 import { Button } from '@/components/ui/button';
 import { SearchInput } from '@/components/common/SearchInput';
 import type { BindingTarget } from './hooks/useImBindings';
+import { getAgentProfileDisplayName } from '../../utils/agent-product';
 
 interface BindingTargetDialogProps {
   open: boolean;
   imGroupName: string;
   targets: BindingTarget[];
   targetsLoading: boolean;
+  targetType: 'workspace' | 'session';
+  canUnbind: boolean;
   onSelect: (target: BindingTarget) => void;
   onRestoreDefault: () => void;
   onClose: () => void;
@@ -26,6 +35,8 @@ export function BindingTargetDialog({
   imGroupName,
   targets,
   targetsLoading,
+  targetType,
+  canUnbind,
   onSelect,
   onRestoreDefault,
   onClose,
@@ -61,7 +72,7 @@ export function BindingTargetDialog({
       const agentKey = t.agentProfileId || t.agentProfileName || 'default';
       if (!map.has(agentKey)) {
         map.set(agentKey, {
-          agentName: t.agentProfileName || 'Default Agent',
+          agentName: getAgentProfileDisplayName(t.agentProfileName),
           workspaces: new Map(),
         });
       }
@@ -75,11 +86,20 @@ export function BindingTargetDialog({
   }, [filtered]);
 
   return (
-    <Dialog open={open} onOpenChange={(v) => { if (!v) { onClose(); setFilter(''); } }}>
+    <Dialog
+      open={open}
+      onOpenChange={(v) => {
+        if (!v) {
+          onClose();
+          setFilter('');
+        }
+      }}
+    >
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle className="text-base truncate">
-            选择挂载目标 — {imGroupName}
+            {targetType === 'workspace' ? '选择工作区' : '选择会话'} —{' '}
+            {imGroupName}
           </DialogTitle>
         </DialogHeader>
 
@@ -87,7 +107,11 @@ export function BindingTargetDialog({
           <SearchInput
             value={filter}
             onChange={setFilter}
-            placeholder="搜索工作区或会话..."
+            placeholder={
+              targetType === 'workspace'
+                ? '搜索工作区...'
+                : '搜索工作区或会话...'
+            }
             debounce={150}
           />
         )}
@@ -102,7 +126,9 @@ export function BindingTargetDialog({
 
           {!targetsLoading && targets.length === 0 && (
             <div className="text-center py-8 text-muted-foreground text-sm">
-              暂无可挂载的目标。请先创建一个工作区。
+              {targetType === 'workspace'
+                ? '暂无可绑定的工作区。请先创建工作区。'
+                : '暂无可绑定的会话。请先在工作区内创建会话。'}
             </div>
           )}
 
@@ -119,51 +145,60 @@ export function BindingTargetDialog({
                   <Bot className="w-3.5 h-3.5 text-primary" />
                   {agentGroup.agentName}
                 </div>
-                {Array.from(agentGroup.workspaces.entries()).map(([groupJid, items]) => (
-                  <div key={groupJid} className="space-y-1 rounded-md border border-border/60 p-2">
-                    <div className="flex items-center gap-1.5 px-1 text-xs font-medium text-muted-foreground">
-                      <FolderOpen className="w-3 h-3" />
-                      {items[0].groupName}
+                {Array.from(agentGroup.workspaces.entries()).map(
+                  ([groupJid, items]) => (
+                    <div
+                      key={groupJid}
+                      className="space-y-1 rounded-md border border-border/60 p-2"
+                    >
+                      <div className="flex items-center gap-1.5 px-1 text-xs font-medium text-muted-foreground">
+                        <FolderOpen className="w-3 h-3" />
+                        {items[0].groupName}
+                      </div>
+                      {items.map((target) => {
+                        const key =
+                          target.sessionId || `main:${target.groupJid}`;
+                        const isSelecting = selecting === key;
+                        return (
+                          <button
+                            key={key}
+                            onClick={() => onSelect(target)}
+                            disabled={!!selecting}
+                            className="w-full flex items-center gap-3 px-3 py-2 rounded-md border border-border hover:border-brand-300 hover:bg-brand-50/50 dark:hover:border-brand-600 dark:hover:bg-brand-700/10 transition-colors text-left cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            <MessageSquare className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                            <span className="flex-1 text-sm truncate">
+                              {target.type === 'session'
+                                ? target.sessionName || '会话'
+                                : '绑定到此工作区'}
+                            </span>
+                            {isSelecting && (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" />
+                            )}
+                          </button>
+                        );
+                      })}
                     </div>
-                    {items.map((target) => {
-                      const key = target.sessionId || `main:${target.groupJid}`;
-                      const isSelecting = selecting === key;
-                      return (
-                        <button
-                          key={key}
-                          onClick={() => onSelect(target)}
-                          disabled={!!selecting}
-                          className="w-full flex items-center gap-3 px-3 py-2 rounded-md border border-border hover:border-brand-300 hover:bg-brand-50/50 dark:hover:border-brand-600 dark:hover:bg-brand-700/10 transition-colors text-left cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-                        >
-                          <MessageSquare className="w-4 h-4 text-muted-foreground flex-shrink-0" />
-                          <span className="flex-1 text-sm truncate">
-                            {target.type === 'session'
-                              ? target.sessionName || '会话'
-                              : '主会话'}
-                          </span>
-                          {isSelecting && <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" />}
-                        </button>
-                      );
-                    })}
-                  </div>
-                ))}
+                  ),
+                )}
               </div>
             ))}
         </div>
 
-        {/* Restore default button */}
-        <div className="border-t border-border pt-3 mt-1">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={onRestoreDefault}
-            disabled={!!selecting}
-            className="text-muted-foreground hover:text-foreground w-full"
-          >
-            <RotateCcw className="w-3.5 h-3.5 mr-1.5" />
-            恢复默认路由
-          </Button>
-        </div>
+        {canUnbind && (
+          <div className="border-t border-border pt-3 mt-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={onRestoreDefault}
+              disabled={!!selecting}
+              className="text-muted-foreground hover:text-foreground w-full"
+            >
+              <RotateCcw className="w-3.5 h-3.5 mr-1.5" />
+              解除当前绑定
+            </Button>
+          </div>
+        )}
       </DialogContent>
     </Dialog>
   );

@@ -329,12 +329,6 @@ interface ResolvedProvider {
 
 type RunnerAgentProfile = NonNullable<ContainerInput['agentProfile']>;
 
-function getAgentProfileProviderPolicy(
-  agentProfile?: RunnerAgentProfile,
-): string | null {
-  return agentProfile?.runtimePolicy?.provider_id?.trim() || null;
-}
-
 function sanitizeRuntimePolicyPathSegment(value: string): string {
   return (
     value
@@ -342,6 +336,12 @@ function sanitizeRuntimePolicyPathSegment(value: string): string {
       .replace(/^-+|-+$/g, '')
       .slice(0, 96) || 'default'
   );
+}
+
+function shouldIncludeHostClaudeContext(
+  agentProfile?: RunnerAgentProfile,
+): boolean {
+  return agentProfile?.runtimePolicy?.context?.source === 'host_claude';
 }
 
 function resolveAgentProfileUserSkillsPolicy(
@@ -377,9 +377,7 @@ function resolveAgentProfileUserSkillsPolicy(
     }
     let hasSkillDefinition = false;
     try {
-      hasSkillDefinition = fs
-        .statSync(path.join(source, 'SKILL.md'))
-        .isFile();
+      hasSkillDefinition = fs.statSync(path.join(source, 'SKILL.md')).isFile();
     } catch {
       // Disabled/deleted definitions must invalidate the exact-set policy.
     }
@@ -479,6 +477,12 @@ function getAgentProfileToolPolicyMode(
   return agentProfile?.runtimePolicy?.tools.mode ?? 'inherit';
 }
 
+function getAgentProfileMcpPolicyMode(
+  agentProfile?: RunnerAgentProfile,
+): 'inherit' | 'custom' | 'disabled' {
+  return agentProfile?.runtimePolicy?.mcp.mode ?? 'inherit';
+}
+
 /**
  * One-time provider overrides per group folder.
  * Set by switchProvider(), consumed (and deleted) by trySelectPoolProvider().
@@ -510,19 +514,7 @@ export function setProviderOverride(
 export function willClearSessionOnProviderSwitch(
   groupFolder: string,
   agentId?: string | null,
-  agentProfile?: RunnerAgentProfile,
 ): boolean {
-  const policyProviderId = getAgentProfileProviderPolicy(agentProfile);
-  if (policyProviderId) {
-    const boundId = getSessionProviderId(groupFolder, agentId);
-    if (!boundId) return false;
-    const enabledProviders = getEnabledProviders();
-    const policyProviderEnabled = enabledProviders.some(
-      (provider) => provider.id === policyProviderId,
-    );
-    return policyProviderEnabled && boundId !== policyProviderId;
-  }
-
   // Env-level provider override means the pool is bypassed entirely — no
   // pool-driven switch, so the session is never cleared on this account.
   const override = getContainerEnvConfig(groupFolder);
@@ -581,7 +573,6 @@ export function willClearSessionOnProviderSwitch(
 export function trySelectPoolProvider(
   groupFolder: string,
   agentId?: string | null,
-  agentProfile?: RunnerAgentProfile,
 ): {
   profileId: string;
   resolved: ResolvedProvider;
@@ -595,48 +586,6 @@ export function trySelectPoolProvider(
     override.anthropicBaseUrl
   );
   const existingBoundId = getSessionProviderId(groupFolder, agentId);
-  const policyProviderId = getAgentProfileProviderPolicy(agentProfile);
-  if (policyProviderId) {
-    const ignoredOverrideProviderId = providerOverrides.get(groupFolder);
-    if (ignoredOverrideProviderId) {
-      providerOverrides.delete(groupFolder);
-      logger.info(
-        {
-          groupFolder,
-          ignoredProviderId: ignoredOverrideProviderId,
-          policyProviderId,
-          agentProfileId: agentProfile?.id,
-        },
-        'Ignoring one-time provider override because AgentProfile pins a provider',
-      );
-    }
-
-    const enabledProviders = getEnabledProviders();
-    if (!enabledProviders.some((provider) => provider.id === policyProviderId)) {
-      throw new Error(
-        `AgentProfile ${agentProfile?.id ?? 'unknown'} pins unavailable provider ${policyProviderId}`,
-      );
-    }
-    try {
-      const balancing = getBalancingConfig();
-      providerPool.refreshFromConfig(enabledProviders, balancing);
-      const resolved = resolveProviderById(policyProviderId);
-      providerPool.acquireSession(policyProviderId);
-      setSessionProviderId(groupFolder, agentId, policyProviderId);
-      return {
-        profileId: policyProviderId,
-        resolved: { config: resolved.config, customEnv: resolved.customEnv },
-        previousProviderId: existingBoundId,
-        resetSession: !!existingBoundId && existingBoundId !== policyProviderId,
-      };
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      throw new Error(
-        `AgentProfile ${agentProfile?.id ?? 'unknown'} failed to use pinned provider ${policyProviderId}: ${reason}`,
-      );
-    }
-  }
-
   if (hasOverride) return null;
 
   // Check one-time override (consumed on use)
@@ -695,7 +644,10 @@ export function trySelectPoolProvider(
           );
           return {
             profileId: boundId,
-            resolved: { config: resolved.config, customEnv: resolved.customEnv },
+            resolved: {
+              config: resolved.config,
+              customEnv: resolved.customEnv,
+            },
           };
         } catch (err) {
           logger.warn(
@@ -875,6 +827,7 @@ export function buildVolumeMounts(
     projectRoot,
     dataDir: DATA_DIR,
     groupSessionsDir,
+    includeHostClaudeContext: shouldIncludeHostClaudeContext(agentProfile),
     mountUserSkills: mountUserSkills && userSkillsPolicy.mountUserSkills,
     userSkillsDirOverride: userSkillsPolicy.userSkillsDirOverride,
   });
@@ -1045,8 +998,12 @@ export function buildVolumeMounts(
   }
   const disallowedTools = resolveAgentProfileDisallowedTools(agentProfile);
   const toolPolicyMode = getAgentProfileToolPolicyMode(agentProfile);
+  const mcpPolicyMode = getAgentProfileMcpPolicyMode(agentProfile);
   if (toolPolicyMode !== 'inherit') {
     envLines.push(`HAPPYCLAW_AGENT_TOOL_POLICY=${toolPolicyMode}`);
+  }
+  if (mcpPolicyMode !== 'inherit') {
+    envLines.push(`HAPPYCLAW_AGENT_MCP_POLICY=${mcpPolicyMode}`);
   }
   if (disallowedTools.length > 0) {
     envLines.push(
@@ -1214,11 +1171,7 @@ export async function runContainerAgent(
   mkdirForContainer(groupDir);
 
   // ─── Provider Pool selection ───
-  const poolResult = trySelectPoolProvider(
-    group.folder,
-    sessionAgentId,
-    input.agentProfile,
-  );
+  const poolResult = trySelectPoolProvider(group.folder, sessionAgentId);
   const selectedProfileId = poolResult?.profileId ?? null;
   const resolvedProvider = poolResult?.resolved;
   let providerFailureReported = false;
@@ -1244,8 +1197,7 @@ export async function runContainerAgent(
   }
 
   try {
-    // Determine if this is an admin home container (full privileges)
-    const isAdminHome = !!group.is_home && group.folder === 'main';
+    const isAdminHome = !!input.isAdminHome;
     // Per-user skills: always mount if the group has an owner
     const shouldMountUserSkills = !!group.created_by;
     const mounts = buildVolumeMounts(
@@ -1594,16 +1546,16 @@ export function killProcessTree(
 }
 
 /**
- * admin 主容器（is_home=1, folder=main）+ 系统设置 disableMemoryLayerForAdminHost 开启时，
+ * admin 主容器 + 系统设置 disableMemoryLayerForAdminHost 开启时，
  * HappyClaw 记忆层被禁用，agent 完全按本机 ~/.claude/ Playbook 运行。
  * 供 host 启动路径多处复用，保证判断口径一致。
  */
 function isAdminHomeMemoryDisabled(
-  ownerHomeFolder: string | undefined,
+  isAdminHome: boolean,
   group: RegisteredGroup,
 ): boolean {
   return (
-    ownerHomeFolder === 'main' &&
+    isAdminHome &&
     !!group.is_home &&
     getSystemSettings().disableMemoryLayerForAdminHost
   );
@@ -1765,7 +1717,9 @@ export async function runHostAgent(
   // 3. 写入 settings.json（合并模式，不覆盖已有用户配置）
   // Load user's global MCP servers (same logic as Docker mode).
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  const hostMcpServers = group.created_by ? loadUserMcpServers(group.created_by) : {};
+  const hostMcpServers = group.created_by
+    ? loadUserMcpServers(group.created_by)
+    : {};
   const hostMcpPolicy = resolveAgentProfileMcpPolicy(
     hostMcpServers,
     input.agentProfile,
@@ -1789,9 +1743,15 @@ export async function runHostAgent(
     projectRoot: process.cwd(),
     dataDir: DATA_DIR,
     groupSessionsDir,
+    includeHostClaudeContext: shouldIncludeHostClaudeContext(
+      input.agentProfile,
+    ),
     mountUserSkills: hostUserSkillsPolicy.mountUserSkills,
     userSkillsDirOverride: hostUserSkillsPolicy.userSkillsDirOverride,
-    happyclawMemoryActive: !isAdminHomeMemoryDisabled(ownerHomeFolder, group),
+    happyclawMemoryActive: !isAdminHomeMemoryDisabled(
+      !!input.isAdminHome,
+      group,
+    ),
   });
   const hostClaudeContextSync = syncHostClaudeContext(
     hostClaudeContextPlan,
@@ -1824,11 +1784,7 @@ export async function runHostAgent(
 
   // ─── Provider Pool selection (host mode) ───
   const containerOverride = getContainerEnvConfig(group.folder);
-  const hostPoolResult = trySelectPoolProvider(
-    group.folder,
-    sessionAgentId,
-    input.agentProfile,
-  );
+  const hostPoolResult = trySelectPoolProvider(group.folder, sessionAgentId);
   const hostSelectedProfileId = hostPoolResult?.profileId ?? null;
   const globalConfig =
     hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
@@ -1957,8 +1913,14 @@ export async function runHostAgent(
     const hostToolPolicyMode = getAgentProfileToolPolicyMode(
       input.agentProfile,
     );
+    const hostMcpPolicyMode = getAgentProfileMcpPolicyMode(input.agentProfile);
+    delete hostEnv['HAPPYCLAW_AGENT_TOOL_POLICY'];
+    delete hostEnv['HAPPYCLAW_AGENT_MCP_POLICY'];
     if (hostToolPolicyMode !== 'inherit') {
       hostEnv['HAPPYCLAW_AGENT_TOOL_POLICY'] = hostToolPolicyMode;
+    }
+    if (hostMcpPolicyMode !== 'inherit') {
+      hostEnv['HAPPYCLAW_AGENT_MCP_POLICY'] = hostMcpPolicyMode;
     }
     if (hostDisallowedTools.length > 0) {
       hostEnv['HAPPYCLAW_AGENT_DISALLOWED_TOOLS'] =
@@ -1967,9 +1929,9 @@ export async function runHostAgent(
 
     // 禁用 HappyClaw 记忆层：不注入 memory MCP 工具 / WORKSPACE_GLOBAL/MEMORY env / 记忆提示，
     // 三件套仍通过同步后的 session .claude 生效，避免 externalClaudeDir 漂移。
-    // 仅作用于 admin 主容器（is_home=1, folder=main），不影响 admin 创建的其他子群组。
+    // 仅作用于 admin 主容器，不影响 admin 创建的其他工作区。
     const disableMemoryLayer = isAdminHomeMemoryDisabled(
-      ownerHomeFolder,
+      !!input.isAdminHome,
       group,
     );
 

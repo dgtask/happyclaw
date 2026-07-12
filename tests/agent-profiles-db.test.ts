@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import Database from 'better-sqlite3';
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-profiles-db-'));
 const tmpStoreDir = path.join(tmpDir, 'db');
@@ -41,14 +42,14 @@ afterAll(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-function seedUser(id: string): void {
+function seedUser(id: string, role: 'admin' | 'member' = 'member'): void {
   const now = new Date().toISOString();
   createUser({
     id,
     username: id,
     password_hash: 'hash',
     display_name: id,
-    role: 'member',
+    role,
     status: 'active',
     created_at: now,
     updated_at: now,
@@ -64,21 +65,103 @@ describe('AgentProfile DB model', () => {
 
     expect(profiles).toHaveLength(1);
     expect(profiles[0].is_default).toBe(true);
-    expect(profiles[0].name).toBe('Default Agent');
+    expect(profiles[0].name).toBe('HappyClaw');
     expect(profiles[0].identity_prompt).toBe('');
     expect(profiles[0].include_claude_preset).toBe(true);
     expect(profiles[0].runtime_policy).toEqual({
       provider_id: null,
+      context: { source: 'managed' },
       skills: { mode: 'inherit', ids: [] },
       mcp: { mode: 'inherit', ids: [] },
       tools: { mode: 'inherit' },
     });
     expect(profiles[0].identity_hash).toBe(
-      computeAgentProfileIdentityHash('', true, undefined, 'Default Agent'),
+      computeAgentProfileIdentityHash('', true, undefined, 'HappyClaw'),
     );
   });
 
-  test('ignores historical AgentProfile model policy when normalizing', () => {
+  test('defaults admin HappyClaw to host context and never overwrites an explicit managed choice', () => {
+    const userId = 'agent-profile-admin-context';
+    seedUser(userId, 'admin');
+
+    const original = listAgentProfilesForUser(userId)[0];
+    expect(original).toMatchObject({
+      is_default: true,
+      runtime_policy: { context: { source: 'host_claude' } },
+    });
+
+    const managed = updateAgentProfile(original.id, userId, {
+      runtimePolicy: { context: { source: 'managed' } },
+    });
+    expect(managed?.version).toBe(original.version + 1);
+    expect(managed?.runtime_policy.context.source).toBe('managed');
+
+    const reread = listAgentProfilesForUser(userId)[0];
+    expect(reread.version).toBe(managed?.version);
+    expect(reread.runtime_policy.context.source).toBe('managed');
+  });
+
+  test('migrates an admin HappyClaw legacy policy without context exactly once', () => {
+    const userId = 'agent-profile-admin-legacy-context';
+    seedUser(userId, 'admin');
+    const original = listAgentProfilesForUser(userId)[0];
+    const legacyPolicy = {
+      provider_id: null,
+      skills: { mode: 'inherit', ids: [] },
+      mcp: { mode: 'inherit', ids: [] },
+      tools: { mode: 'inherit' },
+    };
+    const rawDb = new Database(path.join(tmpStoreDir, 'messages.db'));
+    rawDb
+      .prepare('UPDATE agent_profiles SET runtime_policy = ? WHERE id = ?')
+      .run(JSON.stringify(legacyPolicy), original.id);
+    rawDb.close();
+
+    const migrated = listAgentProfilesForUser(userId)[0];
+    expect(migrated.runtime_policy.context.source).toBe('host_claude');
+    expect(migrated.version).toBe(original.version + 1);
+    expect(migrated.identity_hash).toBe(
+      computeAgentProfileIdentityHash(
+        migrated.identity_prompt,
+        migrated.include_claude_preset,
+        migrated.runtime_policy,
+        migrated.name,
+      ),
+    );
+
+    const reread = listAgentProfilesForUser(userId)[0];
+    expect(reread.version).toBe(migrated.version);
+  });
+
+  test('renames the legacy built-in Agent without changing custom default names', () => {
+    const userId = 'agent-profile-user-legacy-name';
+    seedUser(userId);
+    const original = listAgentProfilesForUser(userId)[0];
+
+    const legacy = updateAgentProfile(original.id, userId, {
+      name: 'Default Agent',
+    });
+    expect(legacy?.name).toBe('Default Agent');
+
+    const migrated = listAgentProfilesForUser(userId)[0];
+    expect(migrated.name).toBe('HappyClaw');
+    expect(migrated.version).toBe((legacy?.version ?? 0) + 1);
+    expect(migrated.identity_hash).toBe(
+      computeAgentProfileIdentityHash(
+        migrated.identity_prompt,
+        migrated.include_claude_preset,
+        migrated.runtime_policy,
+        'HappyClaw',
+      ),
+    );
+
+    const custom = updateAgentProfile(migrated.id, userId, {
+      name: '我的默认助手',
+    });
+    expect(listAgentProfilesForUser(userId)[0].name).toBe(custom?.name);
+  });
+
+  test('ignores historical AgentProfile provider and model policy when normalizing', () => {
     expect(
       normalizeAgentProfileRuntimePolicy({
         provider_id: 'provider-a',
@@ -86,7 +169,8 @@ describe('AgentProfile DB model', () => {
         tools: { mode: 'readonly' },
       } as any),
     ).toEqual({
-      provider_id: 'provider-a',
+      provider_id: null,
+      context: { source: 'managed' },
       skills: { mode: 'inherit', ids: [] },
       mcp: { mode: 'inherit', ids: [] },
       tools: { mode: 'readonly' },
@@ -198,7 +282,8 @@ describe('AgentProfile DB model', () => {
     });
 
     expect(profile.runtime_policy).toEqual({
-      provider_id: 'provider-a',
+      provider_id: null,
+      context: { source: 'managed' },
       skills: { mode: 'custom', ids: ['review', 'research'] },
       mcp: { mode: 'disabled', ids: ['ignored'] },
       tools: { mode: 'readonly' },
@@ -227,6 +312,7 @@ describe('AgentProfile DB model', () => {
       {
         runtimePolicy: {
           provider_id: 'provider-b',
+          context: { source: 'host_claude' },
           skills: { mode: 'inherit', ids: [] },
           mcp: { mode: 'custom', ids: ['github'] },
           tools: { mode: 'restricted' },
@@ -235,7 +321,8 @@ describe('AgentProfile DB model', () => {
     );
     expect(updated?.version).toBe(profile.version + 1);
     expect(updated?.runtime_policy).toEqual({
-      provider_id: 'provider-b',
+      provider_id: null,
+      context: { source: 'host_claude' },
       skills: { mode: 'inherit', ids: [] },
       mcp: { mode: 'custom', ids: ['github'] },
       tools: { mode: 'restricted' },
@@ -257,6 +344,7 @@ describe('AgentProfile DB model', () => {
       name: 'Strict Policy Agent',
       runtimePolicy: {
         provider_id: 'provider-fixed',
+        context: { source: 'host_claude' },
         skills: { mode: 'disabled', ids: ['kept-for-audit'] },
         mcp: { mode: 'custom', ids: ['github'] },
         tools: { mode: 'restricted' },
@@ -270,7 +358,8 @@ describe('AgentProfile DB model', () => {
     );
 
     expect(updated?.runtime_policy).toEqual({
-      provider_id: 'provider-fixed',
+      provider_id: null,
+      context: { source: 'host_claude' },
       skills: { mode: 'disabled', ids: ['kept-for-audit'] },
       mcp: { mode: 'custom', ids: ['github'] },
       tools: { mode: 'readonly' },

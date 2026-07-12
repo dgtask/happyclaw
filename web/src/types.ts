@@ -5,11 +5,7 @@ export interface GroupInfo {
   kind?: 'home' | 'main' | 'feishu' | 'web';
   is_home?: boolean;
   is_my_home?: boolean;
-  is_shared?: boolean;
-  member_role?: 'owner' | 'member';
-  member_count?: number;
   can_modify?: boolean;
-  can_manage_members?: boolean;
   editable?: boolean;
   deletable?: boolean;
   lastMessage?: string;
@@ -48,6 +44,9 @@ export interface AgentProfile {
 
 export interface AgentProfileRuntimePolicy {
   provider_id: string | null;
+  context?: {
+    source: 'managed' | 'host_claude';
+  };
   skills: {
     mode: 'inherit' | 'custom' | 'disabled';
     ids: string[];
@@ -58,6 +57,26 @@ export interface AgentProfileRuntimePolicy {
   };
   tools: {
     mode: 'inherit' | 'readonly' | 'restricted';
+  };
+}
+
+export type AgentContextSource = NonNullable<
+  AgentProfileRuntimePolicy['context']
+>['source'];
+
+export function getAgentContextSource(
+  policy?: Partial<AgentProfileRuntimePolicy> | null,
+): AgentContextSource {
+  return policy?.context?.source === 'host_claude' ? 'host_claude' : 'managed';
+}
+
+export function withAgentContextSource(
+  policy: AgentProfileRuntimePolicy,
+  source: AgentContextSource,
+): AgentProfileRuntimePolicy {
+  return {
+    ...policy,
+    context: { source },
   };
 }
 
@@ -150,13 +169,4 @@ export interface AvailableImGroup {
   group_message_type?: string;
   is_thread_capable?: boolean;
   sender_allowlist_locked?: boolean;
-}
-
-export interface GroupMember {
-  user_id: string;
-  role: 'owner' | 'member';
-  added_at: string;
-  added_by?: string;
-  username: string;
-  display_name: string;
 }

@@ -13,7 +13,6 @@ import {
   deleteRegisteredGroup,
   deleteChatHistory,
   deleteAgent,
-  deleteImContextBindingsByWorkspace,
   getRegisteredGroup,
   getAllRegisteredGroups,
   setRegisteredGroup,
@@ -21,7 +20,6 @@ import {
   getAgent,
   clearSenderAllowlist,
   deleteSessionsByProviderId,
-  listFeishuThreadAgentIds,
   VALID_ACTIVATION_MODES,
 } from '../db.js';
 import { authMiddleware, systemConfigMiddleware } from '../middleware/auth.js';
@@ -102,6 +100,7 @@ import { logger } from '../logger.js';
 import { testFeishuCredentials } from '../feishu-connectivity.js';
 import {
   buildSessionMountUpdate,
+  buildDetachedWorkspaceUpdate,
   buildUnmountUpdate,
   buildWorkspaceMountUpdate,
 } from '../channel-mount-service.js';
@@ -470,9 +469,7 @@ configRoutes.patch(
             providerId: id,
             protocolFieldChanged,
           },
-          protocolFieldChanged
-            ? { clearSessionsForProviderId: id }
-            : undefined,
+          protocolFieldChanged ? { clearSessionsForProviderId: id } : undefined,
         );
       }
 
@@ -948,7 +945,10 @@ function applyBindingUpdate(imJid: string, updated: RegisteredGroup): void {
   }
 }
 
-function applyRegisteredGroupUpdate(jid: string, updated: RegisteredGroup): void {
+function applyRegisteredGroupUpdate(
+  jid: string,
+  updated: RegisteredGroup,
+): void {
   setRegisteredGroup(jid, updated);
   const webDeps = getWebDeps();
   if (webDeps) {
@@ -1006,21 +1006,15 @@ function resolveWorkspaceForBinding(
   return null;
 }
 
-function cleanupThreadMapWorkspace(targetMainJid?: string): void {
+function detachThreadMapWorkspace(targetMainJid?: string): void {
   if (!targetMainJid) return;
   const workspace = resolveWorkspaceForBinding(targetMainJid);
   if (!workspace) return;
 
-  const threadAgentIds = listFeishuThreadAgentIds(workspace.jid);
-  for (const agentId of threadAgentIds) {
-    deleteAgent(agentId);
-  }
-  deleteImContextBindingsByWorkspace(workspace.jid);
-  applyRegisteredGroupUpdate(workspace.jid, {
-    ...workspace.group,
-    conversation_source: 'manual',
-    conversation_nav_mode: 'horizontal',
-  });
+  applyRegisteredGroupUpdate(
+    workspace.jid,
+    buildDetachedWorkspaceUpdate(workspace.group),
+  );
 }
 
 configRoutes.get('/feishu', authMiddleware, systemConfigMiddleware, (c) => {
@@ -1362,16 +1356,19 @@ configRoutes.put(
       );
     }
 
-    // 启用「禁用 HappyClaw 记忆层」开关前必须给 admin 主容器配 customCwd，
-    // 否则 CLAUDE_CONFIG_DIR 仍指向 data/sessions/main/.claude，SDK 读不到 ~/.claude/
-    // 又没有 HappyClaw 记忆层注入，agent 会变成空白沙箱。
+    // 启用前必须给每个 admin 的 host 主工作区配置 customCwd，否则 SDK
+    // 既读不到 HappyClaw 记忆层也读不到本机 ~/.claude/。
     if (validation.data.disableMemoryLayerForAdminHost === true) {
-      const adminMain = getRegisteredGroup('web:main');
-      if (!adminMain || !adminMain.customCwd) {
+      const missingAdminHomes = Object.entries(getAllRegisteredGroups())
+        .filter(
+          ([, group]) =>
+            group.is_home && group.executionMode === 'host' && !group.customCwd,
+        )
+        .map(([jid]) => jid);
+      if (missingAdminHomes.length > 0) {
         return c.json(
           {
-            error:
-              '启用前请先给 admin 主容器（web:main）配置 customCwd，否则 SDK 既读不到 HappyClaw 记忆层也读不到 ~/.claude/，会是空白沙箱。',
+            error: `启用前请先给所有 admin 主工作区配置 customCwd：${missingAdminHomes.join(', ')}`,
           },
           400,
         );
@@ -1393,70 +1390,91 @@ configRoutes.put(
 
 // ─── External Claude resources (admin only) ─────────────────────────
 
-configRoutes.get('/external-resources', authMiddleware, systemConfigMiddleware, (c) => {
-  // 仅 admin 可查看宿主机资源，普通用户不允许看到宿主机任何内容
-  const user = c.get('user') as AuthUser;
-  if (user.role !== 'admin') {
-    return c.json({ dir: '', rules: [], claudeMd: null });
-  }
-  const effectiveDir = getEffectiveExternalDir();
+configRoutes.get(
+  '/external-resources',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    // 仅 admin 可查看宿主机资源，普通用户不允许看到宿主机任何内容
+    const user = c.get('user') as AuthUser;
+    if (user.role !== 'admin') {
+      return c.json({ dir: '', rules: [], claudeMd: null });
+    }
+    const effectiveDir = getEffectiveExternalDir();
 
-  const result: {
-    dir: string;
-    rules: Array<{ name: string; size: number }>;
-    claudeMd: string | null;
-  } = { dir: effectiveDir, rules: [], claudeMd: null };
+    const result: {
+      dir: string;
+      rules: Array<{ name: string; size: number }>;
+      claudeMd: string | null;
+    } = { dir: effectiveDir, rules: [], claudeMd: null };
 
-  // Rules
-  const rulesDir = path.join(effectiveDir, 'rules');
-  try {
-    if (fs.existsSync(rulesDir)) {
-      for (const entry of fs.readdirSync(rulesDir, { withFileTypes: true })) {
-        if (!entry.isFile() && !entry.isSymbolicLink()) continue;
-        try {
-          const st = fs.statSync(path.join(rulesDir, entry.name));
-          result.rules.push({ name: entry.name, size: st.size });
-        } catch { /* skip */ }
+    // Rules
+    const rulesDir = path.join(effectiveDir, 'rules');
+    try {
+      if (fs.existsSync(rulesDir)) {
+        for (const entry of fs.readdirSync(rulesDir, { withFileTypes: true })) {
+          if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+          try {
+            const st = fs.statSync(path.join(rulesDir, entry.name));
+            result.rules.push({ name: entry.name, size: st.size });
+          } catch {
+            /* skip */
+          }
+        }
       }
+    } catch {
+      /* ignore */
     }
-  } catch { /* ignore */ }
 
-  // CLAUDE.md
-  const claudeMdPath = path.join(effectiveDir, 'CLAUDE.md');
-  try {
-    if (fs.existsSync(claudeMdPath)) {
-      const content = fs.readFileSync(claudeMdPath, 'utf-8');
-      result.claudeMd = content.length > 10000 ? content.slice(0, 10000) + '\n...(截断)' : content;
+    // CLAUDE.md
+    const claudeMdPath = path.join(effectiveDir, 'CLAUDE.md');
+    try {
+      if (fs.existsSync(claudeMdPath)) {
+        const content = fs.readFileSync(claudeMdPath, 'utf-8');
+        result.claudeMd =
+          content.length > 10000
+            ? content.slice(0, 10000) + '\n...(截断)'
+            : content;
+      }
+    } catch {
+      /* ignore */
     }
-  } catch { /* ignore */ }
 
-  return c.json(result);
-});
+    return c.json(result);
+  },
+);
 
 // Read a single rule file content (admin only)
-configRoutes.get('/external-resources/rule', authMiddleware, systemConfigMiddleware, (c) => {
-  const user = c.get('user') as AuthUser;
-  if (user.role !== 'admin') {
-    return c.text('Forbidden', 403);
-  }
-  const name = c.req.query('name');
-  if (!name || name.includes('/') || name.includes('..')) {
-    return c.text('Invalid name', 400);
-  }
-  const effectiveDir = getEffectiveExternalDir();
-  const filePath = path.join(effectiveDir, 'rules', name);
-  try {
-    const resolved = fs.realpathSync(filePath);
-    // 确保解析后的路径仍在 rules 目录内
-    if (!resolved.startsWith(fs.realpathSync(path.join(effectiveDir, 'rules')))) {
+configRoutes.get(
+  '/external-resources/rule',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    const user = c.get('user') as AuthUser;
+    if (user.role !== 'admin') {
       return c.text('Forbidden', 403);
     }
-    const content = fs.readFileSync(resolved, 'utf-8');
-    return c.text(content);
-  } catch {
-    return c.text('Not found', 404);
-  }
-});
+    const name = c.req.query('name');
+    if (!name || name.includes('/') || name.includes('..')) {
+      return c.text('Invalid name', 400);
+    }
+    const effectiveDir = getEffectiveExternalDir();
+    const filePath = path.join(effectiveDir, 'rules', name);
+    try {
+      const resolved = fs.realpathSync(filePath);
+      // 确保解析后的路径仍在 rules 目录内
+      if (
+        !resolved.startsWith(fs.realpathSync(path.join(effectiveDir, 'rules')))
+      ) {
+        return c.text('Forbidden', 403);
+      }
+      const content = fs.readFileSync(resolved, 'utf-8');
+      return c.text(content);
+    } catch {
+      return c.text('Not found', 404);
+    }
+  },
+);
 
 // ─── Per-user IM connection status ──────────────────────────────────
 
@@ -1616,9 +1634,15 @@ configRoutes.put('/user-im/feishu', authMiddleware, async (c) => {
       autoIsolateContext: next.autoIsolateContext as boolean | undefined,
       ownerOpenId: next.ownerOpenId as string | undefined,
     });
-    appendImConfigAudit(user.username, 'feishu', 'update', Object.keys(validation.data), {
-      userId: user.id,
-    });
+    appendImConfigAudit(
+      user.username,
+      'feishu',
+      'update',
+      Object.keys(validation.data),
+      {
+        userId: user.id,
+      },
+    );
 
     // Migrate existing Feishu chats when autoIsolateContext toggle changes
     const oldAutoIsolate = current?.autoIsolateContext ?? false;
@@ -1746,7 +1770,13 @@ configRoutes.put('/user-im/telegram', authMiddleware, async (c) => {
       proxyUrl: next.proxyUrl || undefined,
       enabled: next.enabled,
     });
-    appendImConfigAudit(user.username, 'telegram', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'telegram',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's Telegram channel
     if (deps?.reloadUserIMConfig) {
@@ -1972,7 +2002,13 @@ configRoutes.put('/user-im/qq', authMiddleware, async (c) => {
       appSecret: next.appSecret,
       enabled: next.enabled,
     });
-    appendImConfigAudit(user.username, 'qq', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'qq',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's QQ channel
     if (deps?.reloadUserIMConfig) {
@@ -2132,7 +2168,7 @@ configRoutes.put('/user-im/qq/paired-chats/:jid', authMiddleware, async (c) => {
 
   const body = await c.req
     .json<{ name?: unknown }>()
-    .catch(() => ({} as { name?: unknown }));
+    .catch(() => ({}) as { name?: unknown });
   const rawName = typeof body.name === 'string' ? body.name : '';
   const name = rawName.trim();
   if (!name) {
@@ -2265,7 +2301,13 @@ configRoutes.put('/user-im/dingtalk', authMiddleware, async (c) => {
 
   try {
     const saved = saveUserDingTalkConfig(user.id, next);
-    appendImConfigAudit(user.username, 'dingtalk', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'dingtalk',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's DingTalk channel
     if (deps?.reloadUserIMConfig) {
@@ -2411,7 +2453,13 @@ configRoutes.put('/user-im/discord', authMiddleware, async (c) => {
 
   try {
     const saved = saveUserDiscordConfig(user.id, next);
-    appendImConfigAudit(user.username, 'discord', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'discord',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's Discord channel
     if (deps?.reloadUserIMConfig) {
@@ -2591,7 +2639,13 @@ configRoutes.put('/user-im/wechat', authMiddleware, async (c) => {
 
   try {
     const saved = saveUserWeChatConfig(user.id, next);
-    appendImConfigAudit(user.username, 'wechat', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'wechat',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Update NO_PROXY based on bypassProxy setting
     updateWeChatNoProxy(saved.bypassProxy ?? true);
@@ -2722,7 +2776,13 @@ configRoutes.get('/user-im/wechat/qrcode-status', authMiddleware, async (c) => {
         baseUrl: data.baseurl || undefined,
         enabled: true,
       });
-    appendImConfigAudit(user.username, 'wechat', 'oauth_qr_confirmed', ['botToken', 'ilinkBotId', 'baseUrl', 'enabled'], { userId: user.id });
+      appendImConfigAudit(
+        user.username,
+        'wechat',
+        'oauth_qr_confirmed',
+        ['botToken', 'ilinkBotId', 'baseUrl', 'enabled'],
+        { userId: user.id },
+      );
 
       // Note: ilink_user_id (the QR scanner) is NOT auto-paired here.
       // The scanner needs to send a message to the bot and use /pair <code>
@@ -2874,7 +2934,13 @@ configRoutes.put('/user-im/whatsapp', authMiddleware, async (c) => {
 
   try {
     const saved = saveUserWhatsAppConfig(user.id, next);
-    appendImConfigAudit(user.username, 'whatsapp', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'whatsapp',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's WhatsApp channel (skeleton always returns false)
     if (deps?.reloadUserIMConfig) {
@@ -2925,10 +2991,7 @@ configRoutes.post('/user-im/whatsapp/logout', authMiddleware, async (c) => {
     try {
       await deps.logoutUserWhatsApp(user.id, accountId);
     } catch (err) {
-      logger.warn(
-        { err, userId: user.id },
-        'WhatsApp logout deps call failed',
-      );
+      logger.warn({ err, userId: user.id }, 'WhatsApp logout deps call failed');
     }
   }
 
@@ -2939,7 +3002,13 @@ configRoutes.post('/user-im/whatsapp/logout', authMiddleware, async (c) => {
       enabled: false,
       paired: false,
     });
-    appendImConfigAudit(user.username, 'whatsapp', 'logout', ['enabled', 'paired'], { userId: user.id, accountId });
+    appendImConfigAudit(
+      user.username,
+      'whatsapp',
+      'logout',
+      ['enabled', 'paired'],
+      { userId: user.id, accountId },
+    );
     const state = deps?.getUserWhatsAppState?.(user.id) ?? {
       status: 'logged_out' as const,
     };
@@ -2977,7 +3046,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   // IM-binding 改的是 imGroup 行（target_agent_id / target_main_jid /
   // activation_mode 等），与 agents.ts 的 4 个 IM-binding 路由对齐：
   // 非成员用 access 检查隐藏存在性（404），成员但非 owner 拒绝写（403）。
-  // 否则共享工作区里的 member 可以劫持 owner 的 IM 路由到自己 agent。
+  // IM 路由变更必须由对应工作区所有者执行。
   if (!canAccessGroup(user, { ...imGroup, jid: imJid })) {
     return c.json({ error: 'IM group not found' }, 404);
   }
@@ -2993,7 +3062,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     const wasThreadMap = imGroup.binding_mode === 'thread_map';
     const updated: RegisteredGroup = buildUnmountUpdate(imGroup);
     applyBindingUpdate(imJid, updated);
-    if (wasThreadMap) cleanupThreadMapWorkspace(previousTargetMainJid);
+    if (wasThreadMap) detachThreadMapWorkspace(previousTargetMainJid);
     logger.info({ imJid, userId: user.id }, 'IM group unbound (bindings page)');
     return c.json({ success: true });
   }
@@ -3051,9 +3120,13 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       return c.json({ error: 'IM group is already bound elsewhere' }, 409);
     }
 
-    const updated: RegisteredGroup = buildSessionMountUpdate(imGroup, sessionId, {
-      replyPolicy,
-    });
+    const updated: RegisteredGroup = buildSessionMountUpdate(
+      imGroup,
+      sessionId,
+      {
+        replyPolicy,
+      },
+    );
     applyBindingUpdate(imJid, updated);
     logger.info(
       { imJid, sessionId, userId: user.id },
@@ -3067,8 +3140,12 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   const activationMode =
     typeof rawActivationMode === 'string' &&
     VALID_ACTIVATION_MODES.has(rawActivationMode)
-      ? (rawActivationMode as typeof rawActivationMode &
-          'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled')
+      ? (rawActivationMode as
+          | (typeof rawActivationMode & 'auto')
+          | 'always'
+          | 'when_mentioned'
+          | 'owner_mentioned'
+          | 'disabled')
       : undefined;
 
   // Parse owner_im_id for owner_mentioned mode
@@ -3092,6 +3169,15 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       imJid,
       imGroup,
     );
+    if (!threadCapable) {
+      return c.json(
+        {
+          error:
+            'Only topic/thread channels can bind to a workspace; ordinary channels must bind to a session',
+        },
+        400,
+      );
+    }
 
     const force = body.force === true;
     const replyPolicy =
@@ -3107,7 +3193,10 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     }
     if (targetGroup.conversation_source === 'feishu_thread' && !threadCapable) {
       return c.json(
-        { error: 'Topic workspaces only accept Feishu topic/thread group bindings' },
+        {
+          error:
+            'Topic workspaces only accept Feishu topic/thread group bindings',
+        },
         400,
       );
     }
@@ -3129,16 +3218,11 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     }
 
     const updated: RegisteredGroup = {
-      ...buildWorkspaceMountUpdate(
-        imGroup,
-        targetMainJid,
-        threadCapable ? 'thread_map' : 'single_session',
-        {
-          replyPolicy,
-          ...(activationMode !== undefined ? { activationMode } : {}),
-          ...(ownerImId !== undefined ? { ownerImId } : {}),
-        },
-      ),
+      ...buildWorkspaceMountUpdate(imGroup, targetMainJid, 'thread_map', {
+        replyPolicy,
+        ...(activationMode !== undefined ? { activationMode } : {}),
+        ...(ownerImId !== undefined ? { ownerImId } : {}),
+      }),
       feishu_chat_mode: feishuInfo?.chat_mode ?? imGroup.feishu_chat_mode,
       feishu_group_message_type:
         feishuInfo?.group_message_type ?? imGroup.feishu_group_message_type,
@@ -3162,7 +3246,9 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   if (activationMode !== undefined || ownerImId !== undefined) {
     const updated: RegisteredGroup = {
       ...imGroup,
-      ...(activationMode !== undefined ? { activation_mode: activationMode } : {}),
+      ...(activationMode !== undefined
+        ? { activation_mode: activationMode }
+        : {}),
       ...(ownerImId !== undefined ? { owner_im_id: ownerImId } : {}),
     };
     applyBindingUpdate(imJid, updated);
@@ -3174,7 +3260,10 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   }
 
   return c.json(
-    { error: 'Must provide target_main_jid, target_session_id, target_agent_id, activation_mode, or unbind' },
+    {
+      error:
+        'Must provide target_main_jid, target_session_id, target_agent_id, activation_mode, or unbind',
+    },
     400,
   );
 });

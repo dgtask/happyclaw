@@ -2,7 +2,6 @@ import { Hono } from 'hono';
 import type { Variables } from '../web-context.js';
 import {
   canAccessGroup,
-  canManageGroupMembers,
   canModifyGroup,
   hasHostExecutionPermission,
   isHostExecutionGroup,
@@ -121,7 +120,6 @@ function serializeWorkspaceSummary(
       : undefined,
     channel_mount_count: inspectGovernance ? channelMounts.length : undefined,
     can_modify: canModifyGroup(user, group),
-    can_manage_members: canManageGroupMembers(user, group),
     created_at: workspace.created_at,
     updated_at: workspace.updated_at,
   };

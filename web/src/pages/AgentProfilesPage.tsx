@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { useLocation, useSearchParams } from 'react-router-dom';
 import {
   ArrowRight,
   Bot,
@@ -16,7 +17,6 @@ import {
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import {
   Select,
@@ -34,19 +34,22 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { api } from '../api/client';
+import { AgentPromptAssistant } from '../components/agents/AgentPromptAssistant';
 import { PolicyResourcePicker } from '../components/agents/PolicyResourcePicker';
 import { useAgentProfilesStore } from '../stores/agent-profiles';
+import { useAuthStore } from '../stores/auth';
 import { useSkillsStore } from '../stores/skills';
 import { useMcpServersStore } from '../stores/mcp-servers';
-import type {
-  ProvidersListResponse,
-  ProviderWithHealth,
-} from '../components/settings/types';
-import type { AgentProfileRuntimePolicy } from '../types';
+import {
+  getAgentContextSource,
+  type AgentContextSource,
+  type AgentProfileRuntimePolicy,
+} from '../types';
+import { getCustomAgentProfiles } from '../utils/agent-product';
 
 const DEFAULT_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
   provider_id: null,
+  context: { source: 'managed' },
   skills: { mode: 'inherit', ids: [] },
   mcp: { mode: 'inherit', ids: [] },
   tools: { mode: 'inherit' },
@@ -59,7 +62,8 @@ function normalizeRuntimePolicy(
   policy?: Partial<AgentProfileRuntimePolicy> | null,
 ): AgentProfileRuntimePolicy {
   return {
-    provider_id: policy?.provider_id?.trim() || null,
+    provider_id: null,
+    context: { source: getAgentContextSource(policy) },
     skills: {
       mode: policy?.skills?.mode ?? 'inherit',
       ids: policy?.skills?.ids ?? [],
@@ -85,6 +89,9 @@ function sameRuntimePolicy(
 }
 
 export function AgentProfilesPage() {
+  const location = useLocation();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requestedProfileId = searchParams.get('agent');
   const {
     profiles,
     loading,
@@ -106,7 +113,8 @@ export function AgentProfilesPage() {
   const [name, setName] = useState('');
   const [identityPrompt, setIdentityPrompt] = useState('');
   const [includeClaudePreset, setIncludeClaudePreset] = useState(true);
-  const [policyProviderId, setPolicyProviderId] = useState('');
+  const [contextSource, setContextSource] =
+    useState<AgentContextSource>('managed');
   const [skillsMode, setSkillsMode] = useState<RuntimePolicyMode>('inherit');
   const [skillIds, setSkillIds] = useState<string[]>([]);
   const [mcpMode, setMcpMode] = useState<RuntimePolicyMode>('inherit');
@@ -117,9 +125,6 @@ export function AgentProfilesPage() {
   const [deleting, setDeleting] = useState(false);
   const [generatingDraft, setGeneratingDraft] = useState(false);
   const [createDescription, setCreateDescription] = useState('');
-  const [providers, setProviders] = useState<ProviderWithHealth[]>([]);
-  const [providersLoading, setProvidersLoading] = useState(true);
-  const [providersError, setProvidersError] = useState<string | null>(null);
   const [movingWorkspaceJid, setMovingWorkspaceJid] = useState<string | null>(
     null,
   );
@@ -128,6 +133,13 @@ export function AgentProfilesPage() {
   >({});
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [deleteTargetId, setDeleteTargetId] = useState('');
+  const [createPanelOpen, setCreatePanelOpen] = useState(false);
+  const isAdmin = useAuthStore((state) => state.user?.role === 'admin');
+
+  const customProfiles = useMemo(
+    () => getCustomAgentProfiles(profiles),
+    [profiles],
+  );
 
   const skills = useSkillsStore((state) => state.skills);
   const skillsLoading = useSkillsStore((state) => state.loading);
@@ -138,67 +150,87 @@ export function AgentProfilesPage() {
   const mcpError = useMcpServersStore((state) => state.error);
   const loadMcpServers = useMcpServersStore((state) => state.loadServers);
 
-  const loadProviders = useCallback(async () => {
-    setProvidersLoading(true);
-    setProvidersError(null);
-    try {
-      const data = await api.get<ProvidersListResponse>(
-        '/api/config/claude/providers',
-      );
-      setProviders(data.providers.filter((provider) => provider.enabled));
-    } catch (err) {
-      setProvidersError(getErrorMessage(err, 'Provider 目录加载失败'));
-    } finally {
-      setProvidersLoading(false);
-    }
-  }, []);
-
   useEffect(() => {
     void loadProfiles();
   }, [loadProfiles]);
 
   useEffect(() => {
-    void loadProviders();
     void loadSkills();
     void loadMcpServers();
-  }, [loadMcpServers, loadProviders, loadSkills]);
+  }, [loadMcpServers, loadSkills]);
 
   useEffect(() => {
     if (draftMode) return;
-    if (selectedId && profiles.some((profile) => profile.id === selectedId)) {
+    if (
+      requestedProfileId &&
+      customProfiles.some((profile) => profile.id === requestedProfileId)
+    ) {
+      if (selectedId !== requestedProfileId) {
+        setSelectedId(requestedProfileId);
+      }
       return;
     }
-    const defaultProfile =
-      profiles.find((profile) => profile.is_default) ?? profiles[0];
-    if (defaultProfile) setSelectedId(defaultProfile.id);
-  }, [draftMode, profiles, selectedId]);
+    if (
+      selectedId &&
+      customProfiles.some((profile) => profile.id === selectedId)
+    ) {
+      if (requestedProfileId && requestedProfileId !== selectedId) {
+        setSearchParams({ agent: selectedId }, { replace: true });
+      }
+      return;
+    }
+    const fallbackId = customProfiles[0]?.id ?? null;
+    setSelectedId(fallbackId);
+    if (requestedProfileId) {
+      setSearchParams(fallbackId ? { agent: fallbackId } : {}, {
+        replace: true,
+      });
+    }
+  }, [
+    customProfiles,
+    draftMode,
+    requestedProfileId,
+    selectedId,
+    setSearchParams,
+  ]);
 
   const selected = useMemo(
-    () => profiles.find((profile) => profile.id === selectedId) ?? null,
-    [profiles, selectedId],
+    () => customProfiles.find((profile) => profile.id === selectedId) ?? null,
+    [customProfiles, selectedId],
   );
+
+  useEffect(() => {
+    if (!selected || location.hash !== '#agent-capabilities') return;
+    const frame = requestAnimationFrame(() => {
+      document
+        .getElementById('agent-capabilities')
+        ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [location.hash, selected]);
 
   const applyRuntimePolicyToForm = (
     policy?: AgentProfileRuntimePolicy | null,
   ) => {
     const normalized = normalizeRuntimePolicy(policy);
-    setPolicyProviderId(normalized.provider_id ?? '');
     setSkillsMode(normalized.skills.mode);
     setSkillIds(normalized.skills.ids);
     setMcpMode(normalized.mcp.mode);
     setMcpIds(normalized.mcp.ids);
     setToolsMode(normalized.tools.mode);
+    setContextSource(getAgentContextSource(normalized));
   };
 
   const currentRuntimePolicy = useMemo(
     () =>
       normalizeRuntimePolicy({
-        provider_id: policyProviderId,
+        provider_id: null,
+        context: { source: contextSource },
         skills: { mode: skillsMode, ids: skillIds },
         mcp: { mode: mcpMode, ids: mcpIds },
         tools: { mode: toolsMode },
       }),
-    [mcpIds, mcpMode, policyProviderId, skillIds, skillsMode, toolsMode],
+    [contextSource, mcpIds, mcpMode, skillIds, skillsMode, toolsMode],
   );
 
   useEffect(() => {
@@ -238,6 +270,27 @@ export function AgentProfilesPage() {
       !includeClaudePreset ||
       !sameRuntimePolicy(currentRuntimePolicy, DEFAULT_RUNTIME_POLICY));
   const hasUnsavedChanges = dirty || draftDirty;
+
+  useEffect(() => {
+    if (searchParams.get('create') !== '1') return;
+    const next = new URLSearchParams(searchParams);
+    next.delete('create');
+    if (
+      hasUnsavedChanges &&
+      !confirm('当前 Agent 有未保存修改，继续会丢失。是否继续？')
+    ) {
+      setSearchParams(next, { replace: true });
+      return;
+    }
+    setDraftMode(true);
+    setSelectedId(null);
+    setName('');
+    setIdentityPrompt('');
+    setIncludeClaudePreset(true);
+    applyRuntimePolicyToForm(DEFAULT_RUNTIME_POLICY);
+    setCreatePanelOpen(false);
+    setSearchParams(next, { replace: true });
+  }, [hasUnsavedChanges, searchParams, setSearchParams]);
 
   useEffect(() => {
     if (!hasUnsavedChanges) return;
@@ -329,6 +382,7 @@ export function AgentProfilesPage() {
     if (!confirmDiscardUnsavedChanges()) return;
     setDraftMode(false);
     setSelectedId(profileId);
+    setSearchParams({ agent: profileId }, { replace: true });
   };
 
   const handleRefreshProfiles = () => {
@@ -349,6 +403,7 @@ export function AgentProfilesPage() {
       setIdentityPrompt(draft.identity_prompt);
       setIncludeClaudePreset(true);
       applyRuntimePolicyToForm(DEFAULT_RUNTIME_POLICY);
+      setCreatePanelOpen(false);
       toast.success('已生成 Agent 配置');
     } catch (err) {
       toast.error(getErrorMessage(err, '生成失败'));
@@ -365,13 +420,13 @@ export function AgentProfilesPage() {
     setIdentityPrompt('');
     setIncludeClaudePreset(true);
     applyRuntimePolicyToForm(DEFAULT_RUNTIME_POLICY);
+    setCreatePanelOpen(false);
   };
 
   const handleDiscardDraft = () => {
     if (draftDirty && !confirm('确认放弃当前 Agent 草稿？')) return;
     setDraftMode(false);
-    const fallback =
-      profiles.find((profile) => profile.is_default) ?? profiles[0];
+    const fallback = customProfiles[0];
     setSelectedId(fallback?.id ?? null);
   };
 
@@ -389,6 +444,7 @@ export function AgentProfilesPage() {
       setCreateDescription('');
       setDraftMode(false);
       setSelectedId(profile.id);
+      setSearchParams({ agent: profile.id }, { replace: true });
       toast.success('已创建 Agent');
     } catch (err) {
       toast.error(getErrorMessage(err, '创建失败'));
@@ -445,8 +501,11 @@ export function AgentProfilesPage() {
   const deleteSelectedProfile = async () => {
     if (!selected) return;
     await deleteProfile(selected.id);
-    const fallback = profiles.find((profile) => profile.is_default);
+    const fallback = customProfiles.find(
+      (profile) => profile.id !== selected.id,
+    );
     setSelectedId(fallback?.id ?? null);
+    setSearchParams(fallback ? { agent: fallback.id } : {}, { replace: true });
     toast.success('已删除');
   };
 
@@ -458,9 +517,10 @@ export function AgentProfilesPage() {
       const latestGovernance = await loadProfileGovernance(selected.id);
       if (latestGovernance.workspaces.length > 0) {
         const fallback =
+          customProfiles.find((profile) => profile.id !== selected.id) ??
           profiles.find(
             (profile) => profile.id !== selected.id && profile.is_default,
-          ) ?? profiles.find((profile) => profile.id !== selected.id);
+          );
         if (!fallback) {
           toast.error('没有可迁移工作区的目标 Agent');
           return;
@@ -470,7 +530,7 @@ export function AgentProfilesPage() {
         return;
       }
       if (latestGovernance.channel_mounts.length > 0) {
-        toast.error('该 Agent 仍有消息挂载，请先在“消息挂载”页面解绑或换绑');
+        toast.error('该 Agent 仍有渠道绑定，请先在“渠道绑定”页面解绑或换绑');
         return;
       }
       if (!confirm(`确认删除 Agent「${selected.name}」？`)) return;
@@ -504,164 +564,223 @@ export function AgentProfilesPage() {
   };
 
   return (
-    <div className="min-h-full bg-background p-4 lg:p-8">
-      <div className="mx-auto max-w-7xl space-y-4">
-        <Card>
-          <CardContent>
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex min-w-0 items-center gap-3">
-                <div className="rounded-lg bg-brand-100 p-2">
-                  <Bot className="h-5 w-5 text-primary" />
-                </div>
-                <div className="min-w-0">
-                  <h1 className="text-2xl font-bold text-foreground">Agent</h1>
-                  <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                    <span>{profiles.length} 个 Agent</span>
-                  </div>
-                </div>
+    <div className="min-h-full bg-background lg:flex">
+      <aside className="border-b border-border bg-muted/20 lg:sticky lg:top-0 lg:flex lg:h-dvh lg:w-72 lg:flex-none lg:flex-col lg:border-b-0 lg:border-r">
+        <div className="flex items-center gap-3 px-4 py-4 lg:px-5 lg:pt-6">
+          <div className="min-w-0 flex-1">
+            <h1 className="text-lg font-semibold text-foreground">
+              自定义 Agent
+            </h1>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              {customProfiles.length} 个 Agent
+            </p>
+          </div>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={handleRefreshProfiles}
+            disabled={loading}
+            aria-label="刷新 Agent 列表"
+            title="刷新 Agent 列表"
+          >
+            <RefreshCw
+              className={loading ? 'h-4 w-4 animate-spin' : 'h-4 w-4'}
+            />
+          </Button>
+          <Button
+            size="sm"
+            onClick={() => setCreatePanelOpen((open) => !open)}
+            aria-expanded={createPanelOpen}
+          >
+            <Plus className="h-4 w-4" />
+            新建
+          </Button>
+        </div>
+
+        {createPanelOpen && (
+          <div className="mx-3 mb-3 space-y-3 rounded-xl border border-border bg-background p-3 lg:mx-4">
+            <div>
+              <div className="text-sm font-medium text-foreground">
+                创建 Agent
               </div>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                描述它的角色，AI 会生成名称和身份提示词。
+              </p>
+            </div>
+            <label className="block">
+              <span className="sr-only">Agent 角色描述</span>
+              <Textarea
+                value={createDescription}
+                onChange={(event) => setCreateDescription(event.target.value)}
+                className="min-h-[88px] resize-y text-sm leading-5"
+                placeholder="例如：帮我做代码评审，重点关注架构风险和测试缺口。"
+              />
+            </label>
+            <div className="grid grid-cols-2 gap-2">
+              <Button
+                className="justify-center"
+                onClick={handleGenerateDraft}
+                disabled={generatingDraft || !createDescription.trim()}
+              >
+                {generatingDraft ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Wand2 className="h-4 w-4" />
+                )}
+                AI 生成
+              </Button>
+              <Button
+                variant="outline"
+                className="justify-center"
+                onClick={handleBlankDraft}
+              >
+                空白创建
+              </Button>
+            </div>
+          </div>
+        )}
+
+        <nav
+          aria-label="自定义 Agent 列表"
+          className="flex gap-2 overflow-x-auto px-3 pb-4 lg:block lg:min-h-0 lg:flex-1 lg:space-y-1 lg:overflow-y-auto lg:px-4"
+        >
+          {draftMode && (
+            <button
+              className="flex min-w-[220px] items-center gap-3 rounded-lg bg-brand-50 px-3 py-2.5 text-left ring-1 ring-inset ring-primary/20 transition-colors lg:min-w-0 lg:w-full"
+              onClick={() => setDraftMode(true)}
+            >
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm font-semibold text-foreground">
+                  {name.trim() || '新 Agent 草稿'}
+                </span>
+                <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">
+                  尚未保存
+                </span>
+              </span>
+              <Badge variant="secondary">草稿</Badge>
+            </button>
+          )}
+          {loading && customProfiles.length === 0 ? (
+            <div className="flex min-w-48 justify-center py-8 lg:min-w-0">
+              <Loader2 className="h-6 w-6 animate-spin text-primary" />
+            </div>
+          ) : profilesError ? (
+            <div className="min-w-56 space-y-3 py-4 text-center lg:min-w-0">
+              <div className="text-sm text-error">{profilesError}</div>
               <Button
                 variant="outline"
                 size="sm"
                 onClick={handleRefreshProfiles}
-                disabled={loading}
               >
-                <RefreshCw
-                  className={loading ? 'h-4 w-4 animate-spin' : 'h-4 w-4'}
-                />
-                刷新
+                重试
               </Button>
             </div>
-          </CardContent>
-        </Card>
-
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[320px_1fr]">
-          <Card>
-            <CardContent>
-              <div className="mb-4 space-y-3 rounded-lg border bg-muted/20 p-3">
-                <Textarea
-                  value={createDescription}
-                  onChange={(event) => setCreateDescription(event.target.value)}
-                  className="min-h-[96px] resize-y text-sm leading-5"
-                  placeholder="用一段话描述你想要的 Agent，例如：帮我做代码评审，重点看架构风险、测试缺口和上线风险，回答要直接给结论。"
-                />
-                <Button
-                  variant="outline"
-                  className="w-full justify-center"
-                  onClick={handleGenerateDraft}
-                  disabled={generatingDraft || !createDescription.trim()}
+          ) : (
+            customProfiles.map((profile) => {
+              const active = profile.id === selectedId;
+              return (
+                <button
+                  key={profile.id}
+                  onClick={() => handleSelectProfile(profile.id)}
+                  className={`flex min-w-[220px] items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring lg:min-w-0 lg:w-full ${
+                    active && !draftMode
+                      ? 'bg-brand-50 text-foreground ring-1 ring-inset ring-primary/15'
+                      : 'hover:bg-accent/70'
+                  }`}
                 >
-                  {generatingDraft ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Wand2 className="h-4 w-4" />
-                  )}
-                  AI 生成并填入右侧
-                </Button>
-                <Button
-                  variant="ghost"
-                  className="w-full justify-center"
-                  onClick={handleBlankDraft}
-                >
-                  <Plus className="h-4 w-4" />
-                  新建空白 Agent
-                </Button>
-              </div>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-semibold text-foreground">
+                      {profile.name}
+                    </span>
+                    <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">
+                      {profile.identity_prompt.replace(/\s+/g, ' ').trim() ||
+                        '尚未设置身份描述'}
+                    </span>
+                  </span>
+                </button>
+              );
+            })
+          )}
+        </nav>
+      </aside>
 
-              <div className="space-y-2">
-                {draftMode && (
-                  <button
-                    className="w-full rounded-lg border border-primary bg-brand-50 px-3 py-2 text-left transition-colors"
-                    onClick={() => setDraftMode(true)}
-                  >
-                    <div className="flex min-w-0 items-center gap-2">
-                      <span className="truncate text-sm font-medium text-foreground">
-                        {name.trim() || '新 Agent 草稿'}
-                      </span>
-                      <Badge variant="secondary">草稿</Badge>
-                    </div>
-                  </button>
-                )}
-                {loading && profiles.length === 0 ? (
-                  <div className="flex justify-center py-8">
-                    <Loader2 className="h-6 w-6 animate-spin text-primary" />
-                  </div>
-                ) : profilesError ? (
-                  <div className="space-y-3 py-4 text-center">
-                    <div className="text-sm text-error">{profilesError}</div>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={handleRefreshProfiles}
-                    >
-                      重试
-                    </Button>
-                  </div>
-                ) : (
-                  profiles.map((profile) => {
-                    const active = profile.id === selectedId;
-                    return (
-                      <button
-                        key={profile.id}
-                        onClick={() => handleSelectProfile(profile.id)}
-                        className={`w-full rounded-lg border px-3 py-2 text-left transition-colors ${
-                          active && !draftMode
-                            ? 'border-primary bg-brand-50'
-                            : 'border-border hover:bg-muted/50'
-                        }`}
-                      >
-                        <div className="flex min-w-0 items-center gap-2">
-                          <span className="truncate text-sm font-medium text-foreground">
-                            {profile.name}
-                          </span>
-                          {profile.is_default && (
-                            <Badge variant="secondary">默认</Badge>
-                          )}
-                          <span className="text-[11px] text-muted-foreground">
-                            v{profile.version}
-                          </span>
-                        </div>
-                      </button>
-                    );
-                  })
-                )}
+      <main className="min-w-0 flex-1">
+        <div className="mx-auto max-w-5xl p-4 pb-24 sm:p-6 sm:pb-24 lg:p-8">
+          {!selected && !draftMode ? (
+            <div className="flex min-h-[420px] flex-col items-center justify-center rounded-xl border border-dashed border-border px-6 text-center">
+              <div className="grid h-12 w-12 place-items-center rounded-full bg-muted text-muted-foreground">
+                <Bot className="h-5 w-5" />
               </div>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardContent>
-              {!selected && !draftMode ? (
-                <div className="flex min-h-[420px] items-center justify-center text-sm text-muted-foreground">
-                  选择一个 Agent
+              <div className="mt-4 text-sm font-medium text-foreground">
+                {customProfiles.length === 0
+                  ? '还没有自定义 Agent'
+                  : '选择一个 Agent'}
+              </div>
+              <p className="mt-1 max-w-sm text-xs leading-5 text-muted-foreground">
+                {customProfiles.length === 0
+                  ? '创建一个专门处理特定任务的 Agent。'
+                  : '从左侧选择 Agent 查看配置，或创建一个新的 Agent。'}
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-6">
+              <header>
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h1 className="truncate text-2xl font-semibold tracking-tight text-foreground">
+                      {name.trim() || '新 Agent'}
+                    </h1>
+                    {draftMode && <Badge variant="secondary">草稿</Badge>}
+                    {hasUnsavedChanges && (
+                      <Badge variant="outline">有未保存修改</Badge>
+                    )}
+                  </div>
+                  <p className="mt-1.5 max-w-2xl text-sm leading-6 text-muted-foreground">
+                    管理 Agent 的身份和能力，以及所属工作区和消息渠道。
+                  </p>
                 </div>
-              ) : (
+              </header>
+
+              <div className="space-y-5">
                 <div className="space-y-5">
-                  <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
-                    <div className="space-y-4">
+                  <section className="overflow-hidden rounded-xl border border-border bg-card">
+                    <div className="border-b border-border px-5 py-4">
+                      <h2 className="text-sm font-semibold text-foreground">
+                        身份
+                      </h2>
+                      <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                        定义这个 Agent
+                        如何称呼自己，以及它处理任务时遵循的角色设定。
+                      </p>
+                    </div>
+                    <div className="space-y-4 px-5 py-5">
                       <div>
-                        <label className="mb-2 flex items-center gap-2 text-sm font-medium">
+                        <label
+                          htmlFor="agent-profile-name"
+                          className="mb-2 flex items-center gap-2 text-sm font-medium"
+                        >
                           名称
-                          {draftMode && <Badge variant="secondary">草稿</Badge>}
-                          {hasUnsavedChanges && (
-                            <Badge variant="outline">未保存</Badge>
-                          )}
                         </label>
                         <Input
+                          id="agent-profile-name"
                           value={name}
                           onChange={(event) => setName(event.target.value)}
                         />
                       </div>
                       <div>
-                        <label className="mb-2 block text-sm font-medium">
+                        <label
+                          htmlFor="agent-profile-identity-prompt"
+                          className="mb-2 block text-sm font-medium"
+                        >
                           身份提示词
                         </label>
                         <Textarea
+                          id="agent-profile-identity-prompt"
                           value={identityPrompt}
                           onChange={(event) =>
                             setIdentityPrompt(event.target.value)
                           }
-                          className="min-h-[260px] resize-y font-mono text-sm leading-6"
+                          className="min-h-[180px] resize-y text-sm leading-6"
                           placeholder="例如：你是一个偏产品架构的工程 Agent，回答时先明确边界，再给可执行方案。"
                         />
                       </div>
@@ -681,506 +800,474 @@ export function AgentProfilesPage() {
                           aria-label="包含 Claude Code 原生提示词"
                         />
                       </div>
-                      <div className="space-y-4 rounded-lg border bg-muted/20 px-3 py-3">
-                        <div>
-                          <div className="text-sm font-medium text-foreground">
-                            运行策略
+                      {isAdmin && (
+                        <div className="flex items-start justify-between gap-4 rounded-lg border bg-muted/20 px-3 py-3">
+                          <div className="min-w-0">
+                            <div className="text-sm font-medium text-foreground">
+                              继承宿主机 Claude Code 配置
+                            </div>
+                            <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                              将 ~/.claude/ 作为这个 Agent
+                              的基础上下文。无论工作区运行在 Docker
+                              还是宿主机，该设置都会生效；HappyClaw 管理的
+                              Skills 与 MCP 仍会作为附加能力生效。
+                            </div>
                           </div>
-                          <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                            策略在 Agent
-                            启动新运行态时生效；已运行的会话会在保存后由服务端失效并重建。
-                          </div>
-                        </div>
-
-                        <div className="min-w-0">
-                          <label className="mb-1.5 block text-xs font-medium text-muted-foreground">
-                            Provider
-                          </label>
-                          <Select
-                            value={policyProviderId || '__inherit__'}
-                            onValueChange={(value) =>
-                              setPolicyProviderId(
-                                value === '__inherit__' ? '' : value,
+                          <Switch
+                            checked={contextSource === 'host_claude'}
+                            onCheckedChange={(checked) =>
+                              setContextSource(
+                                checked ? 'host_claude' : 'managed',
                               )
                             }
-                            disabled={providersLoading}
-                          >
-                            <SelectTrigger>
-                              <SelectValue placeholder="跟随全局负载均衡" />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="__inherit__">
-                                跟随全局负载均衡
-                              </SelectItem>
-                              {policyProviderId &&
-                                !providers.some(
-                                  (provider) =>
-                                    provider.id === policyProviderId,
-                                ) && (
-                                  <SelectItem value={policyProviderId}>
-                                    {policyProviderId}（当前不可用）
-                                  </SelectItem>
-                                )}
-                              {providers.map((provider) => (
-                                <SelectItem
-                                  key={provider.id}
-                                  value={provider.id}
-                                >
-                                  {provider.name} ·{' '}
-                                  {provider.anthropicModel || '默认模型'}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                          {providersLoading ? (
-                            <div className="mt-1.5 text-[11px] text-muted-foreground">
-                              正在加载 Provider 目录
-                            </div>
-                          ) : providersError ? (
-                            <div className="mt-1.5 flex items-center gap-2 text-[11px] text-error">
-                              <span>{providersError}</span>
-                              <button
-                                className="underline"
-                                onClick={() => void loadProviders()}
-                              >
-                                重试
-                              </button>
-                            </div>
-                          ) : null}
+                            aria-label="继承宿主机 Claude Code 配置"
+                          />
                         </div>
+                      )}
+                    </div>
+                  </section>
 
-                        <div className="grid gap-4 xl:grid-cols-2">
-                          <div className="min-w-0 space-y-2">
-                            <label className="block text-xs font-medium text-muted-foreground">
-                              用户 Skills
-                            </label>
-                            <Select
-                              value={skillsMode}
-                              onValueChange={(value) =>
-                                setSkillsMode(value as RuntimePolicyMode)
-                              }
-                            >
-                              <SelectTrigger>
-                                <SelectValue />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value="inherit">
-                                  继承全部已启用用户 Skills
-                                </SelectItem>
-                                <SelectItem value="custom">
-                                  只允许所选用户 Skills
-                                </SelectItem>
-                                <SelectItem value="disabled">
-                                  禁用用户 Skills
-                                </SelectItem>
-                              </SelectContent>
-                            </Select>
-                            {skillsMode === 'custom' && (
-                              <PolicyResourcePicker
-                                label="允许目录"
-                                options={skillOptions}
-                                selectedIds={skillIds}
-                                onChange={setSkillIds}
-                                loading={skillsLoading}
-                                error={skillsError}
-                                emptyText="没有已启用的用户 Skill"
-                              />
-                            )}
-                            <p className="text-[11px] leading-5 text-muted-foreground">
-                              仅控制 HappyClaw 用户
-                              Skills；项目、外部与插件提供的 Skill
-                              不在该选择范围内，但 Skill
-                              的最终动作仍受下方能力边界约束。
-                            </p>
-                          </div>
+                  {!draftMode && selected && (
+                    <AgentPromptAssistant
+                      key={selected.id}
+                      profileId={selected.id}
+                      agentName={name.trim() || selected.name}
+                      currentPrompt={identityPrompt}
+                      onApply={setIdentityPrompt}
+                    />
+                  )}
 
-                          <div className="min-w-0 space-y-2">
-                            <label className="block text-xs font-medium text-muted-foreground">
-                              用户 MCP
-                            </label>
-                            <Select
-                              value={mcpMode}
-                              onValueChange={(value) =>
-                                setMcpMode(value as RuntimePolicyMode)
-                              }
-                            >
-                              <SelectTrigger>
-                                <SelectValue />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value="inherit">
-                                  继承全部已启用用户 MCP
-                                </SelectItem>
-                                <SelectItem value="custom">
-                                  只允许所选用户 MCP
-                                </SelectItem>
-                                <SelectItem value="disabled">
-                                  禁用用户 MCP
-                                </SelectItem>
-                              </SelectContent>
-                            </Select>
-                            {mcpMode === 'custom' && (
-                              <PolicyResourcePicker
-                                label="允许目录"
-                                options={mcpOptions}
-                                selectedIds={mcpIds}
-                                onChange={setMcpIds}
-                                loading={mcpLoading}
-                                error={mcpError}
-                                emptyText="没有已启用的用户 MCP"
-                              />
-                            )}
-                            <p className="text-[11px] leading-5 text-muted-foreground">
-                              仅控制用户 MCP
-                              目录；选择“只读”或“严格只读”能力边界时，用户 MCP
-                              会被统一关闭。
-                            </p>
-                          </div>
-                        </div>
-
-                        <div className="min-w-0">
-                          <label className="mb-1.5 block text-xs font-medium text-muted-foreground">
-                            工具与扩展能力边界
+                  <section
+                    id="agent-capabilities"
+                    className="scroll-mt-6 overflow-hidden rounded-xl border border-border bg-card"
+                  >
+                    <div className="border-b border-border px-5 py-4">
+                      <h2 className="text-sm font-semibold text-foreground">
+                        Agent 能力
+                      </h2>
+                      <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                        这里是能力的唯一配置入口；所属工作区统一继承。模型、Provider
+                        与凭据使用系统设置。
+                      </p>
+                    </div>
+                    <div className="space-y-5 px-5 py-5">
+                      <div className="grid gap-4 xl:grid-cols-2">
+                        <div className="min-w-0 space-y-2">
+                          <label className="block text-xs font-medium text-muted-foreground">
+                            Skills
                           </label>
                           <Select
-                            value={toolsMode}
+                            value={skillsMode}
                             onValueChange={(value) =>
-                              setToolsMode(value as ToolPolicyMode)
+                              setSkillsMode(value as RuntimePolicyMode)
                             }
                           >
-                            <SelectTrigger>
+                            <SelectTrigger aria-label="Agent Skills">
                               <SelectValue />
                             </SelectTrigger>
                             <SelectContent>
                               <SelectItem value="inherit">
-                                不增加 Agent 级限制
+                                使用全部已启用 Skills
                               </SelectItem>
-                              <SelectItem value="readonly">
-                                只读（禁写、Bash、子 Agent、用户 MCP 与插件）
+                              <SelectItem value="custom">
+                                只允许所选 Skills
                               </SelectItem>
-                              <SelectItem value="restricted">
-                                严格只读（在只读基础上禁用 WebSearch /
-                                WebFetch）
+                              <SelectItem value="disabled">
+                                关闭 Skills
                               </SelectItem>
                             </SelectContent>
                           </Select>
-                          <p className="mt-1.5 text-[11px] leading-5 text-muted-foreground">
-                            两种只读模式都会启用严格 MCP、关闭用户 MCP
-                            与用户插件、禁用写入/Bash/子
-                            Agent，并默认拒绝尚未分类的 HappyClaw
-                            工具；仅保留已分类的查询、记忆读取和消息回复等内置能力。严格只读再关闭网页搜索与抓取。
+                          {skillsMode === 'custom' && (
+                            <PolicyResourcePicker
+                              label="允许目录"
+                              options={skillOptions}
+                              selectedIds={skillIds}
+                              onChange={setSkillIds}
+                              loading={skillsLoading}
+                              error={skillsError}
+                              emptyText="没有已启用的用户 Skill"
+                            />
+                          )}
+                          <p className="text-[11px] leading-5 text-muted-foreground">
+                            选择这个 Agent 可以使用的用户 Skills；Skill
+                            的最终动作仍受下方能力边界约束。
+                          </p>
+                        </div>
+
+                        <div className="min-w-0 space-y-2">
+                          <label className="block text-xs font-medium text-muted-foreground">
+                            MCP
+                          </label>
+                          <Select
+                            value={mcpMode}
+                            onValueChange={(value) =>
+                              setMcpMode(value as RuntimePolicyMode)
+                            }
+                          >
+                            <SelectTrigger aria-label="Agent MCP">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="inherit">
+                                使用全部已启用 MCP
+                              </SelectItem>
+                              <SelectItem value="custom">
+                                只允许所选 MCP
+                              </SelectItem>
+                              <SelectItem value="disabled">关闭 MCP</SelectItem>
+                            </SelectContent>
+                          </Select>
+                          {mcpMode === 'custom' && (
+                            <PolicyResourcePicker
+                              label="允许目录"
+                              options={mcpOptions}
+                              selectedIds={mcpIds}
+                              onChange={setMcpIds}
+                              loading={mcpLoading}
+                              error={mcpError}
+                              emptyText="没有已启用的用户 MCP"
+                            />
+                          )}
+                          <p className="text-[11px] leading-5 text-muted-foreground">
+                            选择这个 Agent 可以连接的用户
+                            MCP；“只读”或“严格只读” 能力边界会统一关闭 MCP。
                           </p>
                         </div>
                       </div>
-                      {!draftMode && selected && (
-                        <div className="space-y-4 border-t pt-4">
-                          <div className="flex flex-wrap items-center justify-between gap-3">
-                            <div className="min-w-0">
-                              <div className="text-sm font-semibold text-foreground">
-                                治理概览
-                              </div>
-                              <div className="mt-1 text-xs text-muted-foreground">
-                                工作区、运行态会话和消息挂载的当前归属
-                              </div>
-                            </div>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() =>
-                                void loadProfileGovernance(selected.id)
-                              }
-                              disabled={governanceBusy}
-                            >
-                              <RefreshCw
-                                className={
-                                  governanceBusy
-                                    ? 'h-4 w-4 animate-spin'
-                                    : 'h-4 w-4'
-                                }
-                              />
-                              刷新
-                            </Button>
-                          </div>
 
-                          <div className="grid gap-3 sm:grid-cols-3">
-                            <div className="min-w-0 rounded-md bg-muted/30 px-3 py-2">
-                              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                                <Workflow className="h-3.5 w-3.5" />
-                                工作区
-                              </div>
-                              <div className="mt-1 text-lg font-semibold text-foreground">
-                                {governance?.workspaces.length ?? 0}
-                              </div>
-                            </div>
-                            <div className="min-w-0 rounded-md bg-muted/30 px-3 py-2">
-                              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                                <MessagesSquare className="h-3.5 w-3.5" />
-                                运行态会话
-                              </div>
-                              <div className="mt-1 text-lg font-semibold text-foreground">
-                                {governanceRuntimeSessionCount}
-                              </div>
-                            </div>
-                            <div className="min-w-0 rounded-md bg-muted/30 px-3 py-2">
-                              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                                <Link2 className="h-3.5 w-3.5" />
-                                IM 挂载
-                              </div>
-                              <div className="mt-1 text-lg font-semibold text-foreground">
-                                {governance?.channel_mounts.length ?? 0}
-                              </div>
-                            </div>
+                      <div className="min-w-0">
+                        <label className="mb-1.5 block text-xs font-medium text-muted-foreground">
+                          工具与扩展能力边界
+                        </label>
+                        <Select
+                          value={toolsMode}
+                          onValueChange={(value) =>
+                            setToolsMode(value as ToolPolicyMode)
+                          }
+                        >
+                          <SelectTrigger aria-label="工具与扩展能力边界">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="inherit">
+                              不增加 Agent 级限制
+                            </SelectItem>
+                            <SelectItem value="readonly">
+                              只读（禁写、Bash、子 Agent、用户 MCP 与插件）
+                            </SelectItem>
+                            <SelectItem value="restricted">
+                              严格只读（在只读基础上禁用 WebSearch / WebFetch）
+                            </SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <p className="mt-1.5 text-[11px] leading-5 text-muted-foreground">
+                          两种只读模式都会启用严格 MCP、关闭用户 MCP
+                          与用户插件、禁用写入/Bash/子
+                          Agent，并默认拒绝尚未分类的 HappyClaw
+                          工具；仅保留已分类的查询、记忆读取和消息回复等内置能力。严格只读再关闭网页搜索与抓取。
+                        </p>
+                      </div>
+                    </div>
+                  </section>
+                  {!draftMode && selected && (
+                    <section className="space-y-4 rounded-xl border border-border bg-card p-5">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="text-sm font-semibold text-foreground">
+                            治理概览
                           </div>
+                          <div className="mt-1 text-xs text-muted-foreground">
+                            工作区、运行态会话和渠道绑定的当前归属
+                          </div>
+                        </div>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() =>
+                            void loadProfileGovernance(selected.id)
+                          }
+                          disabled={governanceBusy}
+                        >
+                          <RefreshCw
+                            className={
+                              governanceBusy
+                                ? 'h-4 w-4 animate-spin'
+                                : 'h-4 w-4'
+                            }
+                          />
+                          刷新
+                        </Button>
+                      </div>
 
-                          {governanceError && !governance ? (
-                            <div className="flex flex-wrap items-center gap-3 rounded-md border border-error/30 bg-error-bg px-3 py-3 text-sm text-error">
-                              <span className="min-w-0 flex-1">
-                                {governanceError}
-                              </span>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() =>
-                                  void loadProfileGovernance(selected.id)
-                                }
-                              >
-                                重试
-                              </Button>
+                      <div className="grid gap-3 sm:grid-cols-3">
+                        <div className="min-w-0 rounded-md bg-muted/30 px-3 py-2">
+                          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                            <Workflow className="h-3.5 w-3.5" />
+                            工作区
+                          </div>
+                          <div className="mt-1 text-lg font-semibold text-foreground">
+                            {governance?.workspaces.length ?? 0}
+                          </div>
+                        </div>
+                        <div className="min-w-0 rounded-md bg-muted/30 px-3 py-2">
+                          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                            <MessagesSquare className="h-3.5 w-3.5" />
+                            运行态会话
+                          </div>
+                          <div className="mt-1 text-lg font-semibold text-foreground">
+                            {governanceRuntimeSessionCount}
+                          </div>
+                        </div>
+                        <div className="min-w-0 rounded-md bg-muted/30 px-3 py-2">
+                          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                            <Link2 className="h-3.5 w-3.5" />
+                            渠道绑定
+                          </div>
+                          <div className="mt-1 text-lg font-semibold text-foreground">
+                            {governance?.channel_mounts.length ?? 0}
+                          </div>
+                        </div>
+                      </div>
+
+                      {governanceError && !governance ? (
+                        <div className="flex flex-wrap items-center gap-3 rounded-md border border-error/30 bg-error-bg px-3 py-3 text-sm text-error">
+                          <span className="min-w-0 flex-1">
+                            {governanceError}
+                          </span>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() =>
+                              void loadProfileGovernance(selected.id)
+                            }
+                          >
+                            重试
+                          </Button>
+                        </div>
+                      ) : governanceBusy && !governance ? (
+                        <div className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          正在加载
+                        </div>
+                      ) : (
+                        <div className="grid gap-4 xl:grid-cols-2">
+                          <div className="min-w-0 space-y-2">
+                            <div className="text-xs font-medium text-muted-foreground">
+                              工作区与运行态会话
                             </div>
-                          ) : governanceBusy && !governance ? (
-                            <div className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
-                              <Loader2 className="h-4 w-4 animate-spin" />
-                              正在加载
-                            </div>
-                          ) : (
-                            <div className="grid gap-4 xl:grid-cols-2">
-                              <div className="min-w-0 space-y-2">
-                                <div className="text-xs font-medium text-muted-foreground">
-                                  工作区与运行态会话
+                            <div className="max-h-64 overflow-auto rounded-md border">
+                              {(governance?.workspaces.length ?? 0) === 0 ? (
+                                <div className="px-3 py-4 text-sm text-muted-foreground">
+                                  暂无工作区
                                 </div>
-                                <div className="max-h-64 overflow-auto rounded-md border">
-                                  {(governance?.workspaces.length ?? 0) ===
-                                  0 ? (
-                                    <div className="px-3 py-4 text-sm text-muted-foreground">
-                                      暂无工作区
-                                    </div>
-                                  ) : (
-                                    governance?.workspaces.map((workspace) => (
-                                      <div
-                                        key={workspace.jid}
-                                        className="border-b px-3 py-2 last:border-b-0"
-                                      >
-                                        <div className="flex min-w-0 items-center justify-between gap-2">
-                                          <div className="min-w-0">
-                                            <div className="truncate text-sm font-medium text-foreground">
-                                              {workspace.name}
-                                            </div>
-                                            <div className="truncate text-xs text-muted-foreground">
-                                              {workspace.folder}
-                                            </div>
-                                          </div>
-                                          <Badge variant="secondary">
-                                            {workspace.runtime_sessions.length}{' '}
-                                            个运行态会话
-                                          </Badge>
+                              ) : (
+                                governance?.workspaces.map((workspace) => (
+                                  <div
+                                    key={workspace.jid}
+                                    className="border-b px-3 py-2 last:border-b-0"
+                                  >
+                                    <div className="flex min-w-0 items-center justify-between gap-2">
+                                      <div className="min-w-0">
+                                        <div className="truncate text-sm font-medium text-foreground">
+                                          {workspace.name}
                                         </div>
-                                        {workspace.runtime_sessions.length >
-                                          0 && (
-                                          <div className="mt-2 space-y-1">
-                                            {workspace.runtime_sessions.map(
-                                              (session) => (
-                                                <div
-                                                  key={`${workspace.jid}:${session.runtime_agent_id || 'main'}`}
-                                                  className="truncate text-xs text-muted-foreground"
-                                                >
-                                                  {session.runtime_agent_id ||
-                                                    'main'}{' '}
-                                                  · v
-                                                  {session.agent_profile_version ??
-                                                    '-'}{' '}
-                                                  ·{' '}
-                                                  {session.sdk_session_id ||
-                                                    '-'}
-                                                </div>
-                                              ),
-                                            )}
-                                          </div>
+                                        <div className="truncate text-xs text-muted-foreground">
+                                          {workspace.folder}
+                                        </div>
+                                      </div>
+                                      <Badge variant="secondary">
+                                        {workspace.runtime_sessions.length}{' '}
+                                        个运行态会话
+                                      </Badge>
+                                    </div>
+                                    {workspace.runtime_sessions.length > 0 && (
+                                      <div className="mt-2 space-y-1">
+                                        {workspace.runtime_sessions.map(
+                                          (session) => (
+                                            <div
+                                              key={`${workspace.jid}:${session.runtime_agent_id || 'main'}`}
+                                              className="truncate text-xs text-muted-foreground"
+                                            >
+                                              {session.runtime_agent_id ||
+                                                'main'}{' '}
+                                              · {session.sdk_session_id || '-'}
+                                            </div>
+                                          ),
                                         )}
-                                        <div className="mt-2 flex items-center gap-2">
-                                          <Select
-                                            value={
-                                              workspaceMoveTargets[
-                                                workspace.jid
-                                              ] || ''
-                                            }
-                                            onValueChange={(value) =>
-                                              setWorkspaceMoveTargets(
-                                                (current) => ({
-                                                  ...current,
-                                                  [workspace.jid]: value,
-                                                }),
-                                              )
-                                            }
-                                          >
-                                            <SelectTrigger className="h-8 min-w-0 flex-1 text-xs">
-                                              <SelectValue placeholder="迁移到其他 Agent" />
-                                            </SelectTrigger>
-                                            <SelectContent>
-                                              {profiles
-                                                .filter(
-                                                  (profile) =>
-                                                    profile.id !== selected.id,
-                                                )
-                                                .map((profile) => (
-                                                  <SelectItem
-                                                    key={profile.id}
-                                                    value={profile.id}
-                                                  >
-                                                    {profile.name}
-                                                  </SelectItem>
-                                                ))}
-                                            </SelectContent>
-                                          </Select>
-                                          <Button
-                                            variant="outline"
-                                            size="sm"
-                                            className="h-8"
-                                            disabled={
-                                              movingWorkspaceJid ===
-                                                workspace.jid ||
-                                              !workspaceMoveTargets[
-                                                workspace.jid
-                                              ]
-                                            }
-                                            onClick={() =>
-                                              void handleMoveWorkspace(
-                                                workspace.jid,
-                                                workspaceMoveTargets[
-                                                  workspace.jid
-                                                ],
-                                              )
-                                            }
-                                          >
-                                            {movingWorkspaceJid ===
-                                            workspace.jid ? (
-                                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                            ) : (
-                                              <ArrowRight className="h-3.5 w-3.5" />
-                                            )}
-                                            迁移
-                                          </Button>
-                                        </div>
                                       </div>
-                                    ))
-                                  )}
-                                </div>
-                              </div>
-
-                              <div className="min-w-0 space-y-2">
-                                <div className="text-xs font-medium text-muted-foreground">
-                                  IM 挂载
-                                </div>
-                                <div className="max-h-64 overflow-auto rounded-md border">
-                                  {(governance?.channel_mounts.length ?? 0) ===
-                                  0 ? (
-                                    <div className="px-3 py-4 text-sm text-muted-foreground">
-                                      暂无 IM 挂载
-                                    </div>
-                                  ) : (
-                                    governance?.channel_mounts.map((mount) => (
-                                      <div
-                                        key={mount.channel_jid}
-                                        className="border-b px-3 py-2 last:border-b-0"
+                                    )}
+                                    <div className="mt-2 flex items-center gap-2">
+                                      <Select
+                                        value={
+                                          workspaceMoveTargets[workspace.jid] ||
+                                          ''
+                                        }
+                                        onValueChange={(value) =>
+                                          setWorkspaceMoveTargets(
+                                            (current) => ({
+                                              ...current,
+                                              [workspace.jid]: value,
+                                            }),
+                                          )
+                                        }
                                       >
-                                        <div className="flex min-w-0 items-center justify-between gap-2">
-                                          <div className="min-w-0">
-                                            <div className="truncate text-sm font-medium text-foreground">
-                                              {mount.channel_jid}
-                                            </div>
-                                            <div className="truncate text-xs text-muted-foreground">
-                                              {mount.workspace_folder ||
-                                                mount.workspace_jid}
-                                            </div>
-                                          </div>
-                                          <Badge variant="outline">
-                                            {mount.channel_type}
-                                          </Badge>
+                                        <SelectTrigger className="h-8 min-w-0 flex-1 text-xs">
+                                          <SelectValue placeholder="迁移到其他 Agent" />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                          {profiles
+                                            .filter(
+                                              (profile) =>
+                                                profile.id !== selected.id,
+                                            )
+                                            .map((profile) => (
+                                              <SelectItem
+                                                key={profile.id}
+                                                value={profile.id}
+                                              >
+                                                {profile.is_default
+                                                  ? '主 Agent'
+                                                  : profile.name}
+                                              </SelectItem>
+                                            ))}
+                                        </SelectContent>
+                                      </Select>
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        className="h-8"
+                                        disabled={
+                                          movingWorkspaceJid ===
+                                            workspace.jid ||
+                                          !workspaceMoveTargets[workspace.jid]
+                                        }
+                                        onClick={() =>
+                                          void handleMoveWorkspace(
+                                            workspace.jid,
+                                            workspaceMoveTargets[workspace.jid],
+                                          )
+                                        }
+                                      >
+                                        {movingWorkspaceJid ===
+                                        workspace.jid ? (
+                                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                        ) : (
+                                          <ArrowRight className="h-3.5 w-3.5" />
+                                        )}
+                                        迁移
+                                      </Button>
+                                    </div>
+                                  </div>
+                                ))
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="min-w-0 space-y-2">
+                            <div className="text-xs font-medium text-muted-foreground">
+                              渠道绑定
+                            </div>
+                            <div className="max-h-64 overflow-auto rounded-md border">
+                              {(governance?.channel_mounts.length ?? 0) ===
+                              0 ? (
+                                <div className="px-3 py-4 text-sm text-muted-foreground">
+                                  暂无渠道绑定
+                                </div>
+                              ) : (
+                                governance?.channel_mounts.map((mount) => (
+                                  <div
+                                    key={mount.channel_jid}
+                                    className="border-b px-3 py-2 last:border-b-0"
+                                  >
+                                    <div className="flex min-w-0 items-center justify-between gap-2">
+                                      <div className="min-w-0">
+                                        <div className="truncate text-sm font-medium text-foreground">
+                                          {mount.channel_jid}
                                         </div>
-                                        <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
-                                          <span>
-                                            {mount.session_id
-                                              ? `session ${mount.session_id}`
-                                              : 'main'}
-                                          </span>
-                                          <span>{mount.routing_mode}</span>
-                                          <span>{mount.reply_policy}</span>
+                                        <div className="truncate text-xs text-muted-foreground">
+                                          {mount.workspace_folder ||
+                                            mount.workspace_jid}
                                         </div>
                                       </div>
-                                    ))
-                                  )}
-                                </div>
-                              </div>
+                                      <Badge variant="outline">
+                                        {mount.channel_type}
+                                      </Badge>
+                                    </div>
+                                    <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
+                                      <span>
+                                        {mount.session_id
+                                          ? `session ${mount.session_id}`
+                                          : 'main'}
+                                      </span>
+                                      <span>{mount.routing_mode}</span>
+                                      <span>{mount.reply_policy}</span>
+                                    </div>
+                                  </div>
+                                ))
+                              )}
                             </div>
-                          )}
+                          </div>
                         </div>
                       )}
-                    </div>
-                    <div className="flex flex-wrap gap-2 lg:justify-end">
-                      {draftMode ? (
-                        <>
-                          <Button
-                            onClick={handleCreate}
-                            disabled={creating || !name.trim()}
-                          >
-                            {creating ? (
-                              <Loader2 className="h-4 w-4 animate-spin" />
-                            ) : (
-                              <Plus className="h-4 w-4" />
-                            )}
-                            创建 Agent
-                          </Button>
-                          <Button
-                            variant="outline"
-                            onClick={handleDiscardDraft}
-                          >
-                            <X className="h-4 w-4" />
-                            放弃草稿
-                          </Button>
-                        </>
-                      ) : (
-                        <>
-                          <Button
-                            onClick={handleSave}
-                            disabled={!dirty || saving || !name.trim()}
-                          >
-                            {saving ? (
-                              <Loader2 className="h-4 w-4 animate-spin" />
-                            ) : (
-                              <Save className="h-4 w-4" />
-                            )}
-                            保存
-                          </Button>
-                          <Button
-                            variant="outline"
-                            onClick={handleDelete}
-                            disabled={
-                              !selected || selected.is_default || deleting
-                            }
-                            className="text-error hover:bg-error-bg hover:text-error"
-                          >
-                            <Trash2 className="h-4 w-4" />
-                            删除
-                          </Button>
-                        </>
-                      )}
-                    </div>
-                  </div>
+                    </section>
+                  )}
                 </div>
-              )}
-            </CardContent>
-          </Card>
+                <div className="flex flex-wrap items-center gap-2 border-t border-border pt-5">
+                  <div className="mr-auto text-xs text-muted-foreground">
+                    {draftMode
+                      ? '完成配置后创建 Agent'
+                      : dirty
+                        ? '有未保存的修改'
+                        : '所有更改已保存'}
+                  </div>
+                  {draftMode ? (
+                    <>
+                      <Button
+                        onClick={handleCreate}
+                        disabled={creating || !name.trim()}
+                      >
+                        {creating ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Plus className="h-4 w-4" />
+                        )}
+                        创建 Agent
+                      </Button>
+                      <Button variant="outline" onClick={handleDiscardDraft}>
+                        <X className="h-4 w-4" />
+                        放弃草稿
+                      </Button>
+                    </>
+                  ) : (
+                    <>
+                      <Button
+                        onClick={handleSave}
+                        disabled={!dirty || saving || !name.trim()}
+                      >
+                        {saving ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Save className="h-4 w-4" />
+                        )}
+                        保存
+                      </Button>
+                      <Button
+                        variant="outline"
+                        onClick={handleDelete}
+                        disabled={!selected || selected.is_default || deleting}
+                        className="text-error hover:bg-error-bg hover:text-error"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                        删除
+                      </Button>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
         </div>
-      </div>
+      </main>
 
       <Dialog
         open={deleteDialogOpen}
@@ -1194,7 +1281,7 @@ export function AgentProfilesPage() {
             <p className="leading-6 text-muted-foreground">
               「{selected?.name}」仍归属 {governance?.workspaces.length ?? 0}{' '}
               个工作区。删除前必须把它们迁移到同一个目标
-              Agent；消息挂载会随工作区归属一起更新。
+              Agent；渠道绑定会随工作区归属一起更新。
             </p>
             <div>
               <label className="mb-1.5 block text-xs font-medium text-muted-foreground">
@@ -1213,8 +1300,7 @@ export function AgentProfilesPage() {
                     .filter((profile) => profile.id !== selected?.id)
                     .map((profile) => (
                       <SelectItem key={profile.id} value={profile.id}>
-                        {profile.name}
-                        {profile.is_default ? '（默认）' : ''}
+                        {profile.is_default ? '主 Agent' : profile.name}
                       </SelectItem>
                     ))}
                 </SelectContent>

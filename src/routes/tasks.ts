@@ -38,22 +38,6 @@ import { getChannelType, extractChatId } from '../im-channel.js';
 const tasksRoutes = new Hono<{ Variables: Variables }>();
 const MIN_INTERVAL_MS = 60 * 1000;
 
-/**
- * 防止共享工作区里 member A 改 / 跑 / 删 member B 的任务。admin 例外。
- * 历史 task.created_by=null 的任务只对 admin 可见，避免在共享工作区泄漏 prompt / logs。
- * 返回 null = 通过；返回 Response = 404（统一伪装为 not_found，避免泄漏存在性）。
- */
-function denyForeignTask(
-  c: any,
-  existing: { created_by?: string | null },
-  authUser: AuthUser,
-): Response | null {
-  if (authUser.role === 'admin') return null;
-  if (!existing.created_by) return c.json({ error: 'Task not found' }, 404);
-  if (existing.created_by === authUser.id) return null;
-  return c.json({ error: 'Task not found' }, 404);
-}
-
 // --- Routes ---
 
 tasksRoutes.get('/', authMiddleware, async (c) => {
@@ -62,11 +46,6 @@ tasksRoutes.get('/', authMiddleware, async (c) => {
   const tasks = getAllTasks().filter((task) => {
     // Host-mode tasks are only visible to admin
     if (task.execution_mode === 'host' && authUser.role !== 'admin') {
-      return false;
-    }
-    // Tasks are user-owned. Shared workspace membership does not grant
-    // visibility into another member's task prompt, logs, or run status.
-    if (authUser.role !== 'admin' && task.created_by !== authUser.id) {
       return false;
     }
     const group = allGroups[task.chat_jid];
@@ -281,10 +260,6 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
       );
     }
   }
-  {
-    const denial = denyForeignTask(c, existing, authUser);
-    if (denial) return denial;
-  }
   const body = await c.req.json().catch(() => ({}));
 
   const validation = TaskPatchSchema.safeParse(body);
@@ -479,10 +454,6 @@ tasksRoutes.delete('/:id', authMiddleware, (c) => {
       );
     }
   }
-  {
-    const denial = denyForeignTask(c, existing, authUser);
-    if (denial) return denial;
-  }
   // Only admin can delete script tasks
   if (existing.execution_type === 'script' && authUser.role !== 'admin') {
     return c.json({ error: '只有管理员可以删除脚本类型任务' }, 403);
@@ -545,11 +516,6 @@ tasksRoutes.post('/:id/run', authMiddleware, (c) => {
       );
     }
   }
-  {
-    const denial = denyForeignTask(c, existing, authUser);
-    if (denial) return denial;
-  }
-
   // Only admin can run script tasks
   if (existing.execution_type === 'script' && authUser.role !== 'admin') {
     return c.json({ error: '只有管理员可以运行脚本类型任务' }, 403);
@@ -584,12 +550,6 @@ tasksRoutes.get('/:id/logs', authMiddleware, (c) => {
         403,
       );
     }
-  }
-  // 与 PATCH/DELETE/RUN 对齐：shared workspace 中 member A 不应能读
-  // member B 的任务日志（含 prompt、stderr、tool 输出）。
-  {
-    const denial = denyForeignTask(c, existing, authUser);
-    if (denial) return denial;
   }
   const limitRaw = parseInt(c.req.query('limit') || '20', 10);
   const limit = Math.min(

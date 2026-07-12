@@ -1,13 +1,10 @@
 /**
  * Verifies Sub-Agent CRUD (create / rename / delete) requires workspace
- * ownership (canModifyGroup), while the read route (GET) still allows shared
- * members (canAccessGroup).
+ * ownership (canModifyGroup).
  *
  * Coverage matrix:
  *   - owner        → POST creates a conversation (200)
- *   - shared member → POST / PATCH / DELETE return 403 (owner-only)
- *   - shared member → GET still 200
- *   - non-member   → POST returns 404 (group hidden by canAccessGroup)
+ *   - non-owner → routes return 404 (group hidden by canAccessGroup)
  *
  * Mirrors tests/routes-workspace-config-acl.test.ts. web.js's broadcast is
  * mocked so the success path doesn't pull in the full Hono app / WebSocket.
@@ -67,7 +64,6 @@ const db = await import('../src/db.js');
 const agentRoutes = agentRoutesModule.default;
 
 const OWNER_ID = 'alice';
-const MEMBER_ID = 'bob';
 const OUTSIDER_ID = 'charlie';
 const GROUP_JID = 'web:agents-acl-group';
 const GROUP_FOLDER = 'agents-acl-group';
@@ -81,8 +77,6 @@ function seedTestGroup(): void {
     created_by: OWNER_ID,
     is_home: false,
   } as any);
-  db.addGroupMember(GROUP_FOLDER, OWNER_ID, 'owner');
-  db.addGroupMember(GROUP_FOLDER, MEMBER_ID, 'member');
 }
 
 function asUser(userId: string, role: 'admin' | 'member' = 'member'): void {
@@ -97,12 +91,6 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
-  try {
-    db.removeGroupMember(GROUP_FOLDER, OWNER_ID);
-    db.removeGroupMember(GROUP_FOLDER, MEMBER_ID);
-  } catch {
-    /* ignore */
-  }
   try {
     db.deleteRegisteredGroup(GROUP_JID);
   } catch {
@@ -198,41 +186,6 @@ describe('agents CRUD ACL', () => {
     expect(body.agent?.name).toBe('My conversation');
   });
 
-  test('shared member is denied POST (403, owner-only)', async () => {
-    seedTestGroup();
-    asUser(MEMBER_ID);
-
-    const { status, body } = await postAgent({ name: 'Nope' });
-    expect(status).toBe(403);
-    expect(body.error).toMatch(/owner/i);
-  });
-
-  test('shared member is denied PATCH (403)', async () => {
-    seedTestGroup();
-    asUser(MEMBER_ID);
-
-    const { status, body } = await patchAgent('any-agent-id', { name: 'x' });
-    expect(status).toBe(403);
-    expect(body.error).toMatch(/owner/i);
-  });
-
-  test('shared member is denied DELETE (403)', async () => {
-    seedTestGroup();
-    asUser(MEMBER_ID);
-
-    const { status, body } = await deleteAgent('any-agent-id');
-    expect(status).toBe(403);
-    expect(body.error).toMatch(/owner/i);
-  });
-
-  test('shared member can still GET (200)', async () => {
-    seedTestGroup();
-    asUser(MEMBER_ID);
-
-    const { status } = await getAgents();
-    expect(status).toBe(200);
-  });
-
   test('non-member returns 404 on POST (group hidden)', async () => {
     seedTestGroup();
     asUser(OUTSIDER_ID);
@@ -253,15 +206,6 @@ describe('formal sessions API', () => {
     expect(body.session?.id).toBeTruthy();
     expect(body.session?.name).toBe('Session API');
     expect(body.agent?.id).toBe(body.session?.id);
-  });
-
-  test('shared member is denied POST /sessions (403, owner-only)', async () => {
-    seedTestGroup();
-    asUser(MEMBER_ID);
-
-    const { status, body } = await postSession({ name: 'Nope' });
-    expect(status).toBe(403);
-    expect(body.error).toMatch(/owner/i);
   });
 
   test('DELETE /sessions/:id is blocked by channel_mounts session binding', async () => {
@@ -302,37 +246,6 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
     );
     return { status: res.status, body: await res.json().catch(() => ({})) };
   }
-
-  test('shared member is denied PUT /im-binding (403)', async () => {
-    seedTestGroup();
-    asUser(MEMBER_ID);
-    const { status, body } = await req('/im-binding', 'PUT', { im_jid: 'feishu:x' });
-    expect(status).toBe(403);
-    expect(body.error).toMatch(/owner/i);
-  });
-
-  test('shared member is denied PUT /agents/:id/im-binding (403)', async () => {
-    seedTestGroup();
-    asUser(MEMBER_ID);
-    const { status, body } = await req(
-      '/agents/some-agent/im-binding',
-      'PUT',
-      { im_jid: 'feishu:x' },
-    );
-    expect(status).toBe(403);
-    expect(body.error).toMatch(/owner/i);
-  });
-
-  test('shared member is denied DELETE /im-binding/:imJid (403)', async () => {
-    seedTestGroup();
-    asUser(MEMBER_ID);
-    const { status, body } = await req(
-      `/im-binding/${encodeURIComponent('feishu:x')}`,
-      'DELETE',
-    );
-    expect(status).toBe(403);
-    expect(body.error).toMatch(/owner/i);
-  });
 
   test('non-member returns 404 on PUT /im-binding (group hidden)', async () => {
     seedTestGroup();

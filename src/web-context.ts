@@ -9,11 +9,9 @@ import type {
   MessageCursor,
   UserSessionWithUser,
 } from './types.js';
-import type { RuntimeOwnerCandidateUser } from './runtime-owner.js';
 import {
   getJidsByFolder,
   getRegisteredGroup,
-  getGroupMemberRole,
   getSessionWithUser,
 } from './db.js';
 import type { WhatsAppConnectionState } from './whatsapp.js';
@@ -31,7 +29,7 @@ export interface WebDeps {
   getSessions: () => Record<string, string>;
   processGroupMessages: (chatJid: string) => Promise<boolean>;
   ensureTerminalContainerStarted: (chatJid: string) => boolean;
-  formatMessages: (messages: NewMessage[], isShared?: boolean) => string;
+  formatMessages: (messages: NewMessage[]) => string;
   getLastAgentTimestamp: () => Record<string, MessageCursor>;
   setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => void;
   /**
@@ -167,14 +165,6 @@ export interface WebDeps {
     effectiveGroup: RegisteredGroup;
     isHome: boolean;
   };
-  /**
-   * User-by-id lookup used by plugin-runtime owner resolution. Web eager-expand
-   * delegates to `resolvePerMessageRuntimeOwner` (#24 round-16 P2-1) so the
-   * web fast-path applies the same admin-gating as the cold-start path —
-   * non-admin / disabled / unknown senders on `web:main + isHome` fall back
-   * to `created_by` instead of being treated as the runtime owner.
-   */
-  getUserById?: (id: string) => RuntimeOwnerCandidateUser | null | undefined;
 }
 
 export type Variables = {
@@ -288,9 +278,8 @@ export function hasHostExecutionPermission(user: AuthUser): boolean {
  * Check if a user can access (view messages, send messages to) a group.
  * All users (including admin) follow the same visibility rules:
  * - is_home groups → only the owner (created_by) can access
- * - IM groups (jid does not start with 'web:') → owner or group_members
- * - folder === 'main' → only the admin who owns it
- * - Web groups → created_by matches user.id, or user is in group_members
+ * - IM groups (jid does not start with 'web:') → only the owner
+ * - Web groups → created_by matches user.id
  */
 export function canAccessGroup(
   user: { id: string; role: UserRole },
@@ -301,8 +290,6 @@ export function canAccessGroup(
   // For legacy rows without created_by, resolve owner from sibling home group.
   if (!group.jid.startsWith('web:')) {
     if (group.created_by === user.id) return true;
-    // Check membership for IM groups sharing a non-home folder
-    if (getGroupMemberRole(group.folder, user.id) !== null) return true;
     if (group.created_by) return false;
     const siblingJids = getJidsByFolder(group.folder);
     for (const jid of siblingJids) {
@@ -315,14 +302,7 @@ export function canAccessGroup(
     // Ownership cannot be resolved for this IM group → deny by default.
     return false;
   }
-  // folder === 'main': only accessible by the admin who owns it (via created_by or group_members)
-  if (group.folder === 'main') {
-    if (group.created_by === user.id) return true;
-    return getGroupMemberRole(group.folder, user.id) !== null;
-  }
-  if (group.created_by === user.id) return true;
-  // Check group_members table for shared workspaces
-  return getGroupMemberRole(group.folder, user.id) !== null;
+  return group.created_by === user.id;
 }
 
 /**
@@ -338,14 +318,6 @@ export function canModifyGroup(
   if (group.is_home) return group.created_by === user.id;
   if (!group.jid.startsWith('web:')) {
     if (group.created_by) return group.created_by === user.id;
-    // Legacy IM group (created_by=null): resolve owner via group_members first.
-    // Necessary for legacy IM groups bound to a non-home shared workspace —
-    // they have no is_home sibling so the sibling fallback alone returns false
-    // and the real owner (group_members role='owner') gets 403 on every
-    // destructive op despite canAccessGroup letting them through.
-    // owner-only here is stricter than canAccessGroup (which accepts 'member').
-    const memberRole = getGroupMemberRole(group.folder, user.id);
-    if (memberRole === 'owner') return true;
     // Sibling home group fallback for legacy IM groups auto-bound to a home folder.
     const siblingJids = getJidsByFolder(group.folder);
     for (const jid of siblingJids) {
@@ -357,19 +329,6 @@ export function canModifyGroup(
     }
     return false;
   }
-  return group.created_by === user.id;
-}
-
-/**
- * Check if a user can manage members (add/remove) of a group.
- * - Home groups cannot have members managed.
- * - Only the group creator (owner) can manage members.
- */
-export function canManageGroupMembers(
-  user: { id: string; role: UserRole },
-  group: RegisteredGroup & { jid: string },
-): boolean {
-  if (group.is_home) return false;
   return group.created_by === user.id;
 }
 

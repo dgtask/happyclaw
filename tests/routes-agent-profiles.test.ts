@@ -26,6 +26,18 @@ vi.mock('../src/agent-profile-generator.js', () => ({
     name: description.includes('评审') ? '代码评审 Agent' : 'AI Agent',
     identity_prompt: `根据描述生成：${description}`,
   })),
+  refineAgentProfilePrompt: vi.fn(
+    async ({
+      currentPrompt,
+      message,
+    }: {
+      currentPrompt: string;
+      message: string;
+    }) => ({
+      reply: `已按要求调整：${message}`,
+      identity_prompt: `${currentPrompt}\n新增要求：${message}`.trim(),
+    }),
+  ),
 }));
 
 vi.mock('../src/middleware/auth.ts', () => ({
@@ -33,7 +45,7 @@ vi.mock('../src/middleware/auth.ts', () => ({
     c.set('user', {
       id: 'routes-agent-user',
       username: 'routes-agent-user',
-      role: 'member',
+      role: c.req.header('x-test-role') === 'admin' ? 'admin' : 'member',
       permissions: [],
     });
     return next();
@@ -109,6 +121,9 @@ describe('/api/agent-profiles routes', () => {
     const body = await res.json();
     expect(body.profiles).toHaveLength(1);
     expect(body.profiles[0].is_default).toBe(true);
+    expect(body.profiles[0].runtime_policy.context).toEqual({
+      source: 'managed',
+    });
   });
 
   test('POST creates and PATCH updates an AgentProfile', async () => {
@@ -133,7 +148,8 @@ describe('/api/agent-profiles routes', () => {
     expect(created.name).toBe('Research');
     expect(created.include_claude_preset).toBe(false);
     expect(created.runtime_policy).toMatchObject({
-      provider_id: testProviderId,
+      provider_id: null,
+      context: { source: 'managed' },
       skills: { mode: 'custom', ids: ['research'] },
       tools: { mode: 'readonly' },
     });
@@ -160,6 +176,7 @@ describe('/api/agent-profiles routes', () => {
     expect(patchedBody.profile.include_claude_preset).toBe(true);
     expect(patchedBody.profile.runtime_policy).toMatchObject({
       provider_id: null,
+      context: { source: 'managed' },
       skills: { mode: 'disabled', ids: [] },
       mcp: { mode: 'custom', ids: ['github'] },
       tools: { mode: 'restricted' },
@@ -184,7 +201,7 @@ describe('/api/agent-profiles routes', () => {
     expect(res.status).toBe(400);
   });
 
-  test('rejects unavailable provider, Skill, and MCP references instead of failing open', async () => {
+  test('ignores Agent Provider and rejects unavailable Skill and MCP references', async () => {
     const res = await routes.request('/', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -201,7 +218,6 @@ describe('/api/agent-profiles routes', () => {
     expect(res.status).toBe(400);
     expect(await res.json()).toMatchObject({
       invalid_runtime_policy: {
-        providers: ['missing-provider'],
         skills: ['missing-skill'],
         mcp: ['missing-mcp'],
       },
@@ -231,11 +247,90 @@ describe('/api/agent-profiles routes', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.profile.runtime_policy).toEqual({
-      provider_id: testProviderId,
+      provider_id: null,
+      context: { source: 'managed' },
       skills: { mode: 'custom', ids: ['research'] },
       mcp: { mode: 'custom', ids: ['github'] },
       tools: { mode: 'readonly' },
     });
+  });
+
+  test('rejects host context for members on create and patch', async () => {
+    const createRes = await routes.request('/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Unauthorized Host Agent',
+        runtime_policy: { context: { source: 'host_claude' } },
+      }),
+    });
+    expect(createRes.status).toBe(403);
+    expect(await createRes.json()).toEqual({
+      error: 'host_claude context requires an admin role',
+    });
+
+    const profile = db.createAgentProfile({
+      ownerUserId: 'routes-agent-user',
+      name: 'Managed Agent',
+    });
+    const patchRes = await routes.request(`/${profile.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        runtime_policy: { context: { source: 'host_claude' } },
+      }),
+    });
+    expect(patchRes.status).toBe(403);
+    expect(await patchRes.json()).toEqual({
+      error: 'host_claude context requires an admin role',
+    });
+    expect(
+      db.getAgentProfileForUser(profile.id, 'routes-agent-user')?.runtime_policy
+        .context.source,
+    ).toBe('managed');
+  });
+
+  test('allows admins to create host agents and patch the default HappyClaw profile', async () => {
+    const createRes = await routes.request('/', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-test-role': 'admin',
+      },
+      body: JSON.stringify({
+        name: 'Admin Host Agent',
+        runtime_policy: { context: { source: 'host_claude' } },
+      }),
+    });
+    expect(createRes.status).toBe(201);
+    expect((await createRes.json()).profile.runtime_policy.context).toEqual({
+      source: 'host_claude',
+    });
+
+    const defaultProfile = db
+      .listAgentProfilesForUser('routes-agent-user')
+      .find((profile) => profile.is_default)!;
+    const patchRes = await routes.request(`/${defaultProfile.id}`, {
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+        'x-test-role': 'admin',
+      },
+      body: JSON.stringify({
+        runtime_policy: { context: { source: 'host_claude' } },
+      }),
+    });
+    expect(patchRes.status).toBe(200);
+    const patched = (await patchRes.json()).profile;
+    expect(patched.runtime_policy.context).toEqual({ source: 'host_claude' });
+    expect(patched.version).toBe(defaultProfile.version + 1);
+    expect(patched.identity_hash).not.toBe(defaultProfile.identity_hash);
+
+    const deleteRes = await routes.request(`/${defaultProfile.id}`, {
+      method: 'DELETE',
+      headers: { 'x-test-role': 'admin' },
+    });
+    expect(deleteRes.status).toBe(400);
   });
 
   test('rejects blank names after trim', async () => {
@@ -268,6 +363,54 @@ describe('/api/agent-profiles routes', () => {
       body: JSON.stringify({ description: '   ' }),
     });
     expect(res.status).toBe(400);
+  });
+
+  test('POST /:id/refine-prompt returns a candidate without saving it', async () => {
+    const [profile] = db.listAgentProfilesForUser('routes-agent-user');
+    const originalPrompt = profile.identity_prompt;
+    const res = await routes.request(`/${profile.id}/refine-prompt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        message: '回答时先给结论',
+        current_prompt: '你是一个研究助手。',
+        history: [
+          { role: 'user', content: '语气更直接一些' },
+          { role: 'assistant', content: '已经调整了表达方式。' },
+        ],
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      refinement: {
+        reply: '已按要求调整：回答时先给结论',
+        identity_prompt: '你是一个研究助手。\n新增要求：回答时先给结论',
+      },
+    });
+    expect(
+      db.getAgentProfileForUser(profile.id, 'routes-agent-user'),
+    ).toMatchObject({ identity_prompt: originalPrompt });
+  });
+
+  test('POST /:id/refine-prompt validates ownership and input', async () => {
+    const missing = await routes.request('/missing-profile/refine-prompt', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        message: '调整一下',
+        current_prompt: '',
+      }),
+    });
+    expect(missing.status).toBe(404);
+
+    const [profile] = db.listAgentProfilesForUser('routes-agent-user');
+    const invalid = await routes.request(`/${profile.id}/refine-prompt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message: '   ', current_prompt: '' }),
+    });
+    expect(invalid.status).toBe(400);
   });
 
   test('does not delete the default AgentProfile', async () => {

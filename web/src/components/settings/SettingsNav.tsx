@@ -36,7 +36,7 @@ const systemItems: NavItem[] = [
 
 const accountItems: NavItem[] = [
   { key: 'profile', label: '个人偏好', icon: <User className="w-4 h-4" />, group: 'account' },
-  { key: 'my-channels', label: '消息通道', icon: <MessageSquare className="w-4 h-4" />, group: 'account' },
+  { key: 'my-channels', label: '渠道接入', icon: <MessageSquare className="w-4 h-4" />, group: 'account' },
   { key: 'security', label: '安全与设备', icon: <Shield className="w-4 h-4" />, group: 'account' },
 ];
 
@@ -48,7 +48,7 @@ const featureItems: NavItem[] = [
   { key: 'mcp-servers', label: 'MCP 服务器', icon: <Server className="w-4 h-4" />, group: 'features' },
   { key: 'plugins', label: '插件 (Plugins)', icon: <Puzzle className="w-4 h-4" />, group: 'features' },
   { key: 'agent-definitions', label: '子 Agent 定义', icon: <Bot className="w-4 h-4" />, group: 'features' },
-  { key: 'bindings', label: '消息挂载', icon: <Link2 className="w-4 h-4" />, group: 'features' },
+  { key: 'bindings', label: '渠道绑定', icon: <Link2 className="w-4 h-4" />, group: 'features' },
   { key: 'usage', label: '用量统计', icon: <PieChart className="w-4 h-4" />, group: 'features' },
   { key: 'monitor', label: '系统监控', icon: <Gauge className="w-4 h-4" />, group: 'features' },
   { key: 'users', label: '用户管理', icon: <UserCog className="w-4 h-4" />, group: 'features' },

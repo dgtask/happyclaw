@@ -64,7 +64,6 @@ import {
   getTaskById,
   getUserHomeGroup,
   initDatabase,
-  isGroupShared,
   listUsers,
   setLastGroupSync,
   setRegisteredGroup,
@@ -83,7 +82,6 @@ import {
   deleteAgent,
   deleteCompletedAgents,
   deleteImGroupRecord,
-  deleteImContextBindingsByWorkspace,
   getRunningTaskAgentsByChat,
   markRunningTaskAgentsAsError,
   markAllRunningTaskAgentsAsError,
@@ -95,7 +93,6 @@ import {
   listAgentsByJid,
   getGroupsByOwner,
   getMessagesPage,
-  addGroupMember,
   cleanupOldDailyUsage,
   cleanupOldBillingAuditLog,
   insertUsageRecord,
@@ -104,11 +101,11 @@ import {
   touchImContextBindingActivity,
   updateAgentContextInfo,
   backfillEmptyAllowlistsForUser,
-  listFeishuThreadAgentIds,
   getChannelMount,
 } from './db.js';
 import {
   buildSessionMountUpdate,
+  buildDetachedWorkspaceUpdate,
   buildUnmountUpdate,
   buildWorkspaceMountUpdate,
   resolveChannelMountTarget,
@@ -180,10 +177,7 @@ import type {
   DiscordConnectConfig,
   WhatsAppConnectConfig,
 } from './im-manager.js';
-import {
-  GroupQueue,
-  type IpcDeliveryReceipt,
-} from './group-queue.js';
+import { GroupQueue, type IpcDeliveryReceipt } from './group-queue.js';
 import {
   startSchedulerLoop,
   triggerTaskNow,
@@ -212,7 +206,6 @@ import {
 } from './types.js';
 import { logger } from './logger.js';
 import { resolveTaskOwner } from './task-utils.js';
-import { resolvePerMessageRuntimeOwner } from './runtime-owner.js';
 import { checkOwnerActive } from './owner-gate.js';
 import {
   ensureAgentDirectories,
@@ -262,8 +255,6 @@ process.env.TZ = process.env.TZ || TIMEZONE;
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const execFileAsync = promisify(execFile);
-const DEFAULT_MAIN_JID = 'web:main';
-const DEFAULT_MAIN_NAME = 'Main';
 const SAFE_REQUEST_ID_RE = /^[A-Za-z0-9_-]+$/;
 const OOM_EXIT_RE = /code 137/;
 
@@ -617,11 +608,13 @@ function hasEarlierPendingMessage(
 function createIpcDeliveryTarget(
   chatJid: string,
   messages: Array<{ timestamp: string; id: string }>,
-): {
-  chatJid: string;
-  coveredCursors: MessageCursor[];
-  cursor: MessageCursor;
-} | undefined {
+):
+  | {
+      chatJid: string;
+      coveredCursors: MessageCursor[];
+      cursor: MessageCursor;
+    }
+  | undefined {
   if (messages.length === 0) return undefined;
   const unique = new Map<string, MessageCursor>();
   for (const message of messages) {
@@ -655,10 +648,7 @@ function hasUncoveredPendingMessage(receipt: IpcDeliveryReceipt): boolean {
 
 /** Complete an out-of-band reply/drop without crossing earlier work that an
  * active runner accepted but has not receipted yet. */
-function completeOutOfBandMessage(
-  jid: string,
-  candidate: MessageCursor,
-): void {
+function completeOutOfBandMessage(jid: string, candidate: MessageCursor): void {
   if (hasEarlierPendingMessage(jid, candidate)) {
     advanceNextPullCursorOnly(jid, candidate);
     deferredOutOfBandCursors.defer(jid, candidate);
@@ -1040,7 +1030,7 @@ function resolveImRoute(opts: {
   return isHome ? (imFromGroup ?? imFromJid) : (imFromJid ?? imFromGroup);
 }
 
-function cleanupThreadMapWorkspace(targetMainJid?: string): void {
+function detachThreadMapWorkspace(targetMainJid?: string): void {
   if (!targetMainJid) return;
   const workspaceJid = resolveWorkspaceJid(targetMainJid);
   if (!workspaceJid) return;
@@ -1048,16 +1038,7 @@ function cleanupThreadMapWorkspace(targetMainJid?: string): void {
     registeredGroups[workspaceJid] ?? getRegisteredGroup(workspaceJid);
   if (!workspace) return;
 
-  const threadAgentIds = listFeishuThreadAgentIds(workspaceJid);
-  for (const agentId of threadAgentIds) {
-    deleteAgent(agentId);
-  }
-  deleteImContextBindingsByWorkspace(workspaceJid);
-  const updatedWorkspace: RegisteredGroup = {
-    ...workspace,
-    conversation_source: 'manual',
-    conversation_nav_mode: 'horizontal',
-  };
+  const updatedWorkspace = buildDetachedWorkspaceUpdate(workspace);
   setRegisteredGroup(workspaceJid, updatedWorkspace);
   registeredGroups[workspaceJid] = updatedWorkspace;
 }
@@ -1075,7 +1056,7 @@ function unbindImGroup(jid: string, reason: string): void {
   };
   setRegisteredGroup(jid, updated);
   registeredGroups[jid] = updated;
-  if (wasThreadMap) cleanupThreadMapWorkspace(targetMainJid);
+  if (wasThreadMap) detachThreadMapWorkspace(targetMainJid);
   imSendFailCounts.delete(jid);
   imHealthCheckFailCounts.delete(jid);
   logger.info({ jid, agentId, targetMainJid }, reason);
@@ -1093,7 +1074,7 @@ export function removeImGroupRecord(jid: string, reason: string): void {
   const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
   if (!group) return;
   if (group.binding_mode === 'thread_map') {
-    cleanupThreadMapWorkspace(group.target_main_jid);
+    detachThreadMapWorkspace(group.target_main_jid);
   }
   deleteImGroupRecord(jid);
   delete registeredGroups[jid];
@@ -1859,8 +1840,6 @@ async function handleClearCommand(chatJid: string): Promise<string> {
  */
 function collectWorkspaces(userId: string): WorkspaceInfo[] {
   const ownedGroups = getGroupsByOwner(userId);
-  const user = getUserById(userId);
-  const isAdmin = user?.role === 'admin';
 
   const seen = new Set<string>();
   const workspaces: WorkspaceInfo[] = [];
@@ -1875,17 +1854,6 @@ function collectWorkspaces(userId: string): WorkspaceInfo[] {
       .map((a) => ({ id: a.id, name: a.name, status: a.status }));
 
     workspaces.push({ folder: g.folder, name: g.name, agents });
-  }
-
-  if (isAdmin && !seen.has(MAIN_GROUP_FOLDER)) {
-    const agents = listAgentsByJid(DEFAULT_MAIN_JID)
-      .filter((a) => a.kind === 'conversation')
-      .map((a) => ({ id: a.id, name: a.name, status: a.status }));
-    workspaces.push({
-      folder: MAIN_GROUP_FOLDER,
-      name: DEFAULT_MAIN_NAME,
-      agents,
-    });
   }
 
   return workspaces;
@@ -2114,6 +2082,9 @@ function handleBindCommand(chatJid: string, rawSpec: string): string {
   if (threadMapCapable && resolved.target_agent_id) {
     return '飞书话题群只能绑定工作区，不能绑定单个会话。请使用 /bind <workspace>。';
   }
+  if (!threadMapCapable && resolved.target_main_jid) {
+    return '普通群和私聊只能绑定具体会话。请使用 /bind <workspace>/<会话短ID>。';
+  }
 
   const updated: RegisteredGroup = resolved.target_agent_id
     ? buildSessionMountUpdate(group, resolved.target_agent_id, {
@@ -2122,7 +2093,7 @@ function handleBindCommand(chatJid: string, rawSpec: string): string {
     : buildWorkspaceMountUpdate(
         group,
         resolved.target_main_jid!,
-        threadMapCapable ? 'thread_map' : 'single_session',
+        'thread_map',
         { replyPolicy: 'source_only' },
       );
   setRegisteredGroup(chatJid, updated);
@@ -2162,21 +2133,44 @@ async function handleNewCommand(
   registerGroup(newJid, newGroup);
   ensureChatExists(newJid);
   updateChatName(newJid, name);
-  addGroupMember(folder, userId, 'owner', userId);
-
-  // Bind the current IM group to the new workspace's main conversation
-  const updated: RegisteredGroup = {
-    ...group,
-    target_main_jid: newJid,
-    target_agent_id: undefined,
-    reply_policy: 'source_only',
-  };
+  const threadMapCapable = isThreadMapCapableChat({
+    channel_type: getChannelType(chatJid),
+    chat_mode: group.feishu_chat_mode,
+    group_message_type: group.feishu_group_message_type,
+  });
+  let updated: RegisteredGroup;
+  let targetLabel: string;
+  if (threadMapCapable) {
+    updated = buildWorkspaceMountUpdate(group, newJid, 'thread_map', {
+      replyPolicy: 'source_only',
+    });
+    const topicWorkspace = {
+      ...newGroup,
+      conversation_source: 'feishu_thread' as const,
+      conversation_nav_mode: 'vertical_threads' as const,
+    };
+    setRegisteredGroup(newJid, topicWorkspace);
+    registeredGroups[newJid] = topicWorkspace;
+    targetLabel = '工作区';
+  } else {
+    const created = createAutoImConversationAgent({
+      userId,
+      sourceJid: chatJid,
+      groupFolder: folder,
+      name: group.name || '默认会话',
+    });
+    if (!created) return `工作区「${name}」已创建，但自动创建绑定会话失败。`;
+    updated = buildSessionMountUpdate(group, created.agentId, {
+      replyPolicy: 'source_only',
+    });
+    targetLabel = `会话「${group.name || '默认会话'}」`;
+  }
   setRegisteredGroup(chatJid, updated);
   registeredGroups[chatJid] = updated;
   imSendFailCounts.delete(chatJid);
   imHealthCheckFailCounts.delete(chatJid);
 
-  return `工作区「${name}」已创建并绑定\n📁 ${folder}\n🔁 回复策略: source_only\n\n发送 /unbind 可解绑回默认工作区`;
+  return `工作区「${name}」已创建，并绑定到${targetLabel}\n📁 ${folder}\n🔁 回复策略: source_only\n\n发送 /unbind 可解除绑定`;
 }
 
 function handleRequireMentionCommand(
@@ -2978,9 +2972,7 @@ function loadState(): void {
     }
   }
 
-  // Ensure every active user has a home group (is_home=true).
-  // Admin → folder='main', executionMode='host'
-  // Member → folder='home-{userId}', executionMode='container'
+  // Ensure every active user has an owner-specific home group (is_home=true).
   try {
     // Paginate through all active users
     const activeUsers: Array<{ id: string; role: string; username: string }> =
@@ -3018,10 +3010,8 @@ function loadState(): void {
   for (const [jid, group] of Object.entries(registeredGroups)) {
     if (!group.is_home) continue;
 
-    // Determine expected mode based on the owner's role
-    // Admin home groups use host mode, member home groups use container mode
-    const isAdminHome = group.folder === MAIN_GROUP_FOLDER;
-    const expectedMode = isAdminHome ? 'host' : 'container';
+    const owner = group.created_by ? getUserById(group.created_by) : undefined;
+    const expectedMode = owner?.role === 'admin' ? 'host' : 'container';
 
     if (group.executionMode !== expectedMode) {
       group.executionMode = expectedMode;
@@ -3187,9 +3177,8 @@ export function escapeXml(s: string): string {
  * skip expansion and fall through to the raw message. Plugin commands require
  * a per-user runtime so an ownerless group simply has no plugins to expand.
  *
- * `ownerOverride` lets callers pin a specific owner (e.g. message sender for
- * the admin-shared web:main workspace where `group.created_by` is just the
- * first admin who ever materialised the group, #18 P2-bug-5).
+ * `ownerOverride` lets callers pin a specific owner when a caller already
+ * resolved the workspace identity.
  */
 function buildExpandContext(
   chatJid: string,
@@ -3207,12 +3196,8 @@ function buildExpandContext(
   });
 }
 
-export function formatMessages(
-  messages: NewMessage[],
-  isShared = false,
-): string {
+export function formatMessages(messages: NewMessage[]): string {
   const lines = messages.map((m) => {
-    const content = isShared ? `[${m.sender_name}] ${m.content}` : m.content;
     const sourceJid = m.source_jid || m.chat_jid;
     const channelType = getChannelType(sourceJid);
     let sourceAttr = '';
@@ -3220,7 +3205,7 @@ export function formatMessages(
       const chatId = extractChatId(sourceJid);
       sourceAttr = ` source="${escapeXml(channelType)}:${escapeXml(chatId)}"`;
     }
-    return `<message sender="${escapeXml(m.sender_name)}"${sourceAttr} time="${m.timestamp}">${escapeXml(content)}</message>`;
+    return `<message sender="${escapeXml(m.sender_name)}"${sourceAttr} time="${m.timestamp}">${escapeXml(m.content)}</message>`;
   });
   return `<messages>\n${lines.join('\n')}\n</messages>`;
 }
@@ -3279,30 +3264,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   const resolved = resolveEffectiveGroup(group);
-  let effectiveGroup = resolved.effectiveGroup;
-  let isHome = resolved.isHome;
+  const effectiveGroup = resolved.effectiveGroup;
 
   // Get all messages since last agent interaction
   const sinceCursor = lastAgentTimestamp[chatJid] || EMPTY_CURSOR;
   let missedMessages = getMessagesSince(chatJid, sinceCursor);
 
   if (missedMessages.length === 0) return true;
-
-  // Admin home is shared as web:main, so select runtime owner from the latest
-  // active admin sender to avoid writing global memory into another admin's
-  // user-global directory.
-  if (chatJid === 'web:main' && effectiveGroup.is_home) {
-    for (let i = missedMessages.length - 1; i >= 0; i--) {
-      const sender = missedMessages[i]?.sender;
-      if (!sender || sender === 'happyclaw-agent' || sender === '__system__')
-        continue;
-      const senderUser = getUserById(sender);
-      if (senderUser?.status === 'active' && senderUser.role === 'admin') {
-        effectiveGroup = { ...effectiveGroup, created_by: senderUser.id };
-        break;
-      }
-    }
-  }
 
   // Direct IM chats reply to themselves. Routed IM messages keep their original
   // source_jid so workspace-bound conversations can reply back to the sender
@@ -3337,36 +3305,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // become in-band system replies that advance the cursor without spawning
   // a runner.
   {
-    // Admin-shared web:main: plugin runtime is per-sender, so resolve it
-    // per-message rather than pinning one owner for the whole batch
-    // (#23 round-15 P2-2). Pre-fix logic walked missedMessages once,
-    // picked the latest admin sender, and expanded every message under
-    // that one runtime — mixed-admin batches expanded admin-A's slash
-    // commands under admin-B's plugins.
-    //
-    // We still need a non-null sentinel ExpandContext to gate the block
-    // (some workspaces have no resolvable owner at all → skip expansion).
-    // Build one with the batch fallback to decide whether to enter the
-    // expansion path; the per-message resolver wins inside the loop.
     const fallbackExpandCtx = buildExpandContext(
       chatJid,
       effectiveGroup,
       effectiveGroup.created_by,
     );
     if (fallbackExpandCtx) {
-      const resolveCtxForMsg = (msg: (typeof missedMessages)[number]) => {
-        const owner = resolvePerMessageRuntimeOwner({
-          chatJid,
-          isHome: !!effectiveGroup.is_home,
-          fallbackOwner: effectiveGroup.created_by,
-          message: msg,
-          getUserById,
-        });
-        return buildExpandContext(chatJid, effectiveGroup, owner);
-      };
       const { toSend, replies } = await expandMessagesIfNeeded(
         missedMessages,
-        resolveCtxForMsg,
+        fallbackExpandCtx,
         undefined,
         persistPluginExpansion,
       );
@@ -3417,8 +3364,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     agentProfile,
   );
 
-  const shared = isGroupShared(group.folder);
-  let prompt = formatMessages(missedMessages, shared);
+  let prompt = formatMessages(missedMessages);
 
   // Recovery mode: session was cleared to prevent session ghost, so inject
   // recent conversation history to give the fresh session context.
@@ -3464,11 +3410,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
     }
   } else if (
-    willClearSessionOnProviderSwitch(
-      effectiveGroup.folder,
-      undefined,
-      toContainerAgentProfile(agentProfile),
-    )
+    willClearSessionOnProviderSwitch(effectiveGroup.folder, undefined)
   ) {
     // Proactive provider switch (sticky binding unhealthy/disabled) will clear
     // the SDK session inside the runner. Inject history so the new provider's
@@ -3506,7 +3448,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       messageCount: missedMessages.length,
       directImReply,
       imageCount: images.length,
-      shared,
       isRecovery,
       messageTaskId,
     },
@@ -5092,8 +5033,8 @@ async function runAgent(
   agentProfile?: AgentProfile,
 ): Promise<{ status: 'success' | 'error' | 'closed'; error?: string }> {
   const isHome = !!group.is_home;
-  // For the agent-runner: isMain means this is an admin home container (full privileges)
-  const isAdminHome = isHome && group.folder === MAIN_GROUP_FOLDER;
+  const owner = group.created_by ? getUserById(group.created_by) : undefined;
+  const isAdminHome = isHome && owner?.role === 'admin';
   const resolvedAgentProfile =
     agentProfile ?? getAgentProfileForWorkspace(group.folder, group.created_by);
   if (resetMainSessionForAgentProfileMismatch(group, resolvedAgentProfile)) {
@@ -5645,9 +5586,11 @@ function startIpcWatcher(): void {
     const sourceGroupEntry = Object.values(registeredGroups).find(
       (g) => g.folder === sourceGroup,
     );
-    const isAdminHome = !!(
-      sourceGroupEntry?.is_home && sourceGroup === MAIN_GROUP_FOLDER
-    );
+    const sourceOwner = sourceGroupEntry?.created_by
+      ? getUserById(sourceGroupEntry.created_by)
+      : undefined;
+    const isAdminHome =
+      !!sourceGroupEntry?.is_home && sourceOwner?.role === 'admin';
     const isHome = !!sourceGroupEntry?.is_home;
 
     // Collect all IPC roots: main group dir + agents/*/ + tasks-run/*/
@@ -7318,37 +7261,24 @@ async function processAgentConversation(
   }
 
   const isHome = !!effectiveGroup.is_home;
-  const isAdminHome = isHome && effectiveGroup.folder === MAIN_GROUP_FOLDER;
+  const effectiveOwner = effectiveGroup.created_by
+    ? getUserById(effectiveGroup.created_by)
+    : undefined;
+  const isAdminHome = isHome && effectiveOwner?.role === 'admin';
 
   // Plugin command expander (DMI commands) — agent conversation cold start.
   // Replies go to virtualChatJid so the agent UI tab routes them correctly;
   // cursor advancement also uses the virtual JID since that's the read key.
   {
-    // Admin-shared web:main: plugin runtime is per-sender (each admin's
-    // own plugins). Resolve the runtime per-message instead of pinning one
-    // owner for the whole batch (#23 round-15 P2-2). The per-message
-    // resolver strips the `#agent:` suffix from the virtual JID before
-    // the `web:main` gate so virtual JIDs still get the per-sender
-    // semantics (matches the legacy virtual-JID base resolver).
     const fallbackExpandCtx = buildExpandContext(
       virtualChatJid,
       effectiveGroup,
       effectiveGroup.created_by,
     );
     if (fallbackExpandCtx) {
-      const resolveCtxForMsg = (msg: (typeof missedMessages)[number]) => {
-        const owner = resolvePerMessageRuntimeOwner({
-          chatJid: virtualChatJid,
-          isHome: !!effectiveGroup.is_home,
-          fallbackOwner: effectiveGroup.created_by,
-          message: msg,
-          getUserById,
-        });
-        return buildExpandContext(virtualChatJid, effectiveGroup, owner);
-      };
       const { toSend, replies } = await expandMessagesIfNeeded(
         missedMessages,
-        resolveCtxForMsg,
+        fallbackExpandCtx,
         undefined,
         persistPluginExpansion,
       );
@@ -7424,18 +7354,14 @@ async function processAgentConversation(
   // an empty conversation.
   const sessionId = getSession(effectiveGroup.folder, agentId) || undefined;
   let currentAgentSessionId = sessionId;
-  let prompt = formatMessages(missedMessages, false);
+  let prompt = formatMessages(missedMessages);
   // Inject history when the SDK session is fresh, or when a proactive provider
   // switch (sticky binding unhealthy/disabled) will clear the existing session
   // inside the runner — otherwise the new provider's first turn loses context.
   if (
     !sessionId ||
     resetForAgentProfile ||
-    willClearSessionOnProviderSwitch(
-      effectiveGroup.folder,
-      agentId,
-      toContainerAgentProfile(agentProfile),
-    )
+    willClearSessionOnProviderSwitch(effectiveGroup.folder, agentId)
   ) {
     const historyContext = buildRecentConversationHistoryContext(
       virtualChatJid,
@@ -8757,31 +8683,15 @@ async function startMessageLoop(): Promise<void> {
           {
             const { effectiveGroup: activeEffectiveGroup } =
               resolveEffectiveGroup(group);
-            // Admin-shared web:main: plugin runtime is per-sender. Resolve
-            // per-message so each admin's slash command expands under their
-            // own enabled plugins, not whichever admin happened to be the
-            // latest sender for the active-IPC batch (#23 round-15 P2-2).
             const fallbackExpandCtx = buildExpandContext(
               chatJid,
               activeEffectiveGroup,
               activeEffectiveGroup.created_by,
             );
             if (fallbackExpandCtx) {
-              const resolveCtxForMsg = (
-                msg: (typeof messagesToSend)[number],
-              ) => {
-                const owner = resolvePerMessageRuntimeOwner({
-                  chatJid,
-                  isHome: !!activeEffectiveGroup.is_home,
-                  fallbackOwner: activeEffectiveGroup.created_by,
-                  message: msg,
-                  getUserById,
-                });
-                return buildExpandContext(chatJid, activeEffectiveGroup, owner);
-              };
               const { toSend, replies } = await expandMessagesIfNeeded(
                 messagesToSend,
-                resolveCtxForMsg,
+                fallbackExpandCtx,
                 undefined,
                 persistPluginExpansion,
               );
@@ -8823,8 +8733,7 @@ async function startMessageLoop(): Promise<void> {
           // the message is successfully injected, so we no longer need to kill
           // the process for home groups.
 
-          const shared = !group.is_home && isGroupShared(group.folder);
-          const formatted = formatMessages(messagesToSend, shared);
+          const formatted = formatMessages(messagesToSend);
 
           const images = collectMessageImages(chatJid, messagesToSend);
           const imagesForAgent = images.length > 0 ? images : undefined;
@@ -8982,7 +8891,11 @@ function recoverPendingMessages(): void {
       clearPersistedIpcDeliveriesForChats(new Set([chatJid]));
       rewindNextPullCursorToCommitted(chatJid);
       logger.warn(
-        { chatJid, pullCursor, committedCursor: committedCursor || EMPTY_CURSOR },
+        {
+          chatJid,
+          pullCursor,
+          committedCursor: committedCursor || EMPTY_CURSOR,
+        },
         'Startup recovery rewound next-pull cursor past uncommitted IPC delivery',
       );
     }
@@ -8994,7 +8907,8 @@ function recoverPendingMessages(): void {
         pullWasAhead,
         startupRecoveredDeliveryJids.has(chatJid),
       )
-    ) continue;
+    )
+      continue;
     const sinceCursor = committedCursor || EMPTY_CURSOR;
 
     const pending = getMessagesSince(chatJid, sinceCursor);
@@ -10021,7 +9935,7 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
         'Web-origin missed messages: attempting to pipe into running agent',
       );
       const formatted =
-        missedMessages.length > 0 ? formatMessages(missedMessages, false) : '';
+        missedMessages.length > 0 ? formatMessages(missedMessages) : '';
       const images = collectMessageImages(virtualChatJid, missedMessages);
       const imagesForAgent = images.length > 0 ? images : undefined;
 
@@ -10702,7 +10616,8 @@ async function main(): Promise<void> {
 
     if (config.enabled !== false && config.appId && config.appSecret) {
       const homeGroup = getUserHomeGroup(adminUser.id);
-      const homeFolder = homeGroup?.folder || MAIN_GROUP_FOLDER;
+      if (!homeGroup) return false;
+      const homeFolder = homeGroup.folder;
       const adminOwnerRef = {
         value: getUserFeishuConfig(adminUser.id)?.ownerOpenId ?? undefined,
       };
@@ -10776,7 +10691,8 @@ async function main(): Promise<void> {
 
     if (config.enabled !== false && config.botToken) {
       const homeGroup = getUserHomeGroup(adminUser.id);
-      const homeFolder = homeGroup?.folder || MAIN_GROUP_FOLDER;
+      if (!homeGroup) return false;
+      const homeFolder = homeGroup.folder;
       const onNewChat = buildOnNewChat(adminUser.id, homeFolder);
       const connected = await imManager.connectUserTelegram(
         adminUser.id,
@@ -11171,11 +11087,6 @@ async function main(): Promise<void> {
     applyAutoIsolateContext: (userId: string, enable: boolean) =>
       applyAutoIsolateContext(userId, enable),
     resolveEffectiveGroup,
-    getUserById: (id: string) => {
-      const user = getUserById(id);
-      if (!user) return null;
-      return { id: user.id, status: user.status, role: user.role };
-    },
   });
 
   // Clean expired sessions every hour
@@ -11385,8 +11296,7 @@ async function main(): Promise<void> {
     },
   );
   queue.setIpcDeliveryCommitEligibilityChecker(
-    (receipt: IpcDeliveryReceipt) =>
-      !hasUncoveredPendingMessage(receipt),
+    (receipt: IpcDeliveryReceipt) => !hasUncoveredPendingMessage(receipt),
   );
   queue.setOnAbandonedIpcDeliveries(
     (runnerJid: string, receipts: IpcDeliveryReceipt[]) => {

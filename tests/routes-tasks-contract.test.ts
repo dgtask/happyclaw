@@ -61,8 +61,6 @@ const { enqueueIsolatedScheduledTask, getRunningTaskIds } =
 const tasksRoutes = tasksRoutesModule.default;
 
 const OWNER_ID = 'alice';
-const MEMBER_ID = 'bob';
-const ADMIN_ID = 'admin-user';
 const GROUP_JID = 'web:tasks-contract';
 const GROUP_FOLDER = 'tasks-contract';
 
@@ -80,9 +78,6 @@ function seedGroup(): void {
     created_by: OWNER_ID,
     is_home: false,
   } as any);
-  db.addGroupMember(GROUP_FOLDER, OWNER_ID, 'owner');
-  db.addGroupMember(GROUP_FOLDER, MEMBER_ID, 'member');
-  db.addGroupMember(GROUP_FOLDER, ADMIN_ID, 'member');
   fs.mkdirSync(path.join(tmpGroupsDir, GROUP_FOLDER), { recursive: true });
 }
 
@@ -111,11 +106,6 @@ function createTask(
   });
 }
 
-async function getTasks() {
-  const res = await tasksRoutes.request('/', { method: 'GET' });
-  return { status: res.status, body: await res.json().catch(() => ({})) };
-}
-
 async function deleteTask(id: string) {
   const res = await tasksRoutes.request(`/${id}`, { method: 'DELETE' });
   return { status: res.status, body: await res.json().catch(() => ({})) };
@@ -136,9 +126,6 @@ beforeAll(() => {
 
 beforeEach(() => {
   for (const id of [
-    'alice-task',
-    'bob-task',
-    'legacy-task',
     'dirty-source-task',
     'queued-route-task',
   ]) {
@@ -161,36 +148,6 @@ afterAll(() => {
 });
 
 describe('tasks route ownership and cleanup contract', () => {
-  test('GET / hides other members tasks in a shared workspace', async () => {
-    createTask('alice-task', OWNER_ID);
-    createTask('bob-task', MEMBER_ID);
-    createTask('legacy-task', null);
-
-    asUser(OWNER_ID);
-    const ownerRes = await getTasks();
-    expect(ownerRes.status).toBe(200);
-    expect(ownerRes.body.tasks.map((t: any) => t.id)).toEqual(
-      expect.arrayContaining(['alice-task']),
-    );
-    expect(ownerRes.body.tasks).toHaveLength(1);
-
-    asUser(MEMBER_ID);
-    const memberRes = await getTasks();
-    expect(memberRes.status).toBe(200);
-    expect(memberRes.body.tasks.map((t: any) => t.id)).toEqual(
-      expect.arrayContaining(['bob-task']),
-    );
-    expect(memberRes.body.tasks).toHaveLength(1);
-
-    asUser(ADMIN_ID, 'admin');
-    const adminRes = await getTasks();
-    expect(adminRes.status).toBe(200);
-    expect(adminRes.body.tasks.map((t: any) => t.id)).toEqual(
-      expect.arrayContaining(['legacy-task', 'bob-task', 'alice-task']),
-    );
-    expect(adminRes.body.tasks).toHaveLength(3);
-  });
-
   test('DELETE task never deletes the source workspace when workspace fields point at it', async () => {
     createTask('dirty-source-task', OWNER_ID);
     db.updateTaskWorkspace('dirty-source-task', GROUP_JID, GROUP_FOLDER);
@@ -216,7 +173,6 @@ describe('tasks route ownership and cleanup contract', () => {
       created_by: OWNER_ID,
       is_home: false,
     } as any);
-    db.addGroupMember(targetFolder, OWNER_ID, 'owner');
     createTask('queued-route-task', OWNER_ID);
 
     const droppedCallbacks: Array<() => void> = [];

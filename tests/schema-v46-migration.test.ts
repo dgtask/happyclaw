@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import Database from '../src/sqlite-compat.js';
 
-const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'schema-v45-migration-'));
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'schema-v46-migration-'));
 const storeDir = path.join(tmpDir, 'db');
 const groupsDir = path.join(tmpDir, 'groups');
 fs.mkdirSync(storeDir, { recursive: true });
@@ -23,8 +23,8 @@ afterAll(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-describe('schema v42 to v45 migration', () => {
-  test('renames legacy session projection, preserves data, and is idempotent', () => {
+describe('schema v46 migration', () => {
+  test('preserves runtime data, removes workspace memberships, and is idempotent', () => {
     db.initDatabase();
     db.setRegisteredGroup('web:migration-runtime-workspace', {
       name: 'Migration Runtime Workspace',
@@ -44,12 +44,24 @@ describe('schema v42 to v45 migration', () => {
       ALTER TABLE workspace_runtime_sessions RENAME TO workspace_sessions;
       ALTER TABLE workspace_sessions RENAME COLUMN runtime_agent_id TO session_agent_id;
       ALTER TABLE workspace_sessions RENAME COLUMN sdk_session_id TO claude_session_id;
+      CREATE TABLE group_members (
+        group_folder TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'member',
+        added_at TEXT NOT NULL,
+        added_by TEXT,
+        PRIMARY KEY (group_folder, user_id)
+      );
+      INSERT INTO group_members VALUES (
+        'migration-runtime-workspace', 'legacy-member', 'member',
+        '2026-07-10T00:00:00.000Z', 'migration-owner'
+      );
       UPDATE router_state SET value = '42' WHERE key = 'schema_version';
     `);
     legacy.close();
 
     db.initDatabase();
-    expect(db.getRouterState('schema_version')).toBe('45');
+    expect(db.getRouterState('schema_version')).toBe('46');
     expect(
       db.getWorkspaceRuntimeSession(
         'migration-runtime-workspace',
@@ -101,7 +113,7 @@ describe('schema v42 to v45 migration', () => {
     // duplicate/drop the preserved runtime state. It also reconciles ghosts
     // that have no authoritative registered-group/session/channel source.
     db.initDatabase();
-    expect(db.getRouterState('schema_version')).toBe('45');
+    expect(db.getRouterState('schema_version')).toBe('46');
     expect(
       db.getWorkspaceRuntimeSession(
         'migration-runtime-workspace',
@@ -129,6 +141,11 @@ describe('schema v42 to v45 migration', () => {
         "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'workspace_runtime_sessions' ORDER BY name",
       )
       .all() as Array<{ name: string }>;
+    const legacyMembershipTable = inspected
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'group_members'",
+      )
+      .get();
     inspected.close();
     expect(tables).toEqual([{ name: 'workspace_runtime_sessions' }]);
     expect(indexes.map((row) => row.name)).toEqual(
@@ -137,6 +154,7 @@ describe('schema v42 to v45 migration', () => {
         'idx_workspace_runtime_sessions_workspace',
       ]),
     );
+    expect(legacyMembershipTable).toBeUndefined();
 
     // Keep afterAll safe after the explicit inspection close.
     db.initDatabase();

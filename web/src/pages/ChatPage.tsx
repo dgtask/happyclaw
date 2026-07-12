@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Plus, UserCog, LogOut } from 'lucide-react';
+import { UserCog, LogOut, Plus } from 'lucide-react';
 import { useChatStore } from '../stores/chat';
 import { useAuthStore } from '../stores/auth';
 import { useGroupsStore } from '../stores/groups';
 import { ChatView } from '../components/chat/ChatView';
 import { ChatGroupItem } from '../components/chat/ChatGroupItem';
+import { AgentWorkspaceGroup } from '../components/layout/AgentWorkspaceGroup';
 import { ConfirmDialog } from '../components/common';
 import { CreateContainerDialog } from '../components/chat/CreateContainerDialog';
 import { EmojiAvatar } from '../components/common/EmojiAvatar';
@@ -17,7 +18,13 @@ import {
 import { useSwipeBack } from '../hooks/useSwipeBack';
 import { useClearWorkspace } from '../hooks/useClearWorkspace';
 import { type GroupEntry, compareByLastActivity } from '../utils/group-utils';
-import { groupWorkspacesByAgent } from '../utils/agent-product';
+import {
+  getAgentNavigationTargets,
+  getPrimaryAgentWorkspaceRows,
+  groupWorkspacesByAgent,
+  isAgentSectionCollapsible,
+  partitionAgentWorkspaceSections,
+} from '../utils/agent-product';
 
 export function ChatPage() {
   const { groupFolder } = useParams<{ groupFolder?: string }>();
@@ -55,42 +62,27 @@ export function ChatPage() {
   const runnerStates = useGroupsStore((s) => s.runnerStates);
   const hasGroups = Object.keys(groups).length > 0;
 
-  // Build categorized group lists for mobile view (mirrors UnifiedSidebar)
-  const {
-    mainGroup,
-    pinnedAgentSections,
-    myAgentSections,
-    collabAgentSections,
-  } = useMemo(() => {
-    let main: GroupEntry | null = null;
-    const others: GroupEntry[] = [];
-    for (const [jid, info] of Object.entries(groups)) {
-      const entry = { jid, ...info };
-      if (info.is_my_home) main = entry;
-      else others.push(entry);
-    }
-    others.sort(compareByLastActivity);
-    const pinned: GroupEntry[] = [];
-    const my: GroupEntry[] = [];
-    const collab: GroupEntry[] = [];
-    others.forEach((g) => {
-      if (g.pinned_at) pinned.push(g);
-      else if (g.is_shared && (g.member_count ?? 0) >= 2) collab.push(g);
-      else my.push(g);
+  // Mobile and desktop share the same Agent-first navigation contract.
+  const agentSections = useMemo(() => {
+    const entries: GroupEntry[] = Object.entries(groups).map(([jid, info]) => ({
+      jid,
+      ...info,
+    }));
+    entries.sort(compareByLastActivity);
+    const home = entries.find((entry) => entry.is_my_home);
+    const defaultAgentId = home?.agent_profile_id || '__default__';
+    const prioritized = [...entries].sort((a, b) => {
+      if (a.is_my_home) return -1;
+      if (b.is_my_home) return 1;
+      return Number(!!b.pinned_at) - Number(!!a.pinned_at);
     });
-    pinned.sort((a, b) => (a.pinned_at || '').localeCompare(b.pinned_at || ''));
-    return {
-      mainGroup: main,
-      pinnedAgentSections: groupWorkspacesByAgent(pinned),
-      myAgentSections: groupWorkspacesByAgent(my),
-      collabAgentSections: groupWorkspacesByAgent(collab),
-    };
+    return groupWorkspacesByAgent(prioritized, defaultAgentId);
   }, [groups]);
-  const hasAnyGroup =
-    mainGroup ||
-    pinnedAgentSections.length > 0 ||
-    myAgentSections.length > 0 ||
-    collabAgentSections.length > 0;
+  const agentPartitions = useMemo(
+    () => partitionAgentWorkspaceSections(agentSections),
+    [agentSections],
+  );
+  const hasAnyGroup = agentSections.length > 0;
 
   // Sync URL param to store selection. No auto-redirect to home container —
   // users land on the welcome screen and choose a container manually.
@@ -134,6 +126,93 @@ export function ChatPage() {
 
   useSwipeBack(chatViewRef, handleBackToList);
 
+  const renderMobileAgentSection = (
+    section: (typeof agentSections)[number],
+  ) => {
+    const { directGroup, workspaces } = getAgentNavigationTargets(section);
+    return (
+      <AgentWorkspaceGroup
+        key={section.id}
+        agentId={section.id}
+        name={section.name}
+        collapsible={isAgentSectionCollapsible(section)}
+        workspaceCount={workspaces.length}
+        workspaceNames={workspaces.map((workspace) => workspace.name)}
+        runningCount={
+          section.items.filter((item) => runnerStates[item.jid] === 'running')
+            .length
+        }
+        isDirectActive={
+          !!directGroup?.is_my_home && directGroup.jid === currentGroup
+        }
+        containsActiveWorkspace={section.items.some(
+          (item) => item.jid === currentGroup,
+        )}
+        onSelect={() => {
+          if (!directGroup) return;
+          selectGroup(directGroup.jid);
+          navigate(`/chat/${directGroup.folder}?sessions=1`);
+        }}
+        onRebuild={
+          directGroup?.is_my_home && directGroup.can_modify
+            ? () => openClear(directGroup.jid, section.name)
+            : undefined
+        }
+      >
+        {workspaces.map((workspace) => (
+          <ChatGroupItem
+            key={workspace.jid}
+            jid={workspace.jid}
+            name={workspace.name}
+            folder={workspace.folder}
+            lastMessage={workspace.lastMessage}
+            isActive={currentGroup === workspace.jid}
+            isHome={false}
+            isPinned={!!workspace.pinned_at}
+            isRunning={runnerStates[workspace.jid] === 'running'}
+            canModify={workspace.can_modify}
+            onSelect={(jid, folder) => {
+              selectGroup(jid);
+              navigate(`/chat/${folder}?sessions=1`);
+            }}
+            onClearHistory={openClear}
+          />
+        ))}
+      </AgentWorkspaceGroup>
+    );
+  };
+
+  const renderMobilePrimaryAgentWorkspaces = (
+    section: (typeof agentSections)[number],
+  ) => {
+    const workspaces = getPrimaryAgentWorkspaceRows(section);
+    const selectWorkspace = (jid: string, folder: string) => {
+      selectGroup(jid);
+      navigate(`/chat/${folder}?sessions=1`);
+    };
+
+    return (
+      <div data-hc-primary-agent-workspaces={section.id}>
+        {workspaces.map((workspace) => (
+          <ChatGroupItem
+            key={workspace.jid}
+            jid={workspace.jid}
+            name={workspace.name}
+            folder={workspace.folder}
+            lastMessage={workspace.lastMessage}
+            isActive={currentGroup === workspace.jid}
+            isHome={!!workspace.is_my_home}
+            isPinned={!!workspace.pinned_at}
+            isRunning={runnerStates[workspace.jid] === 'running'}
+            canModify={workspace.can_modify}
+            onSelect={selectWorkspace}
+            onClearHistory={openClear}
+          />
+        ))}
+      </div>
+    );
+  };
+
   return (
     <div className="h-full flex bg-muted/30">
       {/* Mobile workspace list when no group selected */}
@@ -148,11 +227,13 @@ export function ChatPage() {
             />
             <div className="flex-1" />
             <button
+              type="button"
               onClick={() => setCreateOpen(true)}
-              className="w-9 h-9 rounded-lg flex items-center justify-center hover:bg-accent text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
-              aria-label="新工作区"
+              className="grid h-10 w-10 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
+              title="新建工作区"
+              aria-label="新建工作区"
             >
-              <Plus className="w-5 h-5" />
+              <Plus className="h-5 w-5" />
             </button>
             <Popover>
               <PopoverTrigger asChild>
@@ -193,166 +274,32 @@ export function ChatPage() {
           </div>
           {hasAnyGroup ? (
             <div className="px-2 pb-nav-safe">
-              {/* Default Agent workspace */}
-              {mainGroup && (
-                <div className="mb-1">
-                  <div className="px-2 pt-1 pb-1">
-                    <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">
-                      {mainGroup.agent_profile_name || 'Default Agent'}
-                      {mainGroup.agent_profile_version
-                        ? ` · v${mainGroup.agent_profile_version}`
-                        : ''}
-                    </span>
-                  </div>
-                  <ChatGroupItem
-                    jid={mainGroup.jid}
-                    name={mainGroup.name}
-                    folder={mainGroup.folder}
-                    lastMessage={mainGroup.lastMessage}
-                    isActive={currentGroup === mainGroup.jid}
-                    isHome
-                    isRunning={runnerStates[mainGroup.jid] === 'running'}
-                    canModify={mainGroup.can_modify}
-                    onSelect={(jid, folder) => {
-                      selectGroup(jid);
-                      navigate(`/chat/${folder}`);
-                    }}
-                    onClearHistory={openClear}
-                  />
-                </div>
+              {agentPartitions.primary && (
+                <section aria-labelledby="mobile-primary-agent-heading">
+                  <h2
+                    id="mobile-primary-agent-heading"
+                    className="px-3 pb-1 pt-1 text-[10px] font-medium tracking-[0.08em] text-muted-foreground"
+                  >
+                    主 Agent · {agentPartitions.primary.name}
+                  </h2>
+                  {renderMobilePrimaryAgentWorkspaces(
+                    agentPartitions.primary,
+                  )}
+                </section>
               )}
-              {/* 已固定 */}
-              {pinnedAgentSections.length > 0 && (
-                <div className="mb-1">
-                  <div className="px-2 pt-2 pb-1">
-                    <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">
-                      已固定
-                    </span>
-                  </div>
-                  {pinnedAgentSections.map((section) => (
-                    <div key={section.id} className="mb-1">
-                      <div className="flex items-center gap-1.5 px-2 pb-1 pt-2">
-                        <span className="truncate text-[10px] text-muted-foreground/80">
-                          {section.name}
-                        </span>
-                        {section.version && (
-                          <span className="text-[10px] text-muted-foreground/60">
-                            v{section.version}
-                          </span>
-                        )}
-                      </div>
-                      {section.items.map((g) => (
-                        <ChatGroupItem
-                          key={g.jid}
-                          jid={g.jid}
-                          name={g.name}
-                          folder={g.folder}
-                          lastMessage={g.lastMessage}
-                          isShared={g.is_shared}
-                          memberRole={g.member_role}
-                          memberCount={g.member_count}
-                          isActive={currentGroup === g.jid}
-                          isHome={false}
-                          isPinned
-                          isRunning={runnerStates[g.jid] === 'running'}
-                          canModify={g.can_modify}
-                          onSelect={(jid, folder) => {
-                            selectGroup(jid);
-                            navigate(`/chat/${folder}`);
-                          }}
-                          onClearHistory={openClear}
-                        />
-                      ))}
-                    </div>
-                  ))}
-                </div>
-              )}
-              {/* My Agent workspaces */}
-              {myAgentSections.length > 0 && (
-                <div className="mb-1">
-                  <div className="px-2 pt-2 pb-1">
-                    <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">
-                      我的 Agent
-                    </span>
-                  </div>
-                  {myAgentSections.map((section) => (
-                    <div key={section.id} className="mb-1">
-                      <div className="px-2 pt-2 pb-1 flex items-center gap-1.5">
-                        <span className="text-[10px] text-muted-foreground/80 truncate">
-                          {section.name}
-                        </span>
-                        {section.version && (
-                          <span className="text-[10px] text-muted-foreground/60">
-                            v{section.version}
-                          </span>
-                        )}
-                      </div>
-                      {section.items.map((g) => (
-                        <ChatGroupItem
-                          key={g.jid}
-                          jid={g.jid}
-                          name={g.name}
-                          folder={g.folder}
-                          lastMessage={g.lastMessage}
-                          isActive={currentGroup === g.jid}
-                          isHome={false}
-                          isRunning={runnerStates[g.jid] === 'running'}
-                          canModify={g.can_modify}
-                          onSelect={(jid, folder) => {
-                            selectGroup(jid);
-                            navigate(`/chat/${folder}`);
-                          }}
-                          onClearHistory={openClear}
-                        />
-                      ))}
-                    </div>
-                  ))}
-                </div>
-              )}
-              {/* Shared Agent workspaces */}
-              {collabAgentSections.length > 0 && (
-                <div className="mb-1">
-                  <div className="px-2 pt-2 pb-1">
-                    <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">
-                      协作 Agent 工作区
-                    </span>
-                  </div>
-                  {collabAgentSections.map((section) => (
-                    <div key={section.id} className="mb-1">
-                      <div className="flex items-center gap-1.5 px-2 pb-1 pt-2">
-                        <span className="truncate text-[10px] text-muted-foreground/80">
-                          {section.name}
-                        </span>
-                        {section.version && (
-                          <span className="text-[10px] text-muted-foreground/60">
-                            v{section.version}
-                          </span>
-                        )}
-                      </div>
-                      {section.items.map((g) => (
-                        <ChatGroupItem
-                          key={g.jid}
-                          jid={g.jid}
-                          name={g.name}
-                          folder={g.folder}
-                          lastMessage={g.lastMessage}
-                          isShared={g.is_shared}
-                          memberRole={g.member_role}
-                          memberCount={g.member_count}
-                          isActive={currentGroup === g.jid}
-                          isHome={false}
-                          isRunning={runnerStates[g.jid] === 'running'}
-                          canModify={g.can_modify}
-                          onSelect={(jid, folder) => {
-                            selectGroup(jid);
-                            navigate(`/chat/${folder}`);
-                          }}
-                          onClearHistory={openClear}
-                        />
-                      ))}
-                    </div>
-                  ))}
-                </div>
+              {agentPartitions.custom.length > 0 && (
+                <section
+                  aria-labelledby="mobile-custom-agent-heading"
+                  className="mt-4 border-t border-border/60 pt-3"
+                >
+                  <h2
+                    id="mobile-custom-agent-heading"
+                    className="px-3 pb-1 text-[10px] font-medium tracking-[0.08em] text-muted-foreground"
+                  >
+                    自定义 Agent
+                  </h2>
+                  {agentPartitions.custom.map(renderMobileAgentSection)}
+                </section>
               )}
             </div>
           ) : (
@@ -412,7 +359,7 @@ export function ChatPage() {
         onClose={() => setCreateOpen(false)}
         onCreated={(jid, folder) => {
           selectGroup(jid);
-          navigate(`/chat/${folder}`);
+          navigate(`/chat/${folder}?sessions=1`);
         }}
       />
     </div>

@@ -19,7 +19,6 @@ interface MessageBubbleProps {
   showTime: boolean;
   thinkingContent?: string;
   thinkingDurationMs?: number;
-  isShared?: boolean;
 }
 
 interface MessageAttachment {
@@ -136,7 +135,7 @@ function TokenUsageDisplay({ tokenUsageJson }: { tokenUsageJson: string }) {
   );
 }
 
-export const MessageBubble = memo(function MessageBubble({ message, showTime, thinkingContent, thinkingDurationMs, isShared }: MessageBubbleProps) {
+export const MessageBubble = memo(function MessageBubble({ message, showTime, thinkingContent, thinkingDurationMs }: MessageBubbleProps) {
   const [copied, setCopied] = useState(false);
   const [lightboxState, setLightboxState] = useState<{ images: string[]; index: number } | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
@@ -145,7 +144,6 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
   const appearance = useAuthStore((s) => s.appearance);
   const { mode: displayMode } = useDisplayMode();
   const isUser = !message.is_from_me;
-  const isOtherUser = isShared && isUser && message.sender !== currentUser?.id;
   const time = new Date(message.timestamp)
     .toLocaleString('zh-CN', {
       year: 'numeric',
@@ -293,7 +291,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
     const isAI = message.is_from_me;
     const senderName = isAI
       ? (currentUser?.ai_name || appearance?.aiName || message.sender_name || 'AI')
-      : (isOtherUser ? (message.sender_name || '用户') : (currentUser?.display_name || currentUser?.username || '我'));
+      : (currentUser?.display_name || currentUser?.username || '我');
 
     return (
       <div className="group mb-2 border-b border-border pb-2">
@@ -381,94 +379,10 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
 
   // ── Chat mode (default): bubble-style layout ──
   if (isUser) {
-    // Shared workspace — other user's message: left-aligned with avatar
-    if (isOtherUser) {
-      const otherName = message.sender_name || '用户';
-      const initial = otherName[0]?.toUpperCase() || '?';
-      return (
-        <div className="group mb-4">
-          <div className="flex items-center gap-2 mb-1.5 lg:hidden">
-            <div className="w-6 h-6 rounded-full bg-muted flex items-center justify-center text-xs font-medium text-foreground/70 flex-shrink-0">
-              {initial}
-            </div>
-            <span className="text-xs text-muted-foreground font-medium">{otherName}</span>
-            {showTime && <span className="text-xs text-muted-foreground">{time}</span>}
-          </div>
-
-          <div className="lg:flex lg:gap-3">
-            <div className="hidden lg:block flex-shrink-0">
-              <div className="w-8 h-8 rounded-full bg-muted flex items-center justify-center text-sm font-medium text-foreground/70">
-                {initial}
-              </div>
-            </div>
-            <div className="flex-1 min-w-0">
-              <div className="hidden lg:flex items-center gap-2 mb-1">
-                <span className="text-xs text-muted-foreground font-medium">{otherName}</span>
-                {showTime && <span className="text-xs text-muted-foreground">{time}</span>}
-              </div>
-              <div className="relative">
-                {images.length > 0 && (
-                  <div className="flex flex-wrap gap-2 mb-2">
-                    {images.map((img, i) => (
-                      <img
-                        key={i}
-                        src={`data:${img.mimeType || 'image/png'};base64,${img.data}`}
-                        alt={img.name || `图片 ${i + 1}`}
-                        className="max-w-48 max-h-48 rounded-lg object-cover cursor-pointer border-2 border-primary hover:border-primary transition-colors"
-                        onClick={() => setLightboxState({ images: allImageSrcs, index: i })}
-                      />
-                    ))}
-                  </div>
-                )}
-                {!hasOnlyImages && (
-                  <div className="bg-card border border-border text-foreground px-4 py-2.5 rounded-2xl rounded-tl-sm shadow-sm">
-                    <p className="text-[15px] leading-relaxed whitespace-pre-wrap break-words">{message.content}</p>
-                  </div>
-                )}
-                {!hasOnlyImages && (
-                  <button
-                    onClick={handleMenuButton}
-                    className="absolute -right-8 top-1/2 -translate-y-1/2 w-6 h-6 rounded-md flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-foreground/10 lg:opacity-0 lg:group-hover:opacity-100 transition-all cursor-pointer"
-                    title="更多"
-                    aria-label="消息菜单"
-                  >
-                    <Ellipsis className="w-4 h-4" />
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
-
-          {lightboxState && (
-            <ImageLightbox
-              images={lightboxState.images}
-              initialIndex={lightboxState.index}
-              onClose={() => setLightboxState(null)}
-            />
-          )}
-          {contextMenu && (
-            <MessageContextMenu
-              content={message.content}
-              position={contextMenu}
-              onClose={() => setContextMenu(null)}
-              chatJid={message.chat_jid}
-              messageId={message.id}
-            />
-          )}
-        </div>
-      );
-    }
-
-    // User message (own): right-aligned
-    const showSenderLabel = isShared;
+    // User message: right-aligned
     return (
       <div className="group flex justify-end mb-4">
         <div className="flex flex-col items-end min-w-0 max-w-[75%]">
-          {showSenderLabel && (
-            <span className="text-xs text-muted-foreground font-medium mb-1 mr-1">
-              {message.sender_name || currentUser?.display_name || currentUser?.username || '我'}
-            </span>
-          )}
           <div className="relative">
             {/* Image attachments */}
             {images.length > 0 && (
@@ -648,6 +562,5 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
   prev.message.token_usage === next.message.token_usage &&
   prev.showTime === next.showTime &&
   prev.thinkingContent === next.thinkingContent &&
-  prev.thinkingDurationMs === next.thinkingDurationMs &&
-  prev.isShared === next.isShared
+  prev.thinkingDurationMs === next.thinkingDurationMs
 );

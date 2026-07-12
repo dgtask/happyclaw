@@ -99,15 +99,6 @@ interface GroupState {
    * delivery for the same chat. They remain replayable until the contiguous
    * prefix is durably committed. */
   acknowledgedIpcDeliveryIds: Set<string>;
-  /**
-   * HappyClaw user id that started the current run (idle→active), or null when
-   * unknown (IM / task / agent / drain runs, or no initiator supplied). The
-   * stop/interrupt routes use it for a resource-level "owner OR initiator"
-   * check, so a shared member can stop/interrupt only the run they started, not
-   * the owner's. Set by the enqueue that starts a fresh run; cleared on idle.
-   * Subsequent IPC-injected messages during an active run do NOT change it.
-   */
-  currentRunInitiator: string | null;
 }
 
 type ActiveGroupState = GroupState & { groupFolder: string };
@@ -184,7 +175,6 @@ export class GroupQueue {
         hasIpcInjectedMessages: false,
         pendingIpcDeliveries: new Map(),
         acknowledgedIpcDeliveryIds: new Set(),
-        currentRunInitiator: null,
       };
       this.groups.set(groupJid, state);
     }
@@ -377,7 +367,6 @@ export class GroupQueue {
       state.pendingMessages = false;
       this.discardPendingTasks(state, jid);
       this.clearRetryTimer(state);
-      state.currentRunInitiator = null;
       this.waitingGroups.delete(jid);
       this.mutationPreserveStopJids.delete(jid);
     }
@@ -623,39 +612,6 @@ export class GroupQueue {
     return state?.active === true;
   }
 
-  /**
-   * The HappyClaw user id that started the currently-active *message* run owning
-   * this jid's serialization key, or null if unknown / no active run. Used by
-   * the stop/interrupt routes for a resource-level "owner OR initiator" ACL: a
-   * shared member may stop/interrupt only a message run they started themselves.
-   *
-   * Task runs (`activeRunnerIsTask` — scheduled tasks, agent conversations,
-   * terminal warmup) are deliberately EXCLUDED and return null → owner-only.
-   * currentRunInitiator is stamped at message-enqueue time and is NOT touched by
-   * runTask, so a base-jid task (e.g. terminal-warmup, index.ts) sharing the
-   * GroupState can go active while a member's still-pending message left an
-   * initiator on it; gating on `!activeRunnerIsTask` prevents that member from
-   * being mis-read as the task run's initiator (which would let them stop the
-   * owner's task). Not clearing the field in runTask is intentional — it lets
-   * the member's own pending message run still expose them once it starts.
-   *
-   * Unlike resolveActiveState this does NOT require groupFolder to be set, so
-   * the initiator is readable from the instant the run goes active (idle→active)
-   * — even during the cold-start window before registerProcess. It matches on
-   * `active` (+ not-a-task) + serialization key only.
-   */
-  getActiveRunInitiator(groupJid: string): string | null {
-    const own = this.groups.get(groupJid);
-    if (own?.active) {
-      return own.activeRunnerIsTask ? null : (own.currentRunInitiator ?? null);
-    }
-    const activeRunner = this.findActiveRunnerFor(groupJid);
-    if (!activeRunner) return null;
-    const runner = this.groups.get(activeRunner);
-    if (!runner || runner.activeRunnerIsTask) return null;
-    return runner.currentRunInitiator ?? null;
-  }
-
   /** Count active task runners whose JID starts with the given base JID + '#task:' */
   countActiveTaskRunners(baseJid: string): number {
     const prefix = baseJid + '#task:';
@@ -877,7 +833,7 @@ export class GroupQueue {
     return true;
   }
 
-  enqueueMessageCheck(groupJid: string, initiatorUserId?: string): void {
+  enqueueMessageCheck(groupJid: string): void {
     if (this.shuttingDown) return;
 
     const state = this.getGroup(groupJid);
@@ -894,9 +850,6 @@ export class GroupQueue {
     }
 
     if (this.isMutationPaused(groupJid)) {
-      if (initiatorUserId !== undefined) {
-        state.currentRunInitiator = initiatorUserId;
-      }
       state.pendingMessages = true;
       this.waitingGroups.add(groupJid);
       logger.debug({ groupJid }, 'Mutation pause active, message queued');
@@ -918,15 +871,6 @@ export class GroupQueue {
         'Group runner active, message queued',
       );
       return;
-    }
-
-    // Past the active / shared-active check → this jid will start its OWN fresh
-    // run (now, or once capacity frees). Record who initiated it so the
-    // stop/interrupt routes can do an owner-or-initiator check. Only overwrite
-    // when an initiator is explicitly supplied, so internal drain re-enqueues
-    // (no initiator) don't wipe a pending run's initiator.
-    if (initiatorUserId !== undefined) {
-      state.currentRunInitiator = initiatorUserId;
     }
 
     if (!this.hasCapacityFor(groupJid)) {
@@ -1877,7 +1821,6 @@ export class GroupQueue {
       state.groupFolder = null;
       state.agentId = null;
       state.taskRunId = null;
-      state.currentRunInitiator = null;
       this.activeCount--;
       if (isHostMode) {
         this.activeHostProcessCount--;

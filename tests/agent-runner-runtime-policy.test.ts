@@ -8,6 +8,7 @@ import { createMcpTools } from '../container/agent-runner/src/mcp-tools.js';
 import {
   filterHappyclawToolsForPolicy,
   getAgentToolPolicyFlagSettings,
+  parseAgentMcpPolicyMode,
   parseAgentToolPolicyMode,
   resolveAgentToolPolicy,
 } from '../container/agent-runner/src/runtime-tool-policy.js';
@@ -146,9 +147,9 @@ describe('AgentProfile runtime tool capability matrix', () => {
 
       expect(policy.settingSources).toContain('project');
       expect(fs.existsSync(path.join(cwd, 'CLAUDE.md'))).toBe(true);
-      expect(resolved.sources.some((source) => source.source === 'project')).toBe(
-        true,
-      );
+      expect(
+        resolved.sources.some((source) => source.source === 'project'),
+      ).toBe(true);
       expect(resolved.effective.allowManagedHooksOnly).toBe(true);
       // SDK 0.3.205 drops disableSkillShellExecution from managedSettings'
       // restrictive allowlist, so production injects it through the explicit
@@ -164,7 +165,10 @@ describe('AgentProfile runtime tool capability matrix', () => {
   });
 
   test('inherit preserves the existing extension surface', () => {
-    const policy = resolveAgentToolPolicy('inherit', registeredHappyClawTools());
+    const policy = resolveAgentToolPolicy(
+      'inherit',
+      registeredHappyClawTools(),
+    );
     expect(policy).toEqual({
       mode: 'inherit',
       disallowedTools: [],
@@ -175,5 +179,28 @@ describe('AgentProfile runtime tool capability matrix', () => {
       disableSkillShellExecution: false,
     });
     expect(parseAgentToolPolicyMode('unknown')).toBe('inherit');
+  });
+
+  test('custom MCP is an exact external set without project or plugin bypass', () => {
+    const policy = resolveAgentToolPolicy(
+      'inherit',
+      registeredHappyClawTools(),
+      'custom',
+    );
+    expect(policy.loadUserPlugins).toBe(false);
+    expect(policy.includeUserMcpServers).toBe(true);
+    expect(policy.strictMcpConfig).toBe(true);
+    expect(policy.settingSources).toEqual(['project', 'user']);
+  });
+
+  test('disabled MCP removes all external servers but preserves builtin MCP', () => {
+    const tools = registeredHappyClawTools();
+    const policy = resolveAgentToolPolicy('inherit', tools, 'disabled');
+    expect(policy.loadUserPlugins).toBe(false);
+    expect(policy.includeUserMcpServers).toBe(false);
+    expect(policy.strictMcpConfig).toBe(true);
+    expect(policy.allowedHappyclawTools).toBeUndefined();
+    expect(parseAgentMcpPolicyMode('disabled')).toBe('disabled');
+    expect(parseAgentMcpPolicyMode('unknown')).toBe('inherit');
   });
 });

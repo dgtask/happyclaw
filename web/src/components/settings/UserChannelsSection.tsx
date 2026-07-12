@@ -10,7 +10,7 @@ export function UserChannelsSection() {
   return (
     <div className="space-y-6">
       <p className="text-sm text-muted-foreground bg-muted rounded-lg px-4 py-3">
-        绑定你的 IM 账号，消息将默认发送到默认 Agent 的主会话。
+        接入你的 IM 账号或 Bot；接入后可在工作区中绑定具体群聊和会话。
       </p>
       <FeishuChannelCard />
       <TelegramChannelCard />

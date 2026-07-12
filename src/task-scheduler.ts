@@ -782,7 +782,8 @@ async function runTaskInner(
 
   // Update tasks snapshot for container to read (filtered by group)
   const isHome = !!workspaceGroup.is_home;
-  const isAdminHome = isHome && workspace.folder === 'main';
+  const owner = taskOwnerId ? getUserById(taskOwnerId) : null;
+  const isAdminHome = isHome && owner?.role === 'admin';
   const tasks = getAllTasks();
   writeTasksSnapshot(
     workspace.folder,
@@ -800,7 +801,6 @@ async function runTaskInner(
 
   // Store task prompt as a user message in workspace chat so it's visible in conversation
   if (deps.storePromptMessage) {
-    const owner = taskOwnerId ? getUserById(taskOwnerId) : null;
     const senderName = owner?.display_name || owner?.username || '定时任务';
     deps.storePromptMessage(
       effectiveJid,

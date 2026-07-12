@@ -8,10 +8,23 @@ import type {
 } from '../types';
 import { useChatStore } from './chat';
 import { useGroupsStore } from './groups';
-import { buildWorkspaceAgentProfilePatch } from '../utils/agent-product';
+import {
+  buildWorkspaceAgentProfilePatch,
+  getAgentProfileDisplayName,
+} from '../utils/agent-product';
 
 interface AgentProfileDraft {
   name: string;
+  identity_prompt: string;
+}
+
+export interface AgentPromptChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export interface AgentPromptRefinement {
+  reply: string;
   identity_prompt: string;
 }
 
@@ -26,6 +39,14 @@ interface AgentProfilesState {
   loadProfiles: () => Promise<void>;
   loadProfileGovernance: (id: string) => Promise<AgentProfileGovernance>;
   generateProfileDraft: (description: string) => Promise<AgentProfileDraft>;
+  refineProfilePrompt: (
+    id: string,
+    data: {
+      message: string;
+      current_prompt: string;
+      history: AgentPromptChatMessage[];
+    },
+  ) => Promise<AgentPromptRefinement>;
   createProfile: (data: {
     name: string;
     identity_prompt?: string;
@@ -61,7 +82,11 @@ export const useAgentProfilesStore = create<AgentProfilesState>((set, get) => ({
         '/api/agent-profiles',
       );
       set({
-        profiles: data.profiles,
+        profiles: data.profiles.map((profile) =>
+          profile.is_default
+            ? { ...profile, name: getAgentProfileDisplayName(profile.name) }
+            : profile,
+        ),
         loading: false,
         profilesError: null,
         error: null,
@@ -110,6 +135,21 @@ export const useAgentProfilesStore = create<AgentProfilesState>((set, get) => ({
       );
       set({ error: null });
       return res.draft;
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
+      throw err;
+    }
+  },
+
+  refineProfilePrompt: async (id, data) => {
+    try {
+      const res = await api.post<{ refinement: AgentPromptRefinement }>(
+        `/api/agent-profiles/${encodeURIComponent(id)}/refine-prompt`,
+        data,
+        60_000,
+      );
+      set({ error: null });
+      return res.refinement;
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
       throw err;

@@ -76,6 +76,14 @@ export function ImBindingDialog({
 
   const isMainMode = agentId === null;
 
+  const compatibleGroups = useMemo(
+    () =>
+      imGroups.filter((group) =>
+        isMainMode ? !!group.is_thread_capable : !group.is_thread_capable,
+      ),
+    [imGroups, isMainMode],
+  );
+
   const loadGroupsForDialog = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
@@ -124,21 +132,21 @@ export function ImBindingDialog({
   const channelFilters: { key: ChannelFilter; label: string; count: number }[] =
     useMemo(() => {
       const counts = new Map<string, number>();
-      for (const group of imGroups) {
+      for (const group of compatibleGroups) {
         counts.set(
           group.channel_type,
           (counts.get(group.channel_type) ?? 0) + 1,
         );
       }
       return [
-        { key: 'all', label: '全部', count: imGroups.length },
+        { key: 'all', label: '全部', count: compatibleGroups.length },
         ...IM_CHANNEL_ORDER.map((type) => ({
           key: type,
           label: getImChannelCapabilities(type)?.label ?? type,
           count: counts.get(type) ?? 0,
         })),
       ];
-    }, [imGroups]);
+    }, [compatibleGroups]);
 
   const selectedChannelLabel =
     channelFilter === 'all'
@@ -146,7 +154,7 @@ export function ImBindingDialog({
       : (getImChannelCapabilities(channelFilter)?.label ?? channelFilter);
 
   const filteredGroups = useMemo(() => {
-    let groups = imGroups;
+    let groups = compatibleGroups;
     if (channelFilter !== 'all') {
       groups = groups.filter((g) => g.channel_type === channelFilter);
     }
@@ -156,7 +164,7 @@ export function ImBindingDialog({
       (g) =>
         g.name.toLowerCase().includes(q) || g.jid.toLowerCase().includes(q),
     );
-  }, [imGroups, channelFilter, filter]);
+  }, [compatibleGroups, channelFilter, filter]);
 
   const isBoundToThis = (group: AvailableImGroup): boolean => {
     if (isMainMode) {
@@ -253,7 +261,7 @@ export function ImBindingDialog({
         : `会话「${group.bound_target_name}」`;
     }
     if (group.bound_main_jid && group.bound_target_name) {
-      return `工作区「${group.bound_target_name} / 主会话」`;
+      return `工作区「${group.bound_target_name}」`;
     }
     return '其他对话';
   };
@@ -285,8 +293,8 @@ export function ImBindingDialog({
   };
 
   const title = isMainMode
-    ? '绑定消息渠道 — 工作区'
-    : `绑定消息渠道${agent ? ` — ${agent.name}` : ' — 当前会话'}`;
+    ? '工作区绑定'
+    : `会话绑定${agent ? ` — ${agent.name}` : ''}`;
 
   const renderThreadCapability = (group: AvailableImGroup) => {
     if (!group.is_thread_capable) return null;
@@ -308,11 +316,11 @@ export function ImBindingDialog({
             </DialogTitle>
           </DialogHeader>
 
-          {isMainMode && (
-            <div className="rounded-lg border border-border/70 bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-              支持绑定飞书、Telegram、QQ、微信、钉钉、Discord、WhatsApp。具备话题能力的渠道绑定到工作区后，会按话题自动映射独立会话。
-            </div>
-          )}
+          <div className="rounded-lg border border-border/70 bg-muted/40 px-3 py-2 text-xs leading-5 text-muted-foreground">
+            {isMainMode
+              ? '绑定飞书话题群后，每个话题会在当前工作区生成一个独立会话。'
+              : '将普通群或私聊绑定到当前会话，后续消息会继续使用这段上下文。'}
+          </div>
 
           {!loading && !loadError && (
             <div className="space-y-2">
@@ -336,7 +344,7 @@ export function ImBindingDialog({
                   </button>
                 ))}
               </div>
-              {imGroups.length > 0 && (
+              {compatibleGroups.length > 0 && (
                 <SearchInput
                   value={filter}
                   onChange={setFilter}
@@ -370,20 +378,17 @@ export function ImBindingDialog({
               </div>
             )}
 
-            {!loading && !loadError && imGroups.length === 0 && (
+            {!loading && !loadError && compatibleGroups.length === 0 && (
               <div className="text-center py-8 text-muted-foreground text-sm">
-                暂无可绑定的消息通道。请先完成对应渠道配置，并在飞书、Telegram、QQ、微信、钉钉、Discord
-                或 WhatsApp 中向 Bot 发送消息。
-                <br />
-                <span className="text-xs opacity-70">
-                  普通群和私聊可绑定到会话；具备话题能力的渠道绑定到工作区后按话题自动分会话。
-                </span>
+                {isMainMode
+                  ? '暂无可绑定的飞书话题群。请先将 Bot 加入话题群，并发送一条消息。'
+                  : '暂无可绑定的普通群或私聊。请先在对应渠道中向 Bot 发送一条消息。'}
               </div>
             )}
 
             {!loading &&
               !loadError &&
-              imGroups.length > 0 &&
+              compatibleGroups.length > 0 &&
               filteredGroups.length === 0 && (
                 <div className="text-center py-6 text-muted-foreground text-sm">
                   {selectedChannelLabel && !filter.trim()
@@ -398,8 +403,6 @@ export function ImBindingDialog({
                 const boundToThis = isBoundToThis(group);
                 const boundToOther = isBoundToOther(group);
                 const isActioning = actionLoading === group.jid;
-                const cannotBindToSession =
-                  !isMainMode && !!group.is_thread_capable;
                 const supportsActivation =
                   isMainMode && supportsActivationModes(group.channel_type);
                 const effectiveMode = (activationModes[group.jid] ||
@@ -451,7 +454,7 @@ export function ImBindingDialog({
                             已绑定
                             {(group.bound_session_id ?? group.bound_agent_id)
                               ? '会话'
-                              : '主会话'}
+                              : '工作区'}
                             {group.bound_target_name &&
                               `「${
                                 group.bound_workspace_name &&
@@ -463,11 +466,6 @@ export function ImBindingDialog({
                           </span>
                         )}
                       </div>
-                      {cannotBindToSession && (
-                        <div className="mt-1 text-[11px] text-muted-foreground">
-                          该渠道会按话题自动映射会话，只能绑定到工作区。
-                        </div>
-                      )}
                     </div>
 
                     {/* Activation mode selector — only for main-mode channels that support trigger modes. */}
@@ -570,15 +568,6 @@ export function ImBindingDialog({
                         )}
                         换绑
                       </Button>
-                    ) : cannotBindToSession ? (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled
-                        className="flex-shrink-0"
-                      >
-                        仅工作区绑定
-                      </Button>
                     ) : (
                       <Button
                         size="sm"
@@ -608,7 +597,7 @@ export function ImBindingDialog({
         title="确认换绑"
         message={
           rebindTarget
-            ? `该通道当前已绑定到${describeBindTarget(rebindTarget.group)}，确认换绑到当前${isMainMode ? '主会话' : '会话'}吗？`
+            ? `该渠道当前已绑定到${describeBindTarget(rebindTarget.group)}，确认换绑到当前${isMainMode ? '工作区' : '会话'}吗？`
             : ''
         }
         confirmText="换绑"

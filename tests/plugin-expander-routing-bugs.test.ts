@@ -22,20 +22,13 @@
  *             `!` commands belong to the user's real repo, not the synthetic
  *             data/groups path.
  *
- *   P2-bug-5: resolvePluginRuntimeOwner must prefer the message sender on the
- *             admin-shared `web:main` workspace — plugin runtime is per-user
- *             and the message sender is the correct owner (not whichever
- *             admin first materialised the group).
- *
  * The tests directly exercise the pure helpers in plugin-expander-context.ts
- * (makeExpandContext, resolvePluginRuntimeOwner) plus a faithful shadow of
- * the cursor-advance algorithm wired into src/index.ts.
+ * plus a faithful shadow of the cursor-advance algorithm wired into src/index.ts.
  */
 
 import { describe, expect, test } from 'vitest';
 
 import { makeExpandContext } from '../src/plugin-expander-context.js';
-import { resolvePluginRuntimeOwner } from './helpers/legacy-runtime-owner.js';
 
 // ─── P2-bug-4: makeExpandContext customCwd in host mode ─────────────────────
 
@@ -91,97 +84,6 @@ describe('makeExpandContext — P2-bug-4 customCwd honored in host mode', () => 
       containerName: null,
     });
     expect(ctx).toBeNull();
-  });
-});
-
-// ─── P2-bug-5: resolvePluginRuntimeOwner sender-vs-created_by precedence ────
-
-describe('resolvePluginRuntimeOwner — P2-bug-5 admin web:main prefers sender', () => {
-  test('web:main + is_home → sender wins over created_by', () => {
-    const owner = resolvePluginRuntimeOwner({
-      groupJid: 'web:main',
-      isHome: true,
-      createdBy: 'admin-1', // first admin to materialise
-      senderUserId: 'admin-2', // currently typing
-    });
-    expect(owner).toBe('admin-2');
-  });
-
-  test('web:main + is_home + no sender → fall back to created_by', () => {
-    const owner = resolvePluginRuntimeOwner({
-      groupJid: 'web:main',
-      isHome: true,
-      createdBy: 'admin-1',
-      senderUserId: null,
-    });
-    expect(owner).toBe('admin-1');
-  });
-
-  test('non-web:main group → created_by always wins (single-owner)', () => {
-    const owner = resolvePluginRuntimeOwner({
-      groupJid: 'web:home-alice',
-      isHome: true,
-      createdBy: 'alice',
-      senderUserId: 'random-other-user',
-    });
-    expect(owner).toBe('alice');
-  });
-
-  test('web:main but is_home=false → created_by wins (not the shared admin home)', () => {
-    const owner = resolvePluginRuntimeOwner({
-      groupJid: 'web:main',
-      isHome: false,
-      createdBy: 'admin-1',
-      senderUserId: 'admin-2',
-    });
-    expect(owner).toBe('admin-1');
-  });
-
-  test('no created_by + no sender → null (no plugins to expand)', () => {
-    const owner = resolvePluginRuntimeOwner({
-      groupJid: 'web:home-orphan',
-      isHome: false,
-      createdBy: null,
-      senderUserId: null,
-    });
-    expect(owner).toBeNull();
-  });
-});
-
-// ─── #19 P2-5: agent conversation virtualChatJid still hits web:main path ───
-
-describe('resolvePluginRuntimeOwner — #19 P2-5 strips #agent: suffix before web:main check', () => {
-  test('virtualChatJid web:main#agent:abc + is_home → sender wins (just like web:main does)', () => {
-    // Before #19 P2-5, the helper compared the literal jid against `web:main`
-    // and an agent conversation tab's jid `web:main#agent:abc` failed that
-    // check, falling back to created_by → wrong admin owner for a shared home.
-    const owner = resolvePluginRuntimeOwner({
-      groupJid: 'web:main#agent:abc-123',
-      isHome: true,
-      createdBy: 'admin-1',
-      senderUserId: 'admin-2',
-    });
-    expect(owner).toBe('admin-2');
-  });
-
-  test('virtualChatJid web:main#agent:abc + no sender → falls back to created_by', () => {
-    const owner = resolvePluginRuntimeOwner({
-      groupJid: 'web:main#agent:abc-123',
-      isHome: true,
-      createdBy: 'admin-1',
-      senderUserId: null,
-    });
-    expect(owner).toBe('admin-1');
-  });
-
-  test('non-web:main virtualChatJid (e.g. web:home-alice#agent:x) keeps single-owner semantics', () => {
-    const owner = resolvePluginRuntimeOwner({
-      groupJid: 'web:home-alice#agent:abc-123',
-      isHome: true,
-      createdBy: 'alice',
-      senderUserId: 'random-other',
-    });
-    expect(owner).toBe('alice');
   });
 });
 

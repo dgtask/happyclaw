@@ -25,6 +25,8 @@ interface MessageListProps {
   onInterrupt?: () => void;
   /** If set, this MessageList is showing a sub-agent's messages */
   agentId?: string;
+  /** Human-readable name of the active conversation for empty-state clarity */
+  contextLabel?: string;
   /** Callback to send a message (used for quick prompts in empty state) */
   onSend?: (content: string) => void;
 }
@@ -51,11 +53,10 @@ const quickPrompts = [
   { icon: Wrench, title: '调试问题', desc: '帮我定位和修复一个 Bug' },
 ];
 
-export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid, isWaiting, onInterrupt, agentId, onSend }: MessageListProps) {
+export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid, isWaiting, onInterrupt, agentId, contextLabel, onSend }: MessageListProps) {
   const { mode: displayMode } = useDisplayMode();
   const thinkingCache = useChatStore(s => s.thinkingCache ?? {});
   const thinkingDurationCache = useChatStore(s => s.thinkingDurationCache ?? {});
-  const isShared = useChatStore(s => !!s.groups[groupJid ?? '']?.is_shared);
   // Spawn agents: selector returns stable reference (the agents array itself),
   // then useMemo filters for spawn kind. Direct .filter() in selector causes
   // infinite re-render because Zustand sees a new array reference every time.
@@ -501,7 +502,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
                 data-index={virtualItem.index}
               >
                 <ErrorBoundary>
-                  <MessageBubble message={message} showTime={showTime} thinkingContent={thinkingCache[message.id]} thinkingDurationMs={thinkingDurationCache[message.id]} isShared={isShared} />
+                  <MessageBubble message={message} showTime={showTime} thinkingContent={thinkingCache[message.id]} thinkingDurationMs={thinkingDurationCache[message.id]} />
                 </ErrorBoundary>
               </div>
             );
@@ -521,9 +522,13 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
                   className="mt-0.5 !h-10 !w-10 shrink-0 !text-lg"
                 />
                 <div className="min-w-0 flex-1">
-                  <h2 className="text-xl font-semibold leading-7 text-foreground">开始主会话</h2>
+                  <h2 className="text-xl font-semibold leading-7 text-foreground">
+                    {agentId ? '开始当前会话' : '开始主会话'}
+                  </h2>
                   <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
-                    我是 {aiName}。直接输入你的问题，或从下面选择一个常用起点。
+                    {agentId && contextLabel
+                      ? `“${contextLabel}”使用独立上下文。直接输入你的问题。`
+                      : `我是 ${aiName}。直接输入你的问题，或从下面选择一个常用起点。`}
                   </p>
                 </div>
               </div>
