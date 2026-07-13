@@ -221,6 +221,22 @@ export const AgentProfileRuntimePolicySchema = z
     context: z
       .object({
         source: z.enum(['managed', 'host_claude']).optional(),
+        auto_compact_window: z
+          .number()
+          .int()
+          .refine(
+            (value) => value === 0 || (value >= 100000 && value <= 1000000),
+            'auto_compact_window must be 0 or between 100000 and 1000000',
+          )
+          .optional(),
+        auto_compact_percentage: z
+          .number()
+          .int()
+          .refine(
+            (value) => value === 0 || (value >= 50 && value <= 90),
+            'auto_compact_percentage must be 0 or between 50 and 90',
+          )
+          .optional(),
       })
       .optional(),
     skills: z
@@ -251,6 +267,12 @@ export const AgentProfileCreateSchema = z.object({
     .optional()
     .transform((val) => (val == null ? undefined : val.trim())),
   include_claude_preset: z.boolean().optional(),
+  avatar_emoji: z.string().max(8).nullable().optional(),
+  avatar_color: z
+    .string()
+    .regex(/^#[0-9a-fA-F]{6}$/)
+    .nullable()
+    .optional(),
   runtime_policy: AgentProfileRuntimePolicySchema.optional(),
 });
 
@@ -262,6 +284,12 @@ export const AgentProfilePatchSchema = z.object({
     .optional()
     .transform((val) => (val == null ? undefined : val.trim())),
   include_claude_preset: z.boolean().optional(),
+  avatar_emoji: z.string().max(8).nullable().optional(),
+  avatar_color: z
+    .string()
+    .regex(/^#[0-9a-fA-F]{6}$/)
+    .nullable()
+    .optional(),
   runtime_policy: AgentProfileRuntimePolicySchema.optional(),
 });
 
@@ -367,53 +395,81 @@ export const RegistrationConfigSchema = z.object({
   requireInviteCode: z.boolean(),
 });
 
-export const SystemSettingsSchema = z.object({
-  containerTimeout: z.number().int().min(60000).max(86400000).optional(),
-  idleTimeout: z.number().int().min(60000).max(86400000).optional(),
-  containerMaxOutputSize: z
-    .number()
-    .int()
-    .min(1048576)
-    .max(104857600)
-    .optional(),
-  maxConcurrentContainers: z.number().int().min(1).max(100).optional(),
-  maxConcurrentHostProcesses: z.number().int().min(1).max(50).optional(),
-  maxLoginAttempts: z.number().int().min(1).max(100).optional(),
-  loginLockoutMinutes: z.number().int().min(1).max(1440).optional(),
-  maxConcurrentScripts: z.number().int().min(1).max(50).optional(),
-  scriptTimeout: z.number().int().min(5000).max(600000).optional(),
-  billingEnabled: z.boolean().optional(),
-  billingMode: z.literal('wallet_first').optional(),
-  billingMinStartBalanceUsd: z.number().min(0).max(1000000).optional(),
-  billingCurrency: z.string().min(1).max(10).optional(),
-  billingCurrencyRate: z.number().min(0.0001).max(1000000).optional(),
-  externalClaudeDir: z.string().max(512).optional(),
-  autoCompactWindow: z
-    .number()
-    .int()
-    .refine(
-      (v) => v === 0 || (v >= 100000 && v <= 1000000),
-      'autoCompactWindow must be 0 (disabled) or between 100000 and 1000000',
-    )
-    .optional(),
-  subagentModel: z.string().min(1).max(64).optional(),
-  disableMemoryLayerForAdminHost: z.boolean().optional(),
-  pluginAutoScan: z.boolean().optional(),
-  taskBackfillGraceMs: z
-    .number()
-    .int()
-    .refine(
-      (v) => v === 0 || (v >= 1000 && v <= 86400000),
-      'taskBackfillGraceMs must be 0 (disabled) or between 1000 (1s) and 86400000 (24h)',
-    )
-    .optional(),
-});
+export const SystemSettingsSchema = z
+  .object({
+    containerTimeout: z.number().int().min(60000).max(86400000).optional(),
+    idleTimeout: z.number().int().min(60000).max(86400000).optional(),
+    containerMaxOutputSize: z
+      .number()
+      .int()
+      .min(1048576)
+      .max(104857600)
+      .optional(),
+    maxConcurrentContainers: z.number().int().min(1).max(100).optional(),
+    maxConcurrentHostProcesses: z.number().int().min(1).max(50).optional(),
+    maxLoginAttempts: z.number().int().min(1).max(100).optional(),
+    loginLockoutMinutes: z.number().int().min(1).max(1440).optional(),
+    maxConcurrentScripts: z.number().int().min(1).max(50).optional(),
+    scriptTimeout: z.number().int().min(5000).max(600000).optional(),
+    taskBackfillGraceMs: z
+      .number()
+      .int()
+      .refine(
+        (v) => v === 0 || (v >= 1000 && v <= 86400000),
+        'taskBackfillGraceMs must be 0 (disabled) or between 1000 (1s) and 86400000 (24h)',
+      )
+      .optional(),
+  })
+  .strict();
+
+export const HostIntegrationSettingsSchema = z
+  .object({
+    externalClaudeDir: z.string().max(512).optional(),
+    pluginAutoScan: z.boolean().optional(),
+    mainAgentContextSource: z.enum(['managed', 'host_claude']).optional(),
+    mainAgentAutoCompactWindow: z
+      .number()
+      .int()
+      .refine(
+        (value) => value === 0 || (value >= 100000 && value <= 1000000),
+        'mainAgentAutoCompactWindow must be 0 or between 100000 and 1000000',
+      )
+      .optional(),
+    mainAgentAutoCompactPercentage: z
+      .number()
+      .int()
+      .refine(
+        (value) => value === 0 || (value >= 50 && value <= 90),
+        'mainAgentAutoCompactPercentage must be 0 or between 50 and 90',
+      )
+      .optional(),
+  })
+  .strict();
+
+export const BillingSettingsSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    minStartBalanceUsd: z.number().min(0).max(1000000).optional(),
+    currency: z.string().trim().min(1).max(10).optional(),
+    currencyRate: z.number().min(0.0001).max(1000000).optional(),
+  })
+  .strict();
 
 export const AppearanceConfigSchema = z.object({
-  appName: z.string().max(32).optional(),
-  aiName: z.string().min(1).max(32),
-  aiAvatarEmoji: z.string().min(1).max(8),
-  aiAvatarColor: z.string().regex(/^#[0-9a-fA-F]{6}$/),
+  appName: z.string().min(1).max(32).optional(),
+  // Compatibility field names; these now describe the global main Agent.
+  aiName: z.string().min(1).max(32).optional(),
+  aiAvatarEmoji: z.string().min(1).max(8).optional(),
+  aiAvatarColor: z
+    .string()
+    .regex(/^#[0-9a-fA-F]{6}$/)
+    .optional(),
+  aiAvatarUrl: z
+    .string()
+    .regex(/^\/api\/auth\/avatars\/[a-zA-Z0-9._-]+$/)
+    .nullable()
+    .optional(),
+  aiAvatarMode: z.enum(['brand', 'emoji']).optional(),
 });
 
 export const ChangePasswordSchema = z.object({

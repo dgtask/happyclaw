@@ -1,11 +1,14 @@
 import type { WebDeps } from './web-context.js';
 import {
+  computeAgentProfileIdentityHash,
   getAllRegisteredGroups,
   getJidsByFolder,
   getOrCreateDefaultAgentProfile,
+  getUserById,
   getWorkspaceAgentProfileId,
 } from './db.js';
-import type { RegisteredGroup } from './types.js';
+import { getSystemSettings } from './runtime-config.js';
+import type { AgentProfile, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
 export interface AgentProfileWorkspace {
@@ -16,6 +19,56 @@ export interface AgentProfileWorkspace {
 export interface WorkspaceRuntimeQuiesceTarget {
   folder: string;
   primaryJid?: string;
+}
+
+/**
+ * Resolve security-sensitive policy at execution time. Persisted profile data
+ * is never sufficient authorization: role downgrades must take effect without
+ * rewriting every historical profile.
+ */
+export function resolveEffectiveAgentProfile(
+  profile: AgentProfile | undefined,
+): AgentProfile | undefined {
+  if (!profile) return undefined;
+  const owner = getUserById(profile.owner_user_id);
+  const contextSource =
+    owner?.role !== 'admin'
+      ? 'managed'
+      : profile.is_default
+        ? getSystemSettings().mainAgentContextSource
+        : profile.runtime_policy.context.source;
+  const autoCompactWindow = profile.is_default
+    ? getSystemSettings().mainAgentAutoCompactWindow
+    : profile.runtime_policy.context.auto_compact_window;
+  const autoCompactPercentage = profile.is_default
+    ? getSystemSettings().mainAgentAutoCompactPercentage
+    : profile.runtime_policy.context.auto_compact_percentage;
+  return {
+    ...profile,
+    identity_hash: computeAgentProfileIdentityHash(
+      profile.identity_prompt,
+      profile.include_claude_preset,
+      {
+        ...profile.runtime_policy,
+        context: {
+          ...profile.runtime_policy.context,
+          source: contextSource,
+          auto_compact_window: autoCompactWindow,
+          auto_compact_percentage: autoCompactPercentage,
+        },
+      },
+      profile.name,
+    ),
+    runtime_policy: {
+      ...profile.runtime_policy,
+      context: {
+        ...profile.runtime_policy.context,
+        source: contextSource,
+        auto_compact_window: autoCompactWindow,
+        auto_compact_percentage: autoCompactPercentage,
+      },
+    },
+  };
 }
 
 export class WorkspaceRuntimeQuiesceError<T = unknown> extends Error {

@@ -133,6 +133,9 @@ interface GroupPayloadItem {
   agent_profile_id?: string;
   agent_profile_name?: string;
   agent_profile_version?: number;
+  agent_profile_avatar_emoji?: string | null;
+  agent_profile_avatar_color?: string | null;
+  agent_profile_avatar_url?: string | null;
 }
 
 function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
@@ -229,6 +232,9 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
       agent_profile_id: agentProfile?.id,
       agent_profile_name: agentProfile?.name,
       agent_profile_version: agentProfile?.version,
+      agent_profile_avatar_emoji: agentProfile?.avatar_emoji,
+      agent_profile_avatar_color: agentProfile?.avatar_color,
+      agent_profile_avatar_url: agentProfile?.avatar_url,
     };
   }
 
@@ -654,6 +660,9 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     agent_profile_id: publishedAgentProfile.id,
     agent_profile_name: publishedAgentProfile.name,
     agent_profile_version: publishedAgentProfile.version,
+    agent_profile_avatar_emoji: publishedAgentProfile.avatar_emoji,
+    agent_profile_avatar_color: publishedAgentProfile.avatar_color,
+    agent_profile_avatar_url: publishedAgentProfile.avatar_url,
   };
 
   return c.json({
@@ -1212,10 +1221,7 @@ groupRoutes.post('/:jid/stop', authMiddleware, async (c) => {
     return c.json({ error: 'Group not found' }, 404);
   }
   if (
-    !canModifyGroup(
-      { id: authUser.id, role: authUser.role },
-      { ...group, jid },
-    )
+    !canModifyGroup({ id: authUser.id, role: authUser.role }, { ...group, jid })
   ) {
     return c.json({ error: 'Only the workspace owner can stop it' }, 403);
   }
@@ -1638,7 +1644,8 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
       if (siblingJid === jid) continue;
       const siblingGroup = getRegisteredGroup(siblingJid);
       if (!siblingGroup) continue;
-      const ownerMatch = group.created_by && siblingGroup.created_by === group.created_by;
+      const ownerMatch =
+        group.created_by && siblingGroup.created_by === group.created_by;
       if (ownerMatch) {
         queryJids.push(siblingJid);
       }

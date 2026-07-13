@@ -38,9 +38,9 @@ export function usePairedChats({ endpoint }: UsePairedChatsOptions) {
       try {
         await api.delete(`${endpoint}/${encodeURIComponent(jid)}`);
         setChats((prev) => prev.filter((c) => c.jid !== jid));
-        toast.success('已移除配对聊天');
+        toast.success('已删除接入记录与本地历史');
       } catch (err) {
-        toast.error(getErrorMessage(err, '移除配对聊天失败'));
+        toast.error(getErrorMessage(err, '删除接入记录失败'));
       } finally {
         setRemovingJid(null);
       }

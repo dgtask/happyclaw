@@ -104,6 +104,9 @@ export interface AgentProfile {
   name: string;
   identity_prompt: string;
   include_claude_preset: boolean;
+  avatar_emoji: string | null;
+  avatar_color: string | null;
+  avatar_url: string | null;
   runtime_policy: AgentProfileRuntimePolicy;
   identity_hash: string;
   version: number;
@@ -117,6 +120,8 @@ export interface AgentProfileRuntimePolicy {
   provider_id: string | null;
   context: {
     source: 'managed' | 'host_claude';
+    auto_compact_window: number;
+    auto_compact_percentage: number;
   };
   skills: {
     mode: 'inherit' | 'custom' | 'disabled';
@@ -350,7 +355,9 @@ export type AuthEventType =
   | 'invite_deleted'
   | 'invite_used'
   | 'recovery_reset'
-  | 'register_success';
+  | 'register_success'
+  | 'system_settings_updated'
+  | 'host_integration_updated';
 
 export interface AuthAuditLog {
   id: number;
@@ -703,7 +710,8 @@ export type BillingAuditEventType =
   | 'code_deleted'
   | 'wallet_blocked'
   | 'wallet_unblocked'
-  | 'quota_exceeded';
+  | 'quota_exceeded'
+  | 'billing_settings_updated';
 
 export interface BillingAuditLog {
   id: number;

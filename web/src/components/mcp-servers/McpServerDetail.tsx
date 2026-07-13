@@ -202,6 +202,7 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
                         className="w-1/3 font-mono text-sm"
                       />
                       <Input
+                        type={showEnvValues[`header:${row.key}`] ? 'text' : 'password'}
                         value={row.value}
                         onChange={(e) => {
                           const next = [...editHeaders];
@@ -211,6 +212,22 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
                         placeholder="value"
                         className="flex-1 font-mono text-sm"
                       />
+                      <button
+                        type="button"
+                        onClick={() => toggleEnvVisibility(`header:${row.key}`)}
+                        className="p-1.5 text-muted-foreground transition-colors hover:text-foreground"
+                        aria-label={
+                          showEnvValues[`header:${row.key}`]
+                            ? '隐藏 Header 值'
+                            : '显示 Header 值'
+                        }
+                      >
+                        {showEnvValues[`header:${row.key}`] ? (
+                          <EyeOff size={16} />
+                        ) : (
+                          <Eye size={16} />
+                        )}
+                      </button>
                       <button
                         type="button"
                         onClick={() => setEditHeaders(editHeaders.filter((_, j) => j !== i))}
@@ -295,6 +312,7 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
                         className="w-1/3 font-mono text-sm"
                       />
                       <Input
+                        type={showEnvValues[`env:${row.key}`] ? 'text' : 'password'}
                         value={row.value}
                         onChange={(e) => {
                           const next = [...editEnv];
@@ -304,6 +322,22 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
                         placeholder="value"
                         className="flex-1 font-mono text-sm"
                       />
+                      <button
+                        type="button"
+                        onClick={() => toggleEnvVisibility(`env:${row.key}`)}
+                        className="p-1.5 text-muted-foreground transition-colors hover:text-foreground"
+                        aria-label={
+                          showEnvValues[`env:${row.key}`]
+                            ? '隐藏环境变量值'
+                            : '显示环境变量值'
+                        }
+                      >
+                        {showEnvValues[`env:${row.key}`] ? (
+                          <EyeOff size={16} />
+                        ) : (
+                          <Eye size={16} />
+                        )}
+                      </button>
                       <button
                         type="button"
                         onClick={() => setEditEnv(editEnv.filter((_, j) => j !== i))}
@@ -382,14 +416,14 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
                           <span className="font-mono text-xs text-foreground font-medium">{key}</span>
                           <span className="text-muted-foreground/50">:</span>
                           <span className="font-mono text-xs text-muted-foreground flex-1 truncate">
-                            {showEnvValues[key] ? value : '••••••••'}
+                            {showEnvValues[`header:${key}`] ? value : '••••••••'}
                           </span>
                           <button
                             type="button"
-                            onClick={() => toggleEnvVisibility(key)}
+                            onClick={() => toggleEnvVisibility(`header:${key}`)}
                             className="p-1 text-muted-foreground hover:text-foreground transition-colors"
                           >
-                            {showEnvValues[key] ? <EyeOff size={14} /> : <Eye size={14} />}
+                            {showEnvValues[`header:${key}`] ? <EyeOff size={14} /> : <Eye size={14} />}
                           </button>
                         </div>
                       ))}
@@ -437,14 +471,14 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
                           <span className="font-mono text-xs text-foreground font-medium">{key}</span>
                           <span className="text-muted-foreground/50">=</span>
                           <span className="font-mono text-xs text-muted-foreground flex-1 truncate">
-                            {showEnvValues[key] ? value : '••••••••'}
+                            {showEnvValues[`env:${key}`] ? value : '••••••••'}
                           </span>
                           <button
                             type="button"
-                            onClick={() => toggleEnvVisibility(key)}
+                            onClick={() => toggleEnvVisibility(`env:${key}`)}
                             className="p-1 text-muted-foreground hover:text-foreground transition-colors"
                           >
-                            {showEnvValues[key] ? <EyeOff size={14} /> : <Eye size={14} />}
+                            {showEnvValues[`env:${key}`] ? <EyeOff size={14} /> : <Eye size={14} />}
                           </button>
                         </div>
                       ))}

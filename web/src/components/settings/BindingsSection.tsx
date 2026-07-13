@@ -450,18 +450,18 @@ export function BindingsSection() {
         confirmText="解除绑定"
       />
 
-      {/* Reset sender allowlist confirm dialog */}
+      {/* Release sender restriction confirm dialog */}
       <ConfirmDialog
         open={!!resetAllowlistGroup}
         onClose={() => setResetAllowlistGroup(null)}
         onConfirm={confirmResetAllowlist}
-        title="重置发言者白名单"
+        title="解除发言者限制"
         message={
           resetAllowlistGroup
-            ? `「${resetAllowlistGroup.name}」当前白名单为空，没人能触发 bot。重置后白名单将被清空，群内所有成员都能触发 bot。继续？`
+            ? `「${resetAllowlistGroup.name}」当前没有可触发机器人的成员。解除限制后，群内允许成员将可以触发机器人。继续？`
             : ''
         }
-        confirmText="重置白名单"
+        confirmText="解除限制"
       />
 
       {/* Delete IM group confirm dialog */}
@@ -469,13 +469,14 @@ export function BindingsSection() {
         open={!!deleteGroup}
         onClose={() => setDeleteGroup(null)}
         onConfirm={confirmDelete}
-        title="删除 IM 渠道"
+        title="删除接入记录与本地历史"
         message={
           deleteGroup
-            ? `确认从 HappyClaw 中删除「${deleteGroup.name}」的注册记录？此操作仅清理本机绑定，不会影响该 IM 群本身。如果 bot 之后再次收到该群消息，会自动重新注册。`
+            ? `确认删除「${deleteGroup.name}」的接入记录？此操作会删除它在 HappyClaw 中的渠道绑定、本地消息、关联会话及运行数据，且不可撤销；不会删除 IM 平台上的群聊。如果机器人之后再次收到该群消息，它可能会重新注册。若只是更换路由，请使用“解绑”。`
             : ''
         }
-        confirmText="删除"
+        confirmText="删除接入记录"
+        confirmVariant="danger"
       />
     </div>
   );

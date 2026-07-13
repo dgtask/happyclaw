@@ -17,7 +17,9 @@ const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'happyclaw-tool-init-'));
 const runnerRoot = path.resolve('container/agent-runner');
 const runnerRequire = createRequire(path.join(runnerRoot, 'package.json'));
 const runnerSdkEntry = runnerRequire.resolve('@anthropic-ai/claude-agent-sdk');
-const runnerSdk = (await import(pathToFileURL(runnerSdkEntry).href)) as typeof import('@anthropic-ai/claude-agent-sdk');
+const runnerSdk = (await import(
+  pathToFileURL(runnerSdkEntry).href
+)) as typeof import('@anthropic-ai/claude-agent-sdk');
 const runnerClaudeExecutable = path.join(
   runnerRoot,
   'node_modules',
@@ -35,7 +37,11 @@ function cleanEnv(): Record<string, string> {
 
 async function captureInitializedTools(
   mode: Exclude<AgentToolPolicyMode, 'inherit'>,
-): Promise<{ actual: string[]; expectedBuiltins: string[]; expectedMcp: string[] }> {
+): Promise<{
+  actual: string[];
+  expectedBuiltins: string[];
+  expectedMcp: string[];
+}> {
   const allTools = createMcpTools({
     chatJid: 'web:tool-init',
     groupFolder: 'tool-init',
@@ -47,7 +53,6 @@ async function captureInitializedTools(
     workspaceGroup: cwd,
     workspaceGlobal: path.join(cwd, 'global'),
     workspaceMemory: path.join(cwd, 'memory'),
-    disableMemoryLayer: false,
   });
   const policy = resolveAgentToolPolicy(
     mode,
@@ -113,14 +118,14 @@ describe('real Claude CLI tool initialization', () => {
     const runnerLock = JSON.parse(
       fs.readFileSync(path.join(runnerRoot, 'package-lock.json'), 'utf8'),
     ) as {
-      packages: Record<string, { version?: string; dependencies?: Record<string, string> }>;
+      packages: Record<
+        string,
+        { version?: string; dependencies?: Record<string, string> }
+      >;
     };
     const importedSdkPackage = JSON.parse(
       fs.readFileSync(
-        path.join(
-          path.dirname(runnerSdkEntry),
-          'package.json',
-        ),
+        path.join(path.dirname(runnerSdkEntry), 'package.json'),
         'utf8',
       ),
     ) as { version: string };
@@ -156,9 +161,7 @@ describe('real Claude CLI tool initialization', () => {
       }).trim(),
     ).toContain(pinnedCli);
     expect(
-      runnerLock.packages[''].dependencies?.[
-        '@anthropic-ai/claude-agent-sdk'
-      ],
+      runnerLock.packages[''].dependencies?.['@anthropic-ai/claude-agent-sdk'],
     ).toBe(pinned);
 
     const dockerfile = fs.readFileSync('container/Dockerfile', 'utf8');

@@ -123,6 +123,8 @@ describe('/api/agent-profiles routes', () => {
     expect(body.profiles[0].is_default).toBe(true);
     expect(body.profiles[0].runtime_policy.context).toEqual({
       source: 'managed',
+      auto_compact_window: 0,
+      auto_compact_percentage: 0,
     });
   });
 
@@ -149,7 +151,11 @@ describe('/api/agent-profiles routes', () => {
     expect(created.include_claude_preset).toBe(false);
     expect(created.runtime_policy).toMatchObject({
       provider_id: null,
-      context: { source: 'managed' },
+      context: {
+        source: 'managed',
+        auto_compact_window: 0,
+        auto_compact_percentage: 0,
+      },
       skills: { mode: 'custom', ids: ['research'] },
       tools: { mode: 'readonly' },
     });
@@ -176,7 +182,11 @@ describe('/api/agent-profiles routes', () => {
     expect(patchedBody.profile.include_claude_preset).toBe(true);
     expect(patchedBody.profile.runtime_policy).toMatchObject({
       provider_id: null,
-      context: { source: 'managed' },
+      context: {
+        source: 'managed',
+        auto_compact_window: 0,
+        auto_compact_percentage: 0,
+      },
       skills: { mode: 'disabled', ids: [] },
       mcp: { mode: 'custom', ids: ['github'] },
       tools: { mode: 'restricted' },
@@ -248,7 +258,11 @@ describe('/api/agent-profiles routes', () => {
     const body = await res.json();
     expect(body.profile.runtime_policy).toEqual({
       provider_id: null,
-      context: { source: 'managed' },
+      context: {
+        source: 'managed',
+        auto_compact_window: 0,
+        auto_compact_percentage: 0,
+      },
       skills: { mode: 'custom', ids: ['research'] },
       mcp: { mode: 'custom', ids: ['github'] },
       tools: { mode: 'readonly' },
@@ -305,6 +319,8 @@ describe('/api/agent-profiles routes', () => {
     expect(createRes.status).toBe(201);
     expect((await createRes.json()).profile.runtime_policy.context).toEqual({
       source: 'host_claude',
+      auto_compact_window: 0,
+      auto_compact_percentage: 0,
     });
 
     const defaultProfile = db
@@ -322,7 +338,11 @@ describe('/api/agent-profiles routes', () => {
     });
     expect(patchRes.status).toBe(200);
     const patched = (await patchRes.json()).profile;
-    expect(patched.runtime_policy.context).toEqual({ source: 'host_claude' });
+    expect(patched.runtime_policy.context).toEqual({
+      source: 'host_claude',
+      auto_compact_window: 0,
+      auto_compact_percentage: 0,
+    });
     expect(patched.version).toBe(defaultProfile.version + 1);
     expect(patched.identity_hash).not.toBe(defaultProfile.identity_hash);
 

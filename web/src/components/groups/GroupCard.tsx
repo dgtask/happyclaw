@@ -57,11 +57,6 @@ export function GroupCard({ group }: GroupCardProps) {
                   <span className="inline-flex min-w-0 items-center gap-1 text-foreground font-medium">
                     <Bot className="h-3.5 w-3.5 text-muted-foreground" />
                     <span className="truncate">{group.agent_profile_name}</span>
-                    {group.agent_profile_version && (
-                      <span className="text-xs text-muted-foreground">
-                        v{group.agent_profile_version}
-                      </span>
-                    )}
                   </span>
                 </div>
               )}

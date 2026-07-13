@@ -10,6 +10,8 @@ fs.mkdirSync(tmpStoreDir, { recursive: true });
 fs.mkdirSync(tmpGroupsDir, { recursive: true });
 
 vi.mock('../src/config.js', async () => ({
+  ASSISTANT_NAME: 'HappyClaw',
+  DATA_DIR: tmpDir,
   STORE_DIR: tmpStoreDir,
   GROUPS_DIR: tmpGroupsDir,
 }));
@@ -20,6 +22,7 @@ vi.mock('../src/logger.js', () => ({
 
 const db = await import('../src/db.js');
 const runtime = await import('../src/agent-profile-runtime.js');
+const runtimeConfig = await import('../src/runtime-config.js');
 
 beforeAll(() => {
   db.initDatabase();
@@ -30,6 +33,63 @@ afterAll(() => {
 });
 
 describe('AgentProfile runtime invalidation', () => {
+  test('default HappyClaw takes its compact threshold from global policy', () => {
+    const userId = 'agent-profile-runtime-default-compact';
+    const now = new Date().toISOString();
+    db.createUser({
+      id: userId,
+      username: userId,
+      password_hash: 'hash',
+      display_name: userId,
+      role: 'member',
+      status: 'active',
+      created_at: now,
+      updated_at: now,
+      must_change_password: false,
+    });
+    runtimeConfig.saveSystemSettings({
+      mainAgentAutoCompactWindow: 0,
+      mainAgentAutoCompactPercentage: 80,
+    });
+    const profile = db.getOrCreateDefaultAgentProfile(userId);
+    const effective = runtime.resolveEffectiveAgentProfile(profile);
+    expect(effective?.runtime_policy.context.source).toBe('managed');
+    expect(effective?.runtime_policy.context.auto_compact_window).toBe(0);
+    expect(effective?.runtime_policy.context.auto_compact_percentage).toBe(80);
+  });
+
+  test('role downgrade forces persisted host context back to managed', () => {
+    const userId = 'agent-profile-runtime-role-downgrade';
+    const now = new Date().toISOString();
+    db.createUser({
+      id: userId,
+      username: userId,
+      password_hash: 'hash',
+      display_name: userId,
+      role: 'admin',
+      status: 'active',
+      created_at: now,
+      updated_at: now,
+      must_change_password: false,
+    });
+    const profile = db.createAgentProfile({
+      ownerUserId: userId,
+      name: 'Host Agent',
+      runtimePolicy: { context: { source: 'host_claude' } },
+    });
+    expect(
+      runtime.resolveEffectiveAgentProfile(profile)?.runtime_policy.context
+        .source,
+    ).toBe('host_claude');
+    const adminEffectiveHash =
+      runtime.resolveEffectiveAgentProfile(profile)?.identity_hash;
+
+    db.updateUserFields(userId, { role: 'member' });
+    const memberEffective = runtime.resolveEffectiveAgentProfile(profile);
+    expect(memberEffective?.runtime_policy.context.source).toBe('managed');
+    expect(memberEffective?.identity_hash).not.toBe(adminEffectiveHash);
+  });
+
   test('opposite multi-profile lock order is serialized without deadlock', async () => {
     const events: string[] = [];
     let releaseFirst!: () => void;

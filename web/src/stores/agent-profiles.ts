@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { api } from '../api/client';
+import { api, apiFetch } from '../api/client';
 import type {
   AgentProfile,
   AgentProfileGovernance,
@@ -51,6 +51,8 @@ interface AgentProfilesState {
     name: string;
     identity_prompt?: string;
     include_claude_preset?: boolean;
+    avatar_emoji?: string | null;
+    avatar_color?: string | null;
     runtime_policy?: AgentProfileRuntimePolicy;
   }) => Promise<AgentProfile>;
   updateProfile: (
@@ -59,9 +61,13 @@ interface AgentProfilesState {
       name?: string;
       identity_prompt?: string;
       include_claude_preset?: boolean;
+      avatar_emoji?: string | null;
+      avatar_color?: string | null;
       runtime_policy?: AgentProfileRuntimePolicy;
     },
   ) => Promise<AgentProfile>;
+  uploadProfileAvatar: (id: string, file: File) => Promise<AgentProfile>;
+  removeProfileAvatar: (id: string) => Promise<AgentProfile>;
   deleteProfile: (id: string) => Promise<void>;
   setWorkspaceAgentProfile: (jid: string, profileId: string) => Promise<void>;
 }
@@ -202,6 +208,33 @@ export const useAgentProfilesStore = create<AgentProfilesState>((set, get) => ({
       set({ error: err instanceof Error ? err.message : String(err) });
       throw err;
     }
+  },
+
+  uploadProfileAvatar: async (id, file) => {
+    const body = new FormData();
+    body.append('avatar', file);
+    const res = await apiFetch<{ profile: AgentProfile }>(
+      `/api/agent-profiles/${encodeURIComponent(id)}/avatar`,
+      { method: 'POST', body },
+    );
+    set((state) => ({
+      profiles: state.profiles.map((profile) =>
+        profile.id === id ? res.profile : profile,
+      ),
+    }));
+    return res.profile;
+  },
+
+  removeProfileAvatar: async (id) => {
+    const res = await api.delete<{ profile: AgentProfile }>(
+      `/api/agent-profiles/${encodeURIComponent(id)}/avatar`,
+    );
+    set((state) => ({
+      profiles: state.profiles.map((profile) =>
+        profile.id === id ? res.profile : profile,
+      ),
+    }));
+    return res.profile;
   },
 
   deleteProfile: async (id) => {

@@ -55,7 +55,12 @@ function validateServerId(id: string): boolean {
   // Length cap mirrors MAX_MCP_KEY_LEN (256) — id is the JSON object key
   // inside servers.json, an unbounded length there can balloon the file
   // into multi-MB and slow every container spawn that JSON.parses it.
-  return id.length > 0 && id.length <= 256 && /^[\w\-]+$/.test(id) && id !== 'happyclaw';
+  return (
+    id.length > 0 &&
+    id.length <= 256 &&
+    /^[\w\-]+$/.test(id) &&
+    id !== 'happyclaw'
+  );
 }
 
 async function readMcpServersFile(userId: string): Promise<McpServersFile> {
@@ -112,11 +117,21 @@ const MAX_MCP_KEY_LEN = 256;
 function validateMcpStringArrayLikeArgs(
   value: unknown,
 ): { ok: true } | { ok: false; reason: string } {
-  if (!Array.isArray(value)) return { ok: false, reason: 'args must be an array of strings' };
-  if (value.length > MAX_MCP_ARGS) return { ok: false, reason: `args has too many entries (max ${MAX_MCP_ARGS})` };
+  if (!Array.isArray(value))
+    return { ok: false, reason: 'args must be an array of strings' };
+  if (value.length > MAX_MCP_ARGS)
+    return {
+      ok: false,
+      reason: `args has too many entries (max ${MAX_MCP_ARGS})`,
+    };
   for (const v of value) {
-    if (typeof v !== 'string') return { ok: false, reason: 'args entries must be strings' };
-    if (v.length > MAX_MCP_ARG_LEN) return { ok: false, reason: `args entry exceeds ${MAX_MCP_ARG_LEN} chars` };
+    if (typeof v !== 'string')
+      return { ok: false, reason: 'args entries must be strings' };
+    if (v.length > MAX_MCP_ARG_LEN)
+      return {
+        ok: false,
+        reason: `args entry exceeds ${MAX_MCP_ARG_LEN} chars`,
+      };
   }
   return { ok: true };
 }
@@ -131,17 +146,29 @@ function validateMcpKeyValueRecord(
   }
   const entries = Object.entries(value as Record<string, unknown>);
   if (entries.length > maxEntries) {
-    return { ok: false, reason: `${fieldName} has too many entries (max ${maxEntries})` };
+    return {
+      ok: false,
+      reason: `${fieldName} has too many entries (max ${maxEntries})`,
+    };
   }
   for (const [k, v] of entries) {
     if (k.length > MAX_MCP_KEY_LEN) {
-      return { ok: false, reason: `${fieldName} key exceeds ${MAX_MCP_KEY_LEN} chars` };
+      return {
+        ok: false,
+        reason: `${fieldName} key exceeds ${MAX_MCP_KEY_LEN} chars`,
+      };
     }
     if (typeof v !== 'string') {
-      return { ok: false, reason: `${fieldName} value for "${k}" must be a string` };
+      return {
+        ok: false,
+        reason: `${fieldName} value for "${k}" must be a string`,
+      };
     }
     if (v.length > MAX_MCP_STRING_LEN) {
-      return { ok: false, reason: `${fieldName} value for "${k}" exceeds ${MAX_MCP_STRING_LEN} chars` };
+      return {
+        ok: false,
+        reason: `${fieldName} value for "${k}" exceeds ${MAX_MCP_STRING_LEN} chars`,
+      };
     }
   }
   return { ok: true };
@@ -149,15 +176,38 @@ function validateMcpKeyValueRecord(
 
 const mcpServersRoutes = new Hono<{ Variables: Variables }>();
 
+function toMcpServerSummary(id: string, entry: McpServerEntry) {
+  const { env, headers, ...metadata } = entry;
+  return {
+    id,
+    ...metadata,
+    envKeys: Object.keys(env ?? {}),
+    headerKeys: Object.keys(headers ?? {}),
+  };
+}
+
 // GET / — list all MCP servers for the current user
 mcpServersRoutes.get('/', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
   const file = await readMcpServersFile(authUser.id);
-  const servers = Object.entries(file.servers).map(([id, entry]) => ({
-    id,
-    ...entry,
-  }));
+  const servers = Object.entries(file.servers).map(([id, entry]) =>
+    toMcpServerSummary(id, entry),
+  );
   return c.json({ servers });
+});
+
+// GET /:id — load one server, including secrets, only when its detail is opened
+mcpServersRoutes.get('/:id', authMiddleware, async (c) => {
+  const authUser = c.get('user') as AuthUser;
+  const id = c.req.param('id');
+  if (!validateServerId(id)) {
+    return c.json({ error: 'Invalid server ID' }, 400);
+  }
+
+  const file = await readMcpServersFile(authUser.id);
+  const entry = file.servers[id];
+  if (!entry) return c.json({ error: 'Server not found' }, 404);
+  return c.json({ server: { id, ...entry } });
 });
 
 // POST / — add a new MCP server
@@ -218,7 +268,10 @@ mcpServersRoutes.post('/', authMiddleware, async (c) => {
       return c.json({ error: 'command is required and must be a string' }, 400);
     }
     if (command.length > MAX_MCP_STRING_LEN) {
-      return c.json({ error: `command exceeds ${MAX_MCP_STRING_LEN} chars` }, 400);
+      return c.json(
+        { error: `command exceeds ${MAX_MCP_STRING_LEN} chars` },
+        400,
+      );
     }
     if (args !== undefined) {
       const r = validateMcpStringArrayLikeArgs(args);
@@ -234,7 +287,10 @@ mcpServersRoutes.post('/', authMiddleware, async (c) => {
       return c.json({ error: 'description must be a string' }, 400);
     }
     if (description.length > MAX_MCP_STRING_LEN) {
-      return c.json({ error: `description exceeds ${MAX_MCP_STRING_LEN} chars` }, 400);
+      return c.json(
+        { error: `description exceeds ${MAX_MCP_STRING_LEN} chars` },
+        400,
+      );
     }
   }
 
@@ -262,7 +318,10 @@ mcpServersRoutes.post('/', authMiddleware, async (c) => {
   file.servers[id] = entry;
 
   await writeMcpServersFile(authUser.id, file);
-  return c.json({ success: true, server: { id, ...file.servers[id] } });
+  return c.json({
+    success: true,
+    server: toMcpServerSummary(id, file.servers[id]),
+  });
 });
 
 // PATCH /:id — update config / enable / disable
@@ -297,7 +356,10 @@ mcpServersRoutes.patch('/:id', authMiddleware, async (c) => {
       return c.json({ error: 'command must be a non-empty string' }, 400);
     }
     if (command.length > MAX_MCP_STRING_LEN) {
-      return c.json({ error: `command exceeds ${MAX_MCP_STRING_LEN} chars` }, 400);
+      return c.json(
+        { error: `command exceeds ${MAX_MCP_STRING_LEN} chars` },
+        400,
+      );
     }
     entry.command = command;
   }
@@ -337,15 +399,21 @@ mcpServersRoutes.patch('/:id', authMiddleware, async (c) => {
     if (typeof description !== 'string' && description !== null) {
       return c.json({ error: 'description must be a string' }, 400);
     }
-    if (typeof description === 'string' && description.length > MAX_MCP_STRING_LEN) {
-      return c.json({ error: `description exceeds ${MAX_MCP_STRING_LEN} chars` }, 400);
+    if (
+      typeof description === 'string' &&
+      description.length > MAX_MCP_STRING_LEN
+    ) {
+      return c.json(
+        { error: `description exceeds ${MAX_MCP_STRING_LEN} chars` },
+        400,
+      );
     }
     entry.description =
       typeof description === 'string' ? description : undefined;
   }
 
   await writeMcpServersFile(authUser.id, file);
-  return c.json({ success: true, server: { id, ...entry } });
+  return c.json({ success: true, server: toMcpServerSummary(id, entry) });
 });
 
 // DELETE /:id — delete a server

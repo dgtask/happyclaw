@@ -54,6 +54,7 @@ import {
 } from './types.js';
 import { checkBillingAccessFresh, isBillingEnabled } from './billing.js';
 import { checkOwnerActive } from './owner-gate.js';
+import { resolveEffectiveAgentProfile } from './agent-profile-runtime.js';
 import { stripAgentInternalTags } from './utils.js';
 
 /**
@@ -99,6 +100,7 @@ function resolveTaskExecutionMode(
 }
 
 function toRunnerAgentProfile(profile: AgentProfile | undefined) {
+  profile = resolveEffectiveAgentProfile(profile);
   if (!profile) return undefined;
   return {
     id: profile.id,
@@ -253,7 +255,8 @@ function cleanupIsolatedTaskRun(
   }
 
   const resolvedWorkspace = resolveTaskRunWorkspace(task, deps, options);
-  const workspace = resolvedWorkspace ??
+  const workspace =
+    resolvedWorkspace ??
     (options.sourceWorkspaceJid && options.sourceWorkspaceFolder
       ? {
           jid: options.sourceWorkspaceJid,
@@ -282,20 +285,8 @@ function cleanupIsolatedTaskRun(
   }
 
   const paths = [
-    path.join(
-      DATA_DIR,
-      'sessions',
-      workspace.folder,
-      'agents',
-      sessionAgentId,
-    ),
-    path.join(
-      DATA_DIR,
-      'ipc',
-      workspace.folder,
-      'tasks-run',
-      taskRunId,
-    ),
+    path.join(DATA_DIR, 'sessions', workspace.folder, 'agents', sessionAgentId),
+    path.join(DATA_DIR, 'ipc', workspace.folder, 'tasks-run', taskRunId),
   ];
   for (const runPath of paths) {
     try {
@@ -842,9 +833,8 @@ async function runTaskInner(
   const taskSessionAgentId = options?.taskRunId
     ? createTaskSessionAgentId(options.taskRunId)
     : `task-${task.id.replace(/[^a-zA-Z0-9_-]+/g, '-')}`;
-  const agentProfile = getAgentProfileForWorkspace(
-    workspace.folder,
-    taskOwnerId,
+  const agentProfile = resolveEffectiveAgentProfile(
+    getAgentProfileForWorkspace(workspace.folder, taskOwnerId),
   );
   if (
     taskSessionNeedsAgentProfileReset(

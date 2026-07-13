@@ -1,13 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
-import {
-  ExternalLink,
-  Key,
-  Loader2,
-  Plus,
-  X,
-} from 'lucide-react';
+import { ExternalLink, Eye, EyeOff, Key, Loader2, Plus, X } from 'lucide-react';
 
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { api } from '../../api/client';
@@ -25,7 +24,10 @@ const RESERVED_ENV_KEYS = new Set([
   'ANTHROPIC_MODEL',
 ]);
 
-function buildCustomEnv(rows: EnvRow[]): { customEnv: Record<string, string>; error: string | null } {
+function buildCustomEnv(rows: EnvRow[]): {
+  customEnv: Record<string, string>;
+  error: string | null;
+} {
   const customEnv: Record<string, string> = {};
 
   for (const [idx, row] of rows.entries()) {
@@ -44,7 +46,10 @@ function buildCustomEnv(rows: EnvRow[]): { customEnv: Record<string, string>; er
       };
     }
     if (RESERVED_ENV_KEYS.has(key)) {
-      return { customEnv: {}, error: `${key} 属于系统保留字段，请在配置表单中填写` };
+      return {
+        customEnv: {},
+        error: `${key} 属于系统保留字段，请在配置表单中填写`,
+      };
     }
     if (customEnv[key] !== undefined) {
       return { customEnv: {}, error: `环境变量 Key "${key}" 重复` };
@@ -103,6 +108,9 @@ export function ProviderEditor({
 
   // 环境变量
   const [customEnvRows, setCustomEnvRows] = useState<EnvRow[]>([]);
+  const [showCustomEnvValues, setShowCustomEnvValues] = useState<
+    Record<number, boolean>
+  >({});
 
   // 状态
   const [saving, setSaving] = useState(false);
@@ -110,6 +118,7 @@ export function ProviderEditor({
   // 初始化表单
   useEffect(() => {
     if (!open) return;
+    setShowCustomEnvValues({});
 
     if (isCreate) {
       setProviderType('third_party');
@@ -140,12 +149,15 @@ export function ProviderEditor({
       setAuthToken('');
       setAuthTokenDirty(false);
       setClearTokenOnSave(false);
-      const envRows = Object.entries(provider.customEnv || {}).map(([key, value]) => ({ key, value }));
+      const envRows = Object.entries(provider.customEnv || {}).map(
+        ([key, value]) => ({ key, value }),
+      );
       setCustomEnvRows(envRows);
     }
   }, [open, isCreate, provider]);
 
-  const addRow = () => setCustomEnvRows((prev) => [...prev, { key: '', value: '' }]);
+  const addRow = () =>
+    setCustomEnvRows((prev) => [...prev, { key: '', value: '' }]);
   const removeRow = (index: number) =>
     setCustomEnvRows((prev) => prev.filter((_, i) => i !== index));
   const updateRow = (index: number, field: keyof EnvRow, value: string) =>
@@ -255,7 +267,9 @@ export function ProviderEditor({
             if (trimmed.startsWith('{')) {
               try {
                 const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-                const oauth = parsed.claudeAiOauth as Record<string, unknown> | undefined;
+                const oauth = parsed.claudeAiOauth as
+                  | Record<string, unknown>
+                  | undefined;
                 if (oauth?.accessToken && oauth?.refreshToken) {
                   createBody.claudeOAuthCredentials = {
                     accessToken: oauth.accessToken,
@@ -307,7 +321,10 @@ export function ProviderEditor({
           patchBody.anthropicModel = model.trim();
         }
 
-        await api.patch(`/api/config/claude/providers/${provider!.id}`, patchBody);
+        await api.patch(
+          `/api/config/claude/providers/${provider!.id}`,
+          patchBody,
+        );
 
         // 更新密钥（如果有变更）
         const secretsBody: Record<string, unknown> = {};
@@ -328,7 +345,9 @@ export function ProviderEditor({
             if (trimmed.startsWith('{')) {
               try {
                 const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-                const oauth = parsed.claudeAiOauth as Record<string, unknown> | undefined;
+                const oauth = parsed.claudeAiOauth as
+                  | Record<string, unknown>
+                  | undefined;
                 if (oauth?.accessToken && oauth?.refreshToken) {
                   secretsBody.claudeOAuthCredentials = {
                     accessToken: oauth.accessToken,
@@ -363,7 +382,10 @@ export function ProviderEditor({
         }
 
         if (hasSecretsChange) {
-          await api.put(`/api/config/claude/providers/${provider!.id}/secrets`, secretsBody);
+          await api.put(
+            `/api/config/claude/providers/${provider!.id}/secrets`,
+            secretsBody,
+          );
         }
 
         setNotice('提供商配置已保存。');
@@ -371,7 +393,9 @@ export function ProviderEditor({
 
       onSave();
     } catch (err) {
-      setError(getErrorMessage(err, isCreate ? '创建提供商失败' : '保存提供商失败'));
+      setError(
+        getErrorMessage(err, isCreate ? '创建提供商失败' : '保存提供商失败'),
+      );
     } finally {
       setSaving(false);
     }
@@ -388,14 +412,18 @@ export function ProviderEditor({
     <Dialog open={open} onOpenChange={(v) => !v && handleClose()}>
       <DialogContent className="sm:max-w-xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>{isCreate ? '添加提供商' : `编辑提供商：${provider?.name}`}</DialogTitle>
+          <DialogTitle>
+            {isCreate ? '添加提供商' : `编辑提供商：${provider?.name}`}
+          </DialogTitle>
         </DialogHeader>
 
         <div className="space-y-4">
           {/* 类型选择（仅创建模式） */}
           {isCreate && (
             <div>
-              <label className="block text-xs text-muted-foreground mb-1">提供商类型</label>
+              <label className="block text-xs text-muted-foreground mb-1">
+                提供商类型
+              </label>
               <div className="inline-flex rounded-lg border border-border p-1 bg-muted">
                 <button
                   type="button"
@@ -425,13 +453,19 @@ export function ProviderEditor({
 
           {/* 名称 */}
           <div>
-            <label className="block text-xs text-muted-foreground mb-1">名称</label>
+            <label className="block text-xs text-muted-foreground mb-1">
+              名称
+            </label>
             <Input
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
               disabled={saving}
-              placeholder={providerType === 'official' ? '如：Claude 官方' : '如：OpenRouter-主账号'}
+              placeholder={
+                providerType === 'official'
+                  ? '如：Claude 官方'
+                  : '如：OpenRouter-主账号'
+              }
             />
           </div>
 
@@ -439,7 +473,9 @@ export function ProviderEditor({
           {providerType === 'official' && (
             <div className="space-y-4">
               <div>
-                <label className="block text-xs text-muted-foreground mb-2">认证方式</label>
+                <label className="block text-xs text-muted-foreground mb-2">
+                  认证方式
+                </label>
                 <div className="inline-flex rounded-lg border border-border p-1 bg-muted">
                   {(['oauth', 'setup_token', 'api_key'] as const).map((tab) => (
                     <button
@@ -452,7 +488,11 @@ export function ProviderEditor({
                           : 'text-muted-foreground'
                       }`}
                     >
-                      {tab === 'oauth' ? 'OAuth 登录' : tab === 'setup_token' ? 'Setup Token' : 'API Key'}
+                      {tab === 'oauth'
+                        ? 'OAuth 登录'
+                        : tab === 'setup_token'
+                          ? 'Setup Token'
+                          : 'API Key'}
                     </button>
                   ))}
                 </div>
@@ -460,42 +500,65 @@ export function ProviderEditor({
 
               {authTab === 'oauth' && (
                 <div className="rounded-lg border border-teal-200 bg-teal-50/50 p-4 space-y-3">
-                  <div className="text-sm font-medium text-foreground">一键登录 Claude（推荐）</div>
+                  <div className="text-sm font-medium text-foreground">
+                    一键登录 Claude（推荐）
+                  </div>
                   <div className="text-xs text-muted-foreground">
-                    点击按钮后会打开 claude.ai 授权页面，完成授权后将页面上显示的授权码粘贴回来。
+                    点击按钮后会打开 claude.ai
+                    授权页面，完成授权后将页面上显示的授权码粘贴回来。
                   </div>
 
                   {/* 编辑模式显示现有凭据 */}
                   {!isCreate && provider?.hasClaudeOAuthCredentials && (
                     <div className="rounded-md border border-emerald-200 dark:border-emerald-800 bg-emerald-50/50 dark:bg-emerald-950/30 p-3 space-y-1 text-xs">
                       <div className="text-emerald-700 dark:text-emerald-300">
-                        Access Token: {provider.claudeOAuthCredentialsAccessTokenMasked || '***'}
+                        Access Token:{' '}
+                        {provider.claudeOAuthCredentialsAccessTokenMasked ||
+                          '***'}
                       </div>
                       {provider.claudeOAuthCredentialsExpiresAt && (
-                        <div className={
-                          provider.claudeOAuthCredentialsExpiresAt <= Date.now()
-                            ? 'text-red-700 dark:text-red-400 font-medium'
-                            : 'text-emerald-700 dark:text-emerald-300'
-                        }>
-                          过期时间: {new Date(provider.claudeOAuthCredentialsExpiresAt).toLocaleString('zh-CN')}
+                        <div
+                          className={
+                            provider.claudeOAuthCredentialsExpiresAt <=
+                            Date.now()
+                              ? 'text-red-700 dark:text-red-400 font-medium'
+                              : 'text-emerald-700 dark:text-emerald-300'
+                          }
+                        >
+                          过期时间:{' '}
+                          {new Date(
+                            provider.claudeOAuthCredentialsExpiresAt,
+                          ).toLocaleString('zh-CN')}
                           {provider.claudeOAuthCredentialsExpiresAt > Date.now()
                             ? ` (${Math.round((provider.claudeOAuthCredentialsExpiresAt - Date.now()) / 60000)} 分钟后)`
                             : ' (已过期)'}
                         </div>
                       )}
-                      <div className="text-emerald-600">SDK 会在 token 过期时自动刷新。</div>
+                      <div className="text-emerald-600">
+                        SDK 会在 token 过期时自动刷新。
+                      </div>
                     </div>
                   )}
 
                   {!oauthState ? (
-                    <Button onClick={handleOAuthStart} disabled={saving || oauthLoading}>
-                      {oauthLoading ? <Loader2 className="size-4 animate-spin" /> : <ExternalLink className="size-4" />}
-                      {!isCreate && provider?.hasClaudeOAuthCredentials ? '重新登录 Claude' : '一键登录 Claude'}
+                    <Button
+                      onClick={handleOAuthStart}
+                      disabled={saving || oauthLoading}
+                    >
+                      {oauthLoading ? (
+                        <Loader2 className="size-4 animate-spin" />
+                      ) : (
+                        <ExternalLink className="size-4" />
+                      )}
+                      {!isCreate && provider?.hasClaudeOAuthCredentials
+                        ? '重新登录 Claude'
+                        : '一键登录 Claude'}
                     </Button>
                   ) : (
                     <div className="space-y-2">
                       <div className="text-xs text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-md px-3 py-2">
-                        授权窗口已打开，请在 claude.ai 完成授权后，将页面上显示的授权码粘贴到下方。
+                        授权窗口已打开，请在 claude.ai
+                        完成授权后，将页面上显示的授权码粘贴到下方。
                       </div>
                       <div className="flex gap-2">
                         <Input
@@ -506,8 +569,13 @@ export function ProviderEditor({
                           placeholder="粘贴授权码"
                           className="flex-1"
                         />
-                        <Button onClick={handleOAuthCallback} disabled={oauthExchanging || !oauthCode.trim()}>
-                          {oauthExchanging && <Loader2 className="size-4 animate-spin" />}
+                        <Button
+                          onClick={handleOAuthCallback}
+                          disabled={oauthExchanging || !oauthCode.trim()}
+                        >
+                          {oauthExchanging && (
+                            <Loader2 className="size-4 animate-spin" />
+                          )}
                           确认
                         </Button>
                         <Button
@@ -539,14 +607,18 @@ export function ProviderEditor({
                     onChange={(e) => setSetupToken(e.target.value)}
                     disabled={saving}
                     placeholder={
-                      !isCreate && (provider?.hasClaudeCodeOauthToken || provider?.hasClaudeOAuthCredentials)
+                      !isCreate &&
+                      (provider?.hasClaudeCodeOauthToken ||
+                        provider?.hasClaudeOAuthCredentials)
                         ? '输入新值覆盖'
                         : '粘贴 setup-token 或 cat ~/.claude/.credentials.json 输出'
                     }
                   />
                   <p className="text-xs text-muted-foreground">
                     支持粘贴{' '}
-                    <code className="bg-muted px-1 rounded">cat ~/.claude/.credentials.json</code>{' '}
+                    <code className="bg-muted px-1 rounded">
+                      cat ~/.claude/.credentials.json
+                    </code>{' '}
                     的 JSON 内容
                   </p>
                 </div>
@@ -596,7 +668,9 @@ export function ProviderEditor({
           {providerType === 'third_party' && (
             <div className="space-y-4">
               <div>
-                <label className="block text-xs text-muted-foreground mb-1">ANTHROPIC_BASE_URL</label>
+                <label className="block text-xs text-muted-foreground mb-1">
+                  ANTHROPIC_BASE_URL
+                </label>
                 <Input
                   type="text"
                   value={baseUrl}
@@ -683,92 +757,136 @@ export function ProviderEditor({
                   className="font-mono"
                 />
                 <p className="text-xs text-muted-foreground mt-1">
-                  注入为 ANTHROPIC_MODEL 环境变量，值取决于第三方 API 支持的模型。
+                  注入为 ANTHROPIC_MODEL 环境变量，值取决于第三方 API
+                  支持的模型。
                 </p>
               </>
             )}
           </div>
 
           {/* ─── 自定义环境变量 ─── */}
-          <div className="border-t border-border pt-4">
-            <div className="flex items-center justify-between mb-2">
-              <label className="text-xs text-muted-foreground">其他自定义环境变量（可选）</label>
-              <button
-                type="button"
-                onClick={addRow}
-                className="inline-flex items-center gap-1 text-xs text-primary hover:text-primary cursor-pointer"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                添加
-              </button>
-            </div>
-            <p className="mb-2 text-xs text-muted-foreground">
-              这些变量仅在当前提供商生效，不同提供商互不影响。
-            </p>
-
-            {customEnvRows.length === 0 ? (
-              <p className="text-xs text-muted-foreground">暂无</p>
-            ) : (
-              <div className="space-y-2">
-                {customEnvRows.map((row, idx) => (
-                  <div key={idx} className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-                    <Input
-                      type="text"
-                      value={row.key}
-                      onChange={(e) => updateRow(idx, 'key', e.target.value)}
-                      placeholder="KEY"
-                      className="w-full sm:w-[38%] px-2.5 py-1.5 text-xs font-mono h-auto"
-                    />
-                    <Input
-                      type="text"
-                      value={row.value}
-                      onChange={(e) => updateRow(idx, 'value', e.target.value)}
-                      placeholder="value"
-                      className="flex-1 px-2.5 py-1.5 text-xs font-mono h-auto"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => removeRow(idx)}
-                      className="w-8 h-8 rounded-md hover:bg-muted text-muted-foreground hover:text-red-500 flex items-center justify-center cursor-pointer"
-                      aria-label="删除环境变量"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  </div>
-                ))}
+          <details className="border-t border-border pt-4">
+            <summary className="cursor-pointer text-sm font-medium text-foreground">
+              高级设置 · 自定义环境变量
+              {customEnvRows.length > 0 && (
+                <span className="ml-2 text-xs font-normal text-muted-foreground">
+                  {customEnvRows.length} 项
+                </span>
+              )}
+            </summary>
+            <div className="mt-3">
+              <div className="mb-2 flex items-center justify-between">
+                <p className="text-xs leading-5 text-muted-foreground">
+                  注入所有使用当前 Provider 的 Agent
+                  运行环境。可能包含敏感凭据，请避免放入无关业务密钥。
+                </p>
+                <button
+                  type="button"
+                  onClick={addRow}
+                  className="ml-3 inline-flex shrink-0 cursor-pointer items-center gap-1 text-xs text-primary hover:text-primary"
+                >
+                  <Plus className="size-3.5" />
+                  添加
+                </button>
               </div>
-            )}
-          </div>
 
-          {/* ─── 权重 ─── */}
-          <div className="border-t border-border pt-3">
-            <div className="flex items-center gap-2 mb-1">
-              <label className="block text-sm font-medium">权重</label>
-              {balancingStrategy === 'weighted-round-robin' && (
+              {customEnvRows.length === 0 ? (
+                <p className="text-xs text-muted-foreground">暂无</p>
+              ) : (
+                <div className="space-y-2">
+                  {customEnvRows.map((row, idx) => (
+                    <div
+                      key={idx}
+                      className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center"
+                    >
+                      <Input
+                        type="text"
+                        value={row.key}
+                        onChange={(e) => updateRow(idx, 'key', e.target.value)}
+                        placeholder="KEY"
+                        className="h-auto w-full px-2.5 py-1.5 font-mono text-xs sm:w-[38%]"
+                      />
+                      <Input
+                        type={showCustomEnvValues[idx] ? 'text' : 'password'}
+                        value={row.value}
+                        onChange={(e) =>
+                          updateRow(idx, 'value', e.target.value)
+                        }
+                        placeholder="value"
+                        className="h-auto flex-1 px-2.5 py-1.5 font-mono text-xs"
+                      />
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setShowCustomEnvValues((current) => ({
+                            ...current,
+                            [idx]: !current[idx],
+                          }))
+                        }
+                        className="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+                        aria-label={
+                          showCustomEnvValues[idx]
+                            ? '隐藏环境变量值'
+                            : '显示环境变量值'
+                        }
+                      >
+                        {showCustomEnvValues[idx] ? (
+                          <EyeOff className="size-4" />
+                        ) : (
+                          <Eye className="size-4" />
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => removeRow(idx)}
+                        className="flex size-8 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-red-500"
+                        aria-label="删除环境变量"
+                      >
+                        <X className="size-4" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </details>
+
+          {/* ─── 权重：仅加权轮询策略使用 ─── */}
+          {balancingStrategy === 'weighted-round-robin' && (
+            <div className="border-t border-border pt-3">
+              <div className="flex items-center gap-2 mb-1">
+                <label className="block text-sm font-medium">权重</label>
                 <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-medium bg-teal-100 text-teal-800">
                   当前策略生效中
                 </span>
-              )}
+              </div>
+              <Input
+                type="number"
+                min={1}
+                max={100}
+                value={weight}
+                onChange={(e) =>
+                  setWeight(
+                    Math.max(1, Math.min(100, parseInt(e.target.value) || 1)),
+                  )
+                }
+                disabled={saving}
+                className="w-24"
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                值越大分配到的请求越多。例如三家分别设 5/3/2，流量比例就是
+                5:3:2。
+              </p>
             </div>
-            <Input
-              type="number"
-              min={1}
-              max={100}
-              value={weight}
-              onChange={(e) => setWeight(Math.max(1, Math.min(100, parseInt(e.target.value) || 1)))}
-              disabled={saving}
-              className="w-24"
-            />
-            <p className="text-xs text-muted-foreground mt-1">
-              {balancingStrategy === 'weighted-round-robin'
-                ? '值越大分配到的请求越多。例如三家分别设 5/3/2，流量比例就是 5:3:2。'
-                : '仅当负载均衡策略为「加权轮询」时生效（当前策略未生效）。范围 1–100。'}
-            </p>
-          </div>
+          )}
 
           {/* ─── 操作按钮 ─── */}
           <div className="flex justify-end gap-2 pt-2">
-            <Button variant="outline" onClick={handleClose} disabled={saving || oauthExchanging}>
+            <Button
+              variant="outline"
+              onClick={handleClose}
+              disabled={saving || oauthExchanging}
+            >
               取消
             </Button>
             {/* OAuth 模式下创建时不需要保存按钮（OAuth 回调会自动触发 onSave） */}

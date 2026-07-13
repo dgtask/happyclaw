@@ -43,6 +43,7 @@ import {
   setWorkspaceLastAgent,
 } from '../../utils/workspaceLastAgent';
 import { CHANNEL_LABEL } from '../settings/channel-meta';
+import { getAgentProfileDisplayName } from '../../utils/agent-product';
 
 /** Sentinel value for binding the main conversation (vs. a specific agent) */
 const MAIN_BINDING = '__main__' as const;
@@ -308,8 +309,11 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     activeAgentTab && isConversationTab
       ? !!agentWaiting[activeAgentTab] || !!agentStreaming[activeAgentTab]
       : isWaiting;
-  const agentProfileLabel =
-    group?.agent_profile_name || (group?.is_home ? 'HappyClaw' : 'Agent');
+  const agentProfileLabel = group?.agent_profile_name
+    ? getAgentProfileDisplayName(group.agent_profile_name)
+    : group?.is_home
+      ? 'HappyClaw'
+      : 'Agent';
   const workspaceDisplayName = group?.is_my_home
     ? agentProfileLabel
     : group?.name;
@@ -884,6 +888,10 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                   }
                   agentId={activeAgentTab}
                   contextLabel={currentContextName}
+                  agentName={agentProfileLabel}
+                  agentAvatarUrl={group?.agent_profile_avatar_url}
+                  agentAvatarEmoji={group?.agent_profile_avatar_emoji}
+                  agentAvatarColor={group?.agent_profile_avatar_color}
                   onSend={(content) => {
                     handleActiveAgentSend(content);
                   }}
@@ -913,6 +921,10 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                   scrollTrigger={scrollTrigger}
                   groupJid={groupJid}
                   isWaiting={isWaiting}
+                  agentName={agentProfileLabel}
+                  agentAvatarUrl={group?.agent_profile_avatar_url}
+                  agentAvatarEmoji={group?.agent_profile_avatar_emoji}
+                  agentAvatarColor={group?.agent_profile_avatar_color}
                   onInterrupt={
                     mainInterrupted ? undefined : () => interruptQuery(groupJid)
                   }

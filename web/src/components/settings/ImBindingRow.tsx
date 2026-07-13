@@ -38,6 +38,12 @@ export function ImBindingRow({
   const supportsActivation =
     getImChannelCapabilities(group.channel_type)?.supports_activation_modes ===
     true;
+  const supportsOwnerMention =
+    getImChannelCapabilities(group.channel_type)?.supports_owner_mention ===
+    true;
+  const activationModeOptions = ACTIVATION_MODE_OPTIONS.filter(
+    (option) => option.value !== 'owner_mentioned' || supportsOwnerMention,
+  );
   // Empty array = "owner-locked trap": bot was added before Feishu owner DM'd it,
   // so nobody (not even the owner) can trigger the bot until allowlist is reset
   // or owner sends a DM (which auto-backfills via learnFeishuOwner).
@@ -133,10 +139,10 @@ export function ImBindingRow({
             ) : (
               <AlertTriangle className="w-3 h-3 mr-1" />
             )}
-            重置白名单
+            解除限制
           </Button>
         )}
-        {hasBound && supportsActivation && (
+        {supportsActivation && (
           <div className="flex items-center gap-1.5">
             <select
               value={group.activation_mode || 'auto'}
@@ -144,11 +150,15 @@ export function ImBindingRow({
                 onActivationModeChange(group.jid, e.target.value)
               }
               disabled={isActioning}
+              aria-label={`${group.name} 的消息响应方式`}
+              title="消息响应方式"
               className="text-xs px-1.5 py-1 rounded border border-border bg-background text-foreground disabled:opacity-50"
             >
-              {ACTIVATION_MODE_OPTIONS.map((o) => (
+              {activationModeOptions.map((o) => (
                 <option key={o.value} value={o.value}>
-                  {o.label}
+                  {o.value === 'auto'
+                    ? `${o.label}（当前：${group.require_mention ? '仅 @机器人' : '所有允许成员'}）`
+                    : o.label}
                 </option>
               ))}
             </select>

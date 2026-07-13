@@ -19,7 +19,6 @@ export interface ClaudeContextPlanArgs {
   includeHostClaudeContext?: boolean;
   mountUserSkills?: boolean;
   userSkillsDirOverride?: string;
-  // host 模式下 HappyClaw 记忆层是否启用（即 !disableMemoryLayerForAdminHost）。
   // true 且 admin 原生 ~/.claude/CLAUDE.md 存在时，两套全局记忆并存，触发 audit 告警。
   happyclawMemoryActive?: boolean;
 }
@@ -174,7 +173,7 @@ export function buildClaudeContextPlan(
     exists(claudeMdSource)
   ) {
     warnings.push(
-      '两套全局记忆同时生效：~/.claude/CLAUDE.md（原生 Playbook）+ HappyClaw 记忆层；如需纯原生体验可开启 disableMemoryLayerForAdminHost',
+      '两套全局记忆同时生效：~/.claude/CLAUDE.md（原生 Playbook）+ HappyClaw 记忆层',
     );
   }
 

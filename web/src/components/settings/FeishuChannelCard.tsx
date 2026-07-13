@@ -32,7 +32,9 @@ export function FeishuChannelCard() {
   const loadConfig = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await api.get<UserFeishuConfig>('/api/config/user-im/feishu');
+      const data = await api.get<UserFeishuConfig>(
+        '/api/config/user-im/feishu',
+      );
       setConfig(data);
       setAppId(data.appId || '');
       setAppSecret('');
@@ -50,7 +52,10 @@ export function FeishuChannelCard() {
   const handleToggle = async (newEnabled: boolean) => {
     setToggling(true);
     try {
-      const data = await api.put<UserFeishuConfig>('/api/config/user-im/feishu', { enabled: newEnabled });
+      const data = await api.put<UserFeishuConfig>(
+        '/api/config/user-im/feishu',
+        { enabled: newEnabled },
+      );
       setConfig(data);
       toast.success(`飞书渠道已${newEnabled ? '启用' : '停用'}`);
     } catch (err) {
@@ -63,7 +68,10 @@ export function FeishuChannelCard() {
   const handleAutoIsolateToggle = async (newValue: boolean) => {
     setToggling(true);
     try {
-      const data = await api.put<UserFeishuConfig>('/api/config/user-im/feishu', { autoIsolateContext: newValue });
+      const data = await api.put<UserFeishuConfig>(
+        '/api/config/user-im/feishu',
+        { autoIsolateContext: newValue },
+      );
       setConfig(data);
       toast.success(`自动隔离上下文已${newValue ? '开启' : '关闭'}`);
     } catch (err) {
@@ -98,7 +106,10 @@ export function FeishuChannelCard() {
       const payload: Record<string, string | boolean> = { enabled: true };
       if (id) payload.appId = id;
       if (secret) payload.appSecret = secret;
-      const data = await api.put<UserFeishuConfig>('/api/config/user-im/feishu', payload);
+      const data = await api.put<UserFeishuConfig>(
+        '/api/config/user-im/feishu',
+        payload,
+      );
       setConfig(data);
       setAppSecret('');
       toast.success('飞书配置已保存');
@@ -113,17 +124,31 @@ export function FeishuChannelCard() {
     <div className="rounded-xl border border-border bg-card overflow-hidden">
       <div className="flex items-center justify-between px-5 py-4 border-b border-border bg-muted/50">
         <div className="flex items-center gap-2">
-          <span className={`inline-block w-2 h-2 rounded-full ${config?.connected ? 'bg-success' : 'bg-muted-foreground/40'}`} />
+          <span
+            className={`inline-block w-2 h-2 rounded-full ${config?.connected ? 'bg-success' : 'bg-muted-foreground/40'}`}
+          />
           <div>
-            <h3 className="text-sm font-semibold text-foreground">飞书 Feishu</h3>
-            <p className="text-xs text-muted-foreground mt-0.5">接收飞书消息并通过 Agent 自动回复</p>
-            <p className="text-xs text-muted-foreground">私聊和群聊均可绑定到工作区</p>
+            <h3 className="text-sm font-semibold text-foreground">
+              飞书 Feishu
+            </h3>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              接收飞书消息并通过 Agent 自动回复
+            </p>
+            <p className="text-xs text-muted-foreground">
+              话题群可绑定工作区；普通群聊和私聊绑定到具体会话
+            </p>
           </div>
         </div>
-        <Switch checked={enabled} disabled={loading || toggling} onCheckedChange={handleToggle} />
+        <Switch
+          checked={enabled}
+          disabled={loading || toggling}
+          onCheckedChange={handleToggle}
+        />
       </div>
 
-      <div className={`px-5 py-4 space-y-4 transition-opacity ${!enabled ? 'opacity-50 pointer-events-none' : ''}`}>
+      <div
+        className={`px-5 py-4 space-y-4 transition-opacity ${!enabled ? 'opacity-50 pointer-events-none' : ''}`}
+      >
         {loading ? (
           <div className="text-sm text-muted-foreground">加载中...</div>
         ) : (
@@ -135,7 +160,9 @@ export function FeishuChannelCard() {
             )}
             <div className="grid md:grid-cols-2 gap-3">
               <div>
-                <Label className="text-xs text-muted-foreground mb-1">App ID</Label>
+                <Label className="text-xs text-muted-foreground mb-1">
+                  App ID
+                </Label>
                 <Input
                   type="text"
                   value={appId}
@@ -144,12 +171,16 @@ export function FeishuChannelCard() {
                 />
               </div>
               <div>
-                <Label className="text-xs text-muted-foreground mb-1">App Secret</Label>
+                <Label className="text-xs text-muted-foreground mb-1">
+                  App Secret
+                </Label>
                 <Input
                   type="password"
                   value={appSecret}
                   onChange={(e) => setAppSecret(e.target.value)}
-                  placeholder={config?.hasAppSecret ? '留空不修改' : '输入飞书 App Secret'}
+                  placeholder={
+                    config?.hasAppSecret ? '留空不修改' : '输入飞书 App Secret'
+                  }
                 />
               </div>
             </div>
@@ -161,8 +192,12 @@ export function FeishuChannelCard() {
             </div>
             <div className="border-t border-border pt-3 flex items-center justify-between">
               <div>
-                <p className="text-sm font-medium text-foreground">自动隔离上下文</p>
-                <p className="text-xs text-muted-foreground">飞书不同私聊和群聊会自动绑定独立对话，上下文互不干扰</p>
+                <p className="text-sm font-medium text-foreground">
+                  新会话自动隔离上下文
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  飞书中新接入的私聊和群聊会自动创建独立会话；这是默认路由规则，不影响已有绑定
+                </p>
               </div>
               <Switch
                 checked={config?.autoIsolateContext ?? false}

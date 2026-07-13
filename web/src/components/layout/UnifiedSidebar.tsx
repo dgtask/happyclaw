@@ -353,6 +353,7 @@ export function UnifiedSidebar({
             <PopoverTrigger asChild>
               <button className="rounded-full hover:ring-2 hover:ring-brand-200 transition-all cursor-pointer mb-2">
                 <EmojiAvatar
+                  imageUrl={user?.avatar_url}
                   emoji={user?.avatar_emoji}
                   color={user?.avatar_color}
                   fallbackChar={userInitial}

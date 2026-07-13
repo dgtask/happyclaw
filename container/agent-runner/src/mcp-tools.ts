@@ -31,9 +31,6 @@ export interface McpContext {
   workspaceGroup: string;
   workspaceGlobal: string;
   workspaceMemory: string;
-  // 禁用 HappyClaw 的 memory MCP 工具（memory_append/search/get），
-  // 让 Agent 完全按用户本机 ~/.claude/ 下的 Playbook 约定管理记忆
-  disableMemoryLayer?: boolean;
 }
 
 function writeIpcFile(dir: string, data: object): string {
@@ -47,8 +44,14 @@ function writeIpcFile(dir: string, data: object): string {
     fs.renameSync(tempPath, filepath);
   } catch (err) {
     // Clean up temp file on failure
-    try { fs.unlinkSync(tempPath); } catch { /* ignore */ }
-    throw new Error(`IPC 写入失败 (${dir}): ${err instanceof Error ? err.message : String(err)}`);
+    try {
+      fs.unlinkSync(tempPath);
+    } catch {
+      /* ignore */
+    }
+    throw new Error(
+      `IPC 写入失败 (${dir}): ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
   return filename;
 }
@@ -553,7 +556,9 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
         // Validate schedule_value before writing IPC
         if (args.schedule_type === 'cron') {
           try {
-            CronExpressionParser.parse(args.schedule_value, { tz: process.env.TZ || 'Asia/Shanghai' });
+            CronExpressionParser.parse(args.schedule_value, {
+              tz: process.env.TZ || 'Asia/Shanghai',
+            });
           } catch {
             return {
               content: [
@@ -619,7 +624,11 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
         const modeLabel = execType === 'script' ? 'script' : 'agent';
         // 改为阻塞确认：等主进程真正落库后回执，避免 fire-and-forget 的“报成功但没建成”。
         try {
-          const result = await pollIpcResult(TASKS_DIR, data, 'schedule_task_result');
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            data,
+            'schedule_task_result',
+          );
           if (!result.success) {
             return {
               content: [
@@ -744,17 +753,35 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           timestamp: new Date().toISOString(),
         };
         try {
-          const result = await pollIpcResult(TASKS_DIR, data, 'pause_task_result');
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            data,
+            'pause_task_result',
+          );
           if (!result.success) {
             return {
-              content: [{ type: 'text' as const, text: `Failed to pause task ${args.task_id}: ${result.error || 'Unknown error'}` }],
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to pause task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                },
+              ],
               isError: true,
             };
           }
-          return { content: [{ type: 'text' as const, text: `Task ${args.task_id} paused.` }] };
+          return {
+            content: [
+              { type: 'text' as const, text: `Task ${args.task_id} paused.` },
+            ],
+          };
         } catch {
           return {
-            content: [{ type: 'text' as const, text: `Timeout waiting for pause confirmation for task ${args.task_id}.` }],
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for pause confirmation for task ${args.task_id}.`,
+              },
+            ],
             isError: true,
           };
         }
@@ -776,17 +803,35 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           timestamp: new Date().toISOString(),
         };
         try {
-          const result = await pollIpcResult(TASKS_DIR, data, 'resume_task_result');
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            data,
+            'resume_task_result',
+          );
           if (!result.success) {
             return {
-              content: [{ type: 'text' as const, text: `Failed to resume task ${args.task_id}: ${result.error || 'Unknown error'}` }],
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to resume task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                },
+              ],
               isError: true,
             };
           }
-          return { content: [{ type: 'text' as const, text: `Task ${args.task_id} resumed.` }] };
+          return {
+            content: [
+              { type: 'text' as const, text: `Task ${args.task_id} resumed.` },
+            ],
+          };
         } catch {
           return {
-            content: [{ type: 'text' as const, text: `Timeout waiting for resume confirmation for task ${args.task_id}.` }],
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for resume confirmation for task ${args.task_id}.`,
+              },
+            ],
             isError: true,
           };
         }
@@ -808,17 +853,38 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           timestamp: new Date().toISOString(),
         };
         try {
-          const result = await pollIpcResult(TASKS_DIR, data, 'cancel_task_result');
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            data,
+            'cancel_task_result',
+          );
           if (!result.success) {
             return {
-              content: [{ type: 'text' as const, text: `Failed to cancel task ${args.task_id}: ${result.error || 'Unknown error'}` }],
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to cancel task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                },
+              ],
               isError: true,
             };
           }
-          return { content: [{ type: 'text' as const, text: `Task ${args.task_id} cancelled and deleted.` }] };
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Task ${args.task_id} cancelled and deleted.`,
+              },
+            ],
+          };
         } catch {
           return {
-            content: [{ type: 'text' as const, text: `Timeout waiting for cancel confirmation for task ${args.task_id}.` }],
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for cancel confirmation for task ${args.task_id}.`,
+              },
+            ],
             isError: true,
           };
         }
@@ -831,22 +897,50 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       `Update an existing scheduled task IN PLACE. Strongly PREFER this over cancel_task + schedule_task when modifying an existing task: delete-then-recreate risks leaving a duplicate (if the delete silently fails) or losing the task entirely. Only the fields you pass are changed; omit a field to keep its current value.`,
       {
         task_id: z.string().describe('The task ID to update'),
-        prompt: z.string().optional().describe('New action/instructions for the task (agent mode)'),
-        schedule_type: z.enum(['cron', 'interval', 'once']).optional().describe('New schedule type. If you change this you MUST also pass schedule_value.'),
+        prompt: z
+          .string()
+          .optional()
+          .describe('New action/instructions for the task (agent mode)'),
+        schedule_type: z
+          .enum(['cron', 'interval', 'once'])
+          .optional()
+          .describe(
+            'New schedule type. If you change this you MUST also pass schedule_value.',
+          ),
         schedule_value: z
           .string()
           .optional()
-          .describe('New schedule value (LOCAL time): cron expr | interval ms | once "2026-02-01T15:30:00" (no Z).'),
-        context_mode: z.enum(['group', 'isolated']).optional().describe('New context mode (agent mode)'),
-        execution_type: z.enum(['agent', 'script']).optional().describe('New execution type (script is admin only)'),
-        script_command: z.string().max(4096).optional().describe('New shell command (script mode)'),
-        execution_mode: z.enum(['host', 'container']).optional().describe('New execution mode (host is admin only)'),
+          .describe(
+            'New schedule value (LOCAL time): cron expr | interval ms | once "2026-02-01T15:30:00" (no Z).',
+          ),
+        context_mode: z
+          .enum(['group', 'isolated'])
+          .optional()
+          .describe('New context mode (agent mode)'),
+        execution_type: z
+          .enum(['agent', 'script'])
+          .optional()
+          .describe('New execution type (script is admin only)'),
+        script_command: z
+          .string()
+          .max(4096)
+          .optional()
+          .describe('New shell command (script mode)'),
+        execution_mode: z
+          .enum(['host', 'container'])
+          .optional()
+          .describe('New execution mode (host is admin only)'),
       },
       async (args) => {
         // 改 schedule_type 必须同时给 schedule_value，否则主进程无法据新类型重算 next_run。
         if (args.schedule_type && !args.schedule_value) {
           return {
-            content: [{ type: 'text' as const, text: 'When changing schedule_type you must also provide a matching schedule_value.' }],
+            content: [
+              {
+                type: 'text' as const,
+                text: 'When changing schedule_type you must also provide a matching schedule_value.',
+              },
+            ],
             isError: true,
           };
         }
@@ -858,22 +952,53 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           isMain: hasCrossGroupAccess,
           timestamp: new Date().toISOString(),
         };
-        for (const k of ['prompt', 'schedule_type', 'schedule_value', 'context_mode', 'execution_type', 'script_command', 'execution_mode'] as const) {
+        for (const k of [
+          'prompt',
+          'schedule_type',
+          'schedule_value',
+          'context_mode',
+          'execution_type',
+          'script_command',
+          'execution_mode',
+        ] as const) {
           if (args[k] !== undefined) data[k] = args[k];
         }
         try {
-          const result = await pollIpcResult(TASKS_DIR, data, 'update_task_result');
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            data,
+            'update_task_result',
+          );
           if (!result.success) {
             return {
-              content: [{ type: 'text' as const, text: `Failed to update task ${args.task_id}: ${result.error || 'Unknown error'}` }],
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to update task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                },
+              ],
               isError: true,
             };
           }
-          const nextRun = result.nextRun ? ` 下次触发：${formatIsoLocal(result.nextRun as string)}` : '';
-          return { content: [{ type: 'text' as const, text: `Task ${args.task_id} updated.${nextRun}` }] };
+          const nextRun = result.nextRun
+            ? ` 下次触发：${formatIsoLocal(result.nextRun as string)}`
+            : '';
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Task ${args.task_id} updated.${nextRun}`,
+              },
+            ],
+          };
         } catch {
           return {
-            content: [{ type: 'text' as const, text: `Timeout waiting for update confirmation for task ${args.task_id}.` }],
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for update confirmation for task ${args.task_id}.`,
+              },
+            ],
             isError: true,
           };
         }
@@ -1012,7 +1137,10 @@ Returns up to 100 messages per call (default 50), ordered oldest-first. Use "bef
           if (messages.length === 0) {
             return {
               content: [
-                { type: 'text' as const, text: 'No messages found in this channel.' },
+                {
+                  type: 'text' as const,
+                  text: 'No messages found in this channel.',
+                },
               ],
             };
           }
@@ -1344,8 +1472,8 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     );
   }
 
-  // --- memory_append --- (only available for home containers, skipped in native Claude mode)
-  if (ctx.isHome && !ctx.disableMemoryLayer) {
+  // --- memory_append --- (only available for home containers)
+  if (ctx.isHome) {
     tools.push(
       tool(
         'memory_append',
@@ -1465,215 +1593,215 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     );
   }
 
-  // --- memory_search + memory_get --- (skipped in native Claude mode)
-  if (!ctx.disableMemoryLayer) {
+  // --- memory_search + memory_get ---
+  {
     tools.push(
-    tool(
-      'memory_search',
-      `\u5728\u5de5\u4f5c\u533a\u7684\u8bb0\u5fc6\u6587\u4ef6\u4e2d\u641c\u7d22\uff08CLAUDE.md\u3001memory/\u3001conversations/ \u53ca\u5176\u4ed6 .md/.txt \u6587\u4ef6\uff09\u3002
+      tool(
+        'memory_search',
+        `\u5728\u5de5\u4f5c\u533a\u7684\u8bb0\u5fc6\u6587\u4ef6\u4e2d\u641c\u7d22\uff08CLAUDE.md\u3001memory/\u3001conversations/ \u53ca\u5176\u4ed6 .md/.txt \u6587\u4ef6\uff09\u3002
 \u8fd4\u56de\u6587\u4ef6\u8def\u5f84\u3001\u884c\u53f7\u548c\u4e0a\u4e0b\u6587\u7247\u6bb5\u3002\u8d85\u8fc7 512KB \u7684\u6587\u4ef6\u4f1a\u88ab\u8df3\u8fc7\u3002
 \u7528\u4e8e\u56de\u5fc6\u8fc7\u53bb\u7684\u51b3\u7b56\u3001\u504f\u597d\u3001\u9879\u76ee\u4e0a\u4e0b\u6587\u6216\u5bf9\u8bdd\u5386\u53f2\u3002`,
-      {
-        query: z
-          .string()
-          .describe(
-            '\u641c\u7d22\u5173\u952e\u8bcd\u6216\u77ed\u8bed\uff08\u4e0d\u533a\u5206\u5927\u5c0f\u5199\uff09',
-          ),
-        max_results: z
-          .number()
-          .optional()
-          .default(20)
-          .describe(
-            '\u6700\u5927\u7ed3\u679c\u6570\uff08\u9ed8\u8ba4 20\uff0c\u4e0a\u9650 50\uff09',
-          ),
-      },
-      async (args) => {
-        if (!args.query.trim()) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: '\u641c\u7d22\u5173\u952e\u8bcd\u4e0d\u80fd\u4e3a\u7a7a\u3002',
-              },
-            ],
-            isError: true,
-          };
-        }
-        const maxResults = Math.min(Math.max(args.max_results ?? 20, 1), 50);
-        const queryLower = args.query.toLowerCase();
-        const files: string[] = [];
-        collectMemoryFiles(ctx.workspaceMemory, files, 4);
-        collectMemoryFiles(ctx.workspaceGroup, files, 4);
-        collectMemoryFiles(ctx.workspaceGlobal, files, 4);
-        const uniqueFiles = Array.from(new Set(files));
-        if (uniqueFiles.length === 0) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: '\u672a\u627e\u5230\u8bb0\u5fc6\u6587\u4ef6\u3002',
-              },
-            ],
-          };
-        }
-        const results: string[] = [];
-        let skippedLarge = 0;
-        for (const filePath of uniqueFiles) {
-          if (results.length >= maxResults) break;
-          try {
-            const stat = fs.statSync(filePath);
-            if (stat.size > MAX_MEMORY_FILE_SIZE) {
-              skippedLarge++;
-              continue;
-            }
-            const content = fs.readFileSync(filePath, 'utf-8');
-            const lines = content.split('\n');
-            let lastEnd = -1;
-            for (let i = 0; i < lines.length; i++) {
-              if (results.length >= maxResults) break;
-              if (lines[i].toLowerCase().includes(queryLower)) {
-                const start = Math.max(0, i - 1);
-                if (start <= lastEnd) continue;
-                const end = Math.min(lines.length, i + 2);
-                lastEnd = end;
-                const snippet = lines.slice(start, end).join('\n');
-                results.push(
-                  `${toRelativePath(filePath)}:${i + 1}\n${snippet}`,
-                );
-              }
-            }
-          } catch {
-            /* skip unreadable */
+        {
+          query: z
+            .string()
+            .describe(
+              '\u641c\u7d22\u5173\u952e\u8bcd\u6216\u77ed\u8bed\uff08\u4e0d\u533a\u5206\u5927\u5c0f\u5199\uff09',
+            ),
+          max_results: z
+            .number()
+            .optional()
+            .default(20)
+            .describe(
+              '\u6700\u5927\u7ed3\u679c\u6570\uff08\u9ed8\u8ba4 20\uff0c\u4e0a\u9650 50\uff09',
+            ),
+        },
+        async (args) => {
+          if (!args.query.trim()) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: '\u641c\u7d22\u5173\u952e\u8bcd\u4e0d\u80fd\u4e3a\u7a7a\u3002',
+                },
+              ],
+              isError: true,
+            };
           }
-        }
-        const skippedNote =
-          skippedLarge > 0
-            ? `\uff08\u8df3\u8fc7 ${skippedLarge} \u4e2a\u5927\u6587\u4ef6\uff09`
-            : '';
-        if (results.length === 0) {
+          const maxResults = Math.min(Math.max(args.max_results ?? 20, 1), 50);
+          const queryLower = args.query.toLowerCase();
+          const files: string[] = [];
+          collectMemoryFiles(ctx.workspaceMemory, files, 4);
+          collectMemoryFiles(ctx.workspaceGroup, files, 4);
+          collectMemoryFiles(ctx.workspaceGlobal, files, 4);
+          const uniqueFiles = Array.from(new Set(files));
+          if (uniqueFiles.length === 0) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: '\u672a\u627e\u5230\u8bb0\u5fc6\u6587\u4ef6\u3002',
+                },
+              ],
+            };
+          }
+          const results: string[] = [];
+          let skippedLarge = 0;
+          for (const filePath of uniqueFiles) {
+            if (results.length >= maxResults) break;
+            try {
+              const stat = fs.statSync(filePath);
+              if (stat.size > MAX_MEMORY_FILE_SIZE) {
+                skippedLarge++;
+                continue;
+              }
+              const content = fs.readFileSync(filePath, 'utf-8');
+              const lines = content.split('\n');
+              let lastEnd = -1;
+              for (let i = 0; i < lines.length; i++) {
+                if (results.length >= maxResults) break;
+                if (lines[i].toLowerCase().includes(queryLower)) {
+                  const start = Math.max(0, i - 1);
+                  if (start <= lastEnd) continue;
+                  const end = Math.min(lines.length, i + 2);
+                  lastEnd = end;
+                  const snippet = lines.slice(start, end).join('\n');
+                  results.push(
+                    `${toRelativePath(filePath)}:${i + 1}\n${snippet}`,
+                  );
+                }
+              }
+            } catch {
+              /* skip unreadable */
+            }
+          }
+          const skippedNote =
+            skippedLarge > 0
+              ? `\uff08\u8df3\u8fc7 ${skippedLarge} \u4e2a\u5927\u6587\u4ef6\uff09`
+              : '';
+          if (results.length === 0) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `\u5728 ${uniqueFiles.length} \u4e2a\u8bb0\u5fc6\u6587\u4ef6\u4e2d\u672a\u627e\u5230\u201c${args.query}\u201d\u7684\u5339\u914d\u3002${skippedNote}`,
+                },
+              ],
+            };
+          }
           return {
             content: [
               {
                 type: 'text' as const,
-                text: `\u5728 ${uniqueFiles.length} \u4e2a\u8bb0\u5fc6\u6587\u4ef6\u4e2d\u672a\u627e\u5230\u201c${args.query}\u201d\u7684\u5339\u914d\u3002${skippedNote}`,
+                text: `\u627e\u5230 ${results.length} \u6761\u5339\u914d${skippedNote}\uff1a\n\n${results.join('\n---\n')}`,
               },
             ],
           };
-        }
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: `\u627e\u5230 ${results.length} \u6761\u5339\u914d${skippedNote}\uff1a\n\n${results.join('\n---\n')}`,
-            },
-          ],
-        };
-      },
-    ),
+        },
+      ),
 
-    // --- memory_get ---
-    tool(
-      'memory_get',
-      `\u8bfb\u53d6\u8bb0\u5fc6\u6587\u4ef6\u6216\u6307\u5b9a\u884c\u8303\u56f4\u3002\u5728 memory_search \u4e4b\u540e\u4f7f\u7528\u4ee5\u83b7\u53d6\u5b8c\u6574\u4e0a\u4e0b\u6587\u3002`,
-      {
-        file: z
-          .string()
-          .describe(
-            '\u76f8\u5bf9\u8def\u5f84\uff0c\u53ef\u5e26 :\u884c\u53f7\uff08\u5982 "CLAUDE.md:12"\u3001"[global] CLAUDE.md:8" \u6216 "[memory] 2026-01-15.md"\uff09',
-          ),
-        from_line: z
-          .number()
-          .optional()
-          .describe(
-            '\u8d77\u59cb\u884c\u53f7\uff08\u4ece 1 \u5f00\u59cb\uff0c\u9ed8\u8ba4\uff1a1\uff09',
-          ),
-        lines: z
-          .number()
-          .optional()
-          .describe(
-            '\u8bfb\u53d6\u884c\u6570\uff08\u9ed8\u8ba4\uff1a\u5168\u90e8\uff0c\u4e0a\u9650\uff1a200\uff09',
-          ),
-      },
-      async (args) => {
-        const { pathRef, lineFromRef } = parseMemoryFileReference(args.file);
-        let resolvedPath: string;
-        if (pathRef.startsWith('[global] ')) {
-          resolvedPath = path.join(
-            ctx.workspaceGlobal,
-            pathRef.slice('[global] '.length),
-          );
-        } else if (pathRef.startsWith('[memory] ')) {
-          resolvedPath = path.join(
-            ctx.workspaceMemory,
-            pathRef.slice('[memory] '.length),
-          );
-        } else {
-          resolvedPath = path.join(ctx.workspaceGroup, pathRef);
-        }
-        resolvedPath = path.normalize(resolvedPath);
-        const inGroup =
-          resolvedPath === ctx.workspaceGroup ||
-          resolvedPath.startsWith(ctx.workspaceGroup + path.sep);
-        const inGlobal =
-          resolvedPath === ctx.workspaceGlobal ||
-          resolvedPath.startsWith(ctx.workspaceGlobal + path.sep);
-        const inMemory =
-          resolvedPath === ctx.workspaceMemory ||
-          resolvedPath.startsWith(ctx.workspaceMemory + path.sep);
-        if (!inGroup && !inGlobal && !inMemory) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: '\u8bbf\u95ee\u88ab\u62d2\u7edd\uff1a\u8def\u5f84\u8d85\u51fa\u5de5\u4f5c\u533a\u8303\u56f4\u3002',
-              },
-            ],
-            isError: true,
-          };
-        }
-        if (!fs.existsSync(resolvedPath)) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: `\u6587\u4ef6\u672a\u627e\u5230\uff1a${pathRef}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-        try {
-          const content = fs.readFileSync(resolvedPath, 'utf-8');
-          const allLines = content.split('\n');
-          const fromLine = Math.max(
-            (args.from_line ?? lineFromRef ?? 1) - 1,
-            0,
-          );
-          const maxLines = Math.min(args.lines ?? allLines.length, 200);
-          const slice = allLines.slice(fromLine, fromLine + maxLines);
-          const header = `${pathRef}\uff08\u7b2c ${fromLine + 1}-${fromLine + slice.length} \u884c\uff0c\u5171 ${allLines.length} \u884c\uff09`;
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: `${header}\n\n${slice.join('\n')}`,
-              },
-            ],
-          };
-        } catch (err) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: `\u8bfb\u53d6\u6587\u4ef6\u65f6\u51fa\u9519\uff1a${err instanceof Error ? err.message : String(err)}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-      },
-    ),
-  );
+      // --- memory_get ---
+      tool(
+        'memory_get',
+        `\u8bfb\u53d6\u8bb0\u5fc6\u6587\u4ef6\u6216\u6307\u5b9a\u884c\u8303\u56f4\u3002\u5728 memory_search \u4e4b\u540e\u4f7f\u7528\u4ee5\u83b7\u53d6\u5b8c\u6574\u4e0a\u4e0b\u6587\u3002`,
+        {
+          file: z
+            .string()
+            .describe(
+              '\u76f8\u5bf9\u8def\u5f84\uff0c\u53ef\u5e26 :\u884c\u53f7\uff08\u5982 "CLAUDE.md:12"\u3001"[global] CLAUDE.md:8" \u6216 "[memory] 2026-01-15.md"\uff09',
+            ),
+          from_line: z
+            .number()
+            .optional()
+            .describe(
+              '\u8d77\u59cb\u884c\u53f7\uff08\u4ece 1 \u5f00\u59cb\uff0c\u9ed8\u8ba4\uff1a1\uff09',
+            ),
+          lines: z
+            .number()
+            .optional()
+            .describe(
+              '\u8bfb\u53d6\u884c\u6570\uff08\u9ed8\u8ba4\uff1a\u5168\u90e8\uff0c\u4e0a\u9650\uff1a200\uff09',
+            ),
+        },
+        async (args) => {
+          const { pathRef, lineFromRef } = parseMemoryFileReference(args.file);
+          let resolvedPath: string;
+          if (pathRef.startsWith('[global] ')) {
+            resolvedPath = path.join(
+              ctx.workspaceGlobal,
+              pathRef.slice('[global] '.length),
+            );
+          } else if (pathRef.startsWith('[memory] ')) {
+            resolvedPath = path.join(
+              ctx.workspaceMemory,
+              pathRef.slice('[memory] '.length),
+            );
+          } else {
+            resolvedPath = path.join(ctx.workspaceGroup, pathRef);
+          }
+          resolvedPath = path.normalize(resolvedPath);
+          const inGroup =
+            resolvedPath === ctx.workspaceGroup ||
+            resolvedPath.startsWith(ctx.workspaceGroup + path.sep);
+          const inGlobal =
+            resolvedPath === ctx.workspaceGlobal ||
+            resolvedPath.startsWith(ctx.workspaceGlobal + path.sep);
+          const inMemory =
+            resolvedPath === ctx.workspaceMemory ||
+            resolvedPath.startsWith(ctx.workspaceMemory + path.sep);
+          if (!inGroup && !inGlobal && !inMemory) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: '\u8bbf\u95ee\u88ab\u62d2\u7edd\uff1a\u8def\u5f84\u8d85\u51fa\u5de5\u4f5c\u533a\u8303\u56f4\u3002',
+                },
+              ],
+              isError: true,
+            };
+          }
+          if (!fs.existsSync(resolvedPath)) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `\u6587\u4ef6\u672a\u627e\u5230\uff1a${pathRef}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          try {
+            const content = fs.readFileSync(resolvedPath, 'utf-8');
+            const allLines = content.split('\n');
+            const fromLine = Math.max(
+              (args.from_line ?? lineFromRef ?? 1) - 1,
+              0,
+            );
+            const maxLines = Math.min(args.lines ?? allLines.length, 200);
+            const slice = allLines.slice(fromLine, fromLine + maxLines);
+            const header = `${pathRef}\uff08\u7b2c ${fromLine + 1}-${fromLine + slice.length} \u884c\uff0c\u5171 ${allLines.length} \u884c\uff09`;
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `${header}\n\n${slice.join('\n')}`,
+                },
+              ],
+            };
+          } catch (err) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `\u8bfb\u53d6\u6587\u4ef6\u65f6\u51fa\u9519\uff1a${err instanceof Error ? err.message : String(err)}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+        },
+      ),
+    );
   }
 
   return tools;

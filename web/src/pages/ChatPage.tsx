@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { UserCog, LogOut, Plus } from 'lucide-react';
+import { UserCog, LogOut, Plus, BarChart3 } from 'lucide-react';
 import { useChatStore } from '../stores/chat';
 import { useAuthStore } from '../stores/auth';
 import { useGroupsStore } from '../stores/groups';
@@ -242,6 +242,7 @@ export function ChatPage() {
                   aria-label="用户菜单"
                 >
                   <EmojiAvatar
+                    imageUrl={user?.avatar_url}
                     emoji={user?.avatar_emoji}
                     color={user?.avatar_color}
                     fallbackChar={userInitial}
@@ -259,6 +260,12 @@ export function ChatPage() {
                   className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md hover:bg-accent text-foreground cursor-pointer"
                 >
                   <UserCog className="w-4 h-4" /> 个人设置
+                </button>
+                <button
+                  onClick={() => navigate('/usage')}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md hover:bg-accent text-foreground cursor-pointer"
+                >
+                  <BarChart3 className="w-4 h-4" /> 用量统计
                 </button>
                 <button
                   onClick={async () => {

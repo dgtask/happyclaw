@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo } from 'react';
-import { Plus, RefreshCw, Server, Download } from 'lucide-react';
+import { Plus, RefreshCw, Server, Download, Loader2 } from 'lucide-react';
 import { SearchInput } from '@/components/common';
 import { PageHeader } from '@/components/common/PageHeader';
 import { SkeletonCardList } from '@/components/common/Skeletons';
@@ -11,6 +11,8 @@ import { useAuthStore } from '../stores/auth';
 import { McpServerCard } from '../components/mcp-servers/McpServerCard';
 import { McpServerDetail } from '../components/mcp-servers/McpServerDetail';
 import { AddMcpServerDialog } from '../components/mcp-servers/AddMcpServerDialog';
+import { api } from '../api/client';
+import type { McpServer } from '../stores/mcp-servers';
 
 export function McpServersPage() {
   const {
@@ -26,6 +28,9 @@ export function McpServersPage() {
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedServer, setSelectedServer] = useState<McpServer | null>(null);
+  const [selectedLoading, setSelectedLoading] = useState(false);
+  const [selectedError, setSelectedError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
@@ -50,7 +55,41 @@ export function McpServersPage() {
   const syncedServers = filtered.filter((s) => s.syncedFromHost);
 
   const enabledCount = servers.filter((s) => s.enabled).length;
-  const selectedServer = servers.find((s) => s.id === selectedId) || null;
+  const selectedSummary = servers.find((s) => s.id === selectedId) || null;
+
+  useEffect(() => {
+    if (!selectedId || !selectedSummary) {
+      setSelectedServer(null);
+      setSelectedError(null);
+      return;
+    }
+
+    let cancelled = false;
+    setSelectedLoading(true);
+    setSelectedError(null);
+    api
+      .get<{ server: McpServer }>(
+        `/api/mcp-servers/${encodeURIComponent(selectedId)}`,
+      )
+      .then(({ server }) => {
+        if (!cancelled) setSelectedServer(server);
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setSelectedServer(null);
+          setSelectedError(
+            error instanceof Error ? error.message : '读取 MCP 详情失败',
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setSelectedLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId, selectedSummary]);
 
   const handleSync = async () => {
     setSyncMessage(null);
@@ -81,13 +120,27 @@ export function McpServersPage() {
             actions={
               <div className="flex items-center gap-3">
                 {isAdmin && (
-                  <Button variant="outline" onClick={handleSync} disabled={syncing}>
-                    <Download size={18} className={syncing ? 'animate-pulse' : ''} />
+                  <Button
+                    variant="outline"
+                    onClick={handleSync}
+                    disabled={syncing}
+                  >
+                    <Download
+                      size={18}
+                      className={syncing ? 'animate-pulse' : ''}
+                    />
                     {syncing ? '同步中...' : '同步宿主机'}
                   </Button>
                 )}
-                <Button variant="outline" onClick={loadServers} disabled={loading}>
-                  <RefreshCw size={18} className={loading ? 'animate-spin' : ''} />
+                <Button
+                  variant="outline"
+                  onClick={loadServers}
+                  disabled={loading}
+                >
+                  <RefreshCw
+                    size={18}
+                    className={loading ? 'animate-spin' : ''}
+                  />
                   刷新
                 </Button>
                 <Button onClick={() => setShowAddDialog(true)}>
@@ -97,6 +150,12 @@ export function McpServersPage() {
               </div>
             }
           />
+        </div>
+
+        <div className="mx-6 mt-4 rounded-lg border border-warning/20 bg-warning-bg px-4 py-3 text-xs leading-5 text-warning">
+          这里的 MCP 仅属于当前用户，再由各 Agent 决定是否允许使用。STDIO
+          命令会在 Agent 的实际运行环境中执行；环境变量和请求 Header
+          可能包含敏感凭据，请只添加可信服务器。
         </div>
 
         {/* Sync message toast */}
@@ -130,8 +189,16 @@ export function McpServersPage() {
               ) : filtered.length === 0 ? (
                 <EmptyState
                   icon={Server}
-                  title={searchQuery ? '没有找到匹配的 MCP 服务器' : '暂无 MCP 服务器'}
-                  description={searchQuery ? undefined : '点击"添加"按钮添加第一个 MCP 服务器'}
+                  title={
+                    searchQuery
+                      ? '没有找到匹配的 MCP 服务器'
+                      : '暂无 MCP 服务器'
+                  }
+                  description={
+                    searchQuery
+                      ? undefined
+                      : '点击"添加"按钮添加第一个 MCP 服务器'
+                  }
                 />
               ) : (
                 <>
@@ -177,14 +244,46 @@ export function McpServersPage() {
 
           {/* Right detail (desktop) */}
           <div className="hidden lg:block lg:w-1/2 xl:w-3/5">
-            <McpServerDetail server={selectedServer} onDeleted={() => setSelectedId(null)} />
+            {selectedLoading ? (
+              <div className="flex min-h-40 items-center justify-center rounded-xl border border-border">
+                <Loader2 className="size-5 animate-spin text-muted-foreground" />
+              </div>
+            ) : selectedError ? (
+              <div
+                role="alert"
+                className="rounded-xl border border-error/20 bg-error-bg p-4 text-sm text-error"
+              >
+                {selectedError}
+              </div>
+            ) : (
+              <McpServerDetail
+                server={selectedServer}
+                onDeleted={() => setSelectedId(null)}
+              />
+            )}
           </div>
         </div>
 
         {/* Mobile detail */}
-        {selectedId && selectedServer && (
+        {selectedId && (
           <div className="lg:hidden p-4">
-            <McpServerDetail server={selectedServer} onDeleted={() => setSelectedId(null)} />
+            {selectedLoading ? (
+              <div className="flex min-h-32 items-center justify-center rounded-xl border border-border">
+                <Loader2 className="size-5 animate-spin text-muted-foreground" />
+              </div>
+            ) : selectedError ? (
+              <div
+                role="alert"
+                className="rounded-xl border border-error/20 bg-error-bg p-4 text-sm text-error"
+              >
+                {selectedError}
+              </div>
+            ) : (
+              <McpServerDetail
+                server={selectedServer}
+                onDeleted={() => setSelectedId(null)}
+              />
+            )}
           </div>
         )}
       </div>

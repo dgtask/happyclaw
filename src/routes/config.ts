@@ -1,11 +1,13 @@
 // Configuration management routes
 
 import { randomBytes, createHash } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { Agent as HttpsAgent } from 'node:https';
 import { ProxyAgent } from 'proxy-agent';
 import QRCode from 'qrcode';
 import { Hono } from 'hono';
-import { updateWeChatNoProxy } from '../config.js';
+import { DATA_DIR, updateWeChatNoProxy } from '../config.js';
 import type { Variables } from '../web-context.js';
 import { canAccessGroup, canModifyGroup, getWebDeps } from '../web-context.js';
 import { extractChatId, getChannelType } from '../im-channel.js';
@@ -18,11 +20,18 @@ import {
   setRegisteredGroup,
   updateChatName,
   getAgent,
+  getAgentProfileForWorkspace,
+  getUserById,
+  logAuthEvent,
   clearSenderAllowlist,
   deleteSessionsByProviderId,
   VALID_ACTIVATION_MODES,
 } from '../db.js';
-import { authMiddleware, systemConfigMiddleware } from '../middleware/auth.js';
+import {
+  adminRoleMiddleware,
+  authMiddleware,
+  systemConfigMiddleware,
+} from '../middleware/auth.js';
 import {
   ClaudeCustomEnvSchema,
   FeishuConfigSchema,
@@ -34,6 +43,7 @@ import {
   WhatsAppConfigSchema,
   RegistrationConfigSchema,
   AppearanceConfigSchema,
+  HostIntegrationSettingsSchema,
   SystemSettingsSchema,
   UnifiedProviderCreateSchema,
   UnifiedProviderPatchSchema,
@@ -105,15 +115,14 @@ import {
   buildWorkspaceMountUpdate,
 } from '../channel-mount-service.js';
 import { isThreadMapCapableChat } from '../im-channel-capabilities.js';
-import {
-  checkImChannelLimit,
-  isBillingEnabled,
-  clearBillingEnabledCache,
-} from '../billing.js';
+import { checkImChannelLimit, isBillingEnabled } from '../billing.js';
 import { providerPool } from '../provider-pool.js';
-import fs from 'fs';
-import path from 'path';
-
+import { getClientIp } from '../utils.js';
+import {
+  quiesceWorkspaceRunnersAroundCommit,
+  withAgentProfileLocks,
+  WorkspaceRuntimeQuiesceError,
+} from '../agent-profile-runtime.js';
 const configRoutes = new Hono<{ Variables: Variables }>();
 
 /**
@@ -1278,6 +1287,25 @@ configRoutes.put(
 
 // ─── Appearance config ────────────────────────────────────────────
 
+const SYSTEM_AGENT_AVATARS_DIR = path.join(DATA_DIR, 'avatars');
+const SYSTEM_AGENT_AVATAR_PREFIX = 'system-agent-';
+const SYSTEM_AGENT_AVATAR_EXTENSIONS: Record<string, string> = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+};
+const SYSTEM_AGENT_AVATAR_MAX_SIZE = 3 * 1024 * 1024;
+
+function removeStaleSystemAgentAvatars(keep?: string): void {
+  if (!fs.existsSync(SYSTEM_AGENT_AVATARS_DIR)) return;
+  for (const filename of fs.readdirSync(SYSTEM_AGENT_AVATARS_DIR)) {
+    if (!filename.startsWith(SYSTEM_AGENT_AVATAR_PREFIX) || filename === keep)
+      continue;
+    fs.rmSync(path.join(SYSTEM_AGENT_AVATARS_DIR, filename), { force: true });
+  }
+}
+
 configRoutes.get('/appearance', authMiddleware, systemConfigMiddleware, (c) => {
   try {
     return c.json(getAppearanceConfig());
@@ -1315,6 +1343,57 @@ configRoutes.put(
   },
 );
 
+configRoutes.post(
+  '/appearance/avatar',
+  authMiddleware,
+  adminRoleMiddleware,
+  async (c) => {
+    if (!(c.req.header('content-type') || '').includes('multipart/form-data')) {
+      return c.json({ error: 'Expected multipart/form-data' }, 400);
+    }
+    const formData = await c.req.formData();
+    const file = formData.get('avatar');
+    if (!file || !(file instanceof File)) {
+      return c.json({ error: 'No avatar file provided' }, 400);
+    }
+    if (file.size > SYSTEM_AGENT_AVATAR_MAX_SIZE) {
+      return c.json({ error: 'File too large (max 3MB)' }, 400);
+    }
+    const extension = SYSTEM_AGENT_AVATAR_EXTENSIONS[file.type];
+    if (!extension) {
+      return c.json(
+        { error: 'Unsupported image type. Use jpg, png, gif or webp' },
+        400,
+      );
+    }
+
+    fs.mkdirSync(SYSTEM_AGENT_AVATARS_DIR, { recursive: true });
+    const filename = `${SYSTEM_AGENT_AVATAR_PREFIX}${randomBytes(4).toString('hex')}${extension}`;
+    const destination = path.join(SYSTEM_AGENT_AVATARS_DIR, filename);
+    const temporary = `${destination}.tmp`;
+    fs.writeFileSync(temporary, Buffer.from(await file.arrayBuffer()));
+    fs.renameSync(temporary, destination);
+    const aiAvatarUrl = `/api/auth/avatars/${filename}`;
+    const appearance = saveAppearanceConfig({ aiAvatarUrl });
+    removeStaleSystemAgentAvatars(filename);
+    return c.json({ appearance, avatarUrl: aiAvatarUrl });
+  },
+);
+
+configRoutes.delete(
+  '/appearance/avatar',
+  authMiddleware,
+  adminRoleMiddleware,
+  (c) => {
+    const appearance = saveAppearanceConfig({
+      aiAvatarUrl: null,
+      aiAvatarMode: 'emoji',
+    });
+    removeStaleSystemAgentAvatars();
+    return c.json({ appearance });
+  },
+);
+
 // Public endpoint — no auth required (like /api/auth/status)
 configRoutes.get('/appearance/public', (c) => {
   try {
@@ -1324,6 +1403,8 @@ configRoutes.get('/appearance/public', (c) => {
       aiName: config.aiName,
       aiAvatarEmoji: config.aiAvatarEmoji,
       aiAvatarColor: config.aiAvatarColor,
+      aiAvatarUrl: config.aiAvatarUrl,
+      aiAvatarMode: config.aiAvatarMode,
     });
   } catch (err) {
     logger.error({ err }, 'Failed to load public appearance config');
@@ -1333,9 +1414,36 @@ configRoutes.get('/appearance/public', (c) => {
 
 // ─── System settings ───────────────────────────────────────────────
 
+function toSystemSettingsResponse(
+  settings: ReturnType<typeof getSystemSettings>,
+) {
+  return {
+    containerTimeout: settings.containerTimeout,
+    idleTimeout: settings.idleTimeout,
+    containerMaxOutputSize: settings.containerMaxOutputSize,
+    maxConcurrentContainers: settings.maxConcurrentContainers,
+    maxConcurrentHostProcesses: settings.maxConcurrentHostProcesses,
+    maxLoginAttempts: settings.maxLoginAttempts,
+    loginLockoutMinutes: settings.loginLockoutMinutes,
+    maxConcurrentScripts: settings.maxConcurrentScripts,
+    scriptTimeout: settings.scriptTimeout,
+    taskBackfillGraceMs: settings.taskBackfillGraceMs,
+  };
+}
+
+function changedSettingFields(
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+  submitted: Record<string, unknown>,
+): string[] {
+  return Object.keys(submitted)
+    .filter((key) => !Object.is(before[key], after[key]))
+    .sort();
+}
+
 configRoutes.get('/system', authMiddleware, systemConfigMiddleware, (c) => {
   try {
-    return c.json(getSystemSettings());
+    return c.json(toSystemSettingsResponse(getSystemSettings()));
   } catch (err) {
     logger.error({ err }, 'Failed to load system settings');
     return c.json({ error: 'Failed to load system settings' }, 500);
@@ -1356,29 +1464,27 @@ configRoutes.put(
       );
     }
 
-    // 启用前必须给每个 admin 的 host 主工作区配置 customCwd，否则 SDK
-    // 既读不到 HappyClaw 记忆层也读不到本机 ~/.claude/。
-    if (validation.data.disableMemoryLayerForAdminHost === true) {
-      const missingAdminHomes = Object.entries(getAllRegisteredGroups())
-        .filter(
-          ([, group]) =>
-            group.is_home && group.executionMode === 'host' && !group.customCwd,
-        )
-        .map(([jid]) => jid);
-      if (missingAdminHomes.length > 0) {
-        return c.json(
-          {
-            error: `启用前请先给所有 admin 主工作区配置 customCwd：${missingAdminHomes.join(', ')}`,
-          },
-          400,
-        );
-      }
-    }
-
     try {
+      const before = toSystemSettingsResponse(getSystemSettings());
       const saved = saveSystemSettings(validation.data);
-      clearBillingEnabledCache();
-      return c.json(saved);
+      const response = toSystemSettingsResponse(saved);
+      const changedFields = changedSettingFields(
+        before,
+        response,
+        validation.data,
+      );
+      if (changedFields.length > 0) {
+        const actor = c.get('user') as AuthUser;
+        logAuthEvent({
+          event_type: 'system_settings_updated',
+          username: actor.username,
+          actor_username: actor.username,
+          ip_address: getClientIp(c),
+          user_agent: c.req.header('user-agent') ?? null,
+          details: { changed_fields: changedFields },
+        });
+      }
+      return c.json(response);
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'Invalid system settings payload';
@@ -1388,18 +1494,163 @@ configRoutes.put(
   },
 );
 
+// ─── Host integration settings (admin role only) ───────────────────
+
+function toHostIntegrationResponse(
+  settings: ReturnType<typeof getSystemSettings>,
+) {
+  return {
+    externalClaudeDir: settings.externalClaudeDir,
+    pluginAutoScan: settings.pluginAutoScan,
+    mainAgentContextSource: settings.mainAgentContextSource,
+    mainAgentAutoCompactWindow: settings.mainAgentAutoCompactWindow,
+    mainAgentAutoCompactPercentage: settings.mainAgentAutoCompactPercentage,
+  };
+}
+
+configRoutes.get(
+  '/host-integration',
+  authMiddleware,
+  adminRoleMiddleware,
+  (c) => c.json(toHostIntegrationResponse(getSystemSettings())),
+);
+
+configRoutes.put(
+  '/host-integration',
+  authMiddleware,
+  adminRoleMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const validation = HostIntegrationSettingsSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+    const requestedDir = validation.data.externalClaudeDir?.trim();
+    if (requestedDir) {
+      try {
+        const resolved = fs.realpathSync(requestedDir);
+        if (
+          !path.isAbsolute(requestedDir) ||
+          !fs.statSync(resolved).isDirectory()
+        ) {
+          throw new Error('not an absolute directory');
+        }
+      } catch {
+        return c.json(
+          { error: 'externalClaudeDir must be an existing absolute directory' },
+          400,
+        );
+      }
+    }
+
+    const before = toHostIntegrationResponse(getSystemSettings());
+    const hostContextChanged =
+      (validation.data.mainAgentContextSource !== undefined &&
+        validation.data.mainAgentContextSource !==
+          before.mainAgentContextSource) ||
+      (validation.data.externalClaudeDir !== undefined &&
+        validation.data.externalClaudeDir !== before.externalClaudeDir);
+    const defaultCompactChanged =
+      (validation.data.mainAgentAutoCompactWindow !== undefined &&
+        validation.data.mainAgentAutoCompactWindow !==
+          before.mainAgentAutoCompactWindow) ||
+      (validation.data.mainAgentAutoCompactPercentage !== undefined &&
+        validation.data.mainAgentAutoCompactPercentage !==
+          before.mainAgentAutoCompactPercentage);
+    const contextMutationRequested =
+      hostContextChanged || defaultCompactChanged;
+    const commit = () => saveSystemSettings(validation.data);
+    let saved: ReturnType<typeof saveSystemSettings>;
+    if (contextMutationRequested && deps) {
+      const workspaces = Object.entries(getAllRegisteredGroups())
+        .map(([jid, group]) => ({
+          jid,
+          group,
+          profile: group.created_by
+            ? getAgentProfileForWorkspace(group.folder, group.created_by)
+            : undefined,
+        }))
+        .filter(({ group, profile }) => {
+          if (!group.created_by || !profile) return false;
+          return (
+            (defaultCompactChanged && profile.is_default) ||
+            (hostContextChanged &&
+              getUserById(group.created_by)?.role === 'admin')
+          );
+        });
+      const profileIds = Array.from(
+        new Set(
+          workspaces
+            .map(({ profile }) => profile)
+            .filter((profile) => !!profile)
+            .map((profile) => profile.id),
+        ),
+      );
+      try {
+        const result = await withAgentProfileLocks(profileIds, () =>
+          quiesceWorkspaceRunnersAroundCommit(
+            deps,
+            workspaces.map(({ jid, group }) => ({
+              folder: group.folder,
+              primaryJid: jid,
+            })),
+            { reason: 'Host integration context updated' },
+            commit,
+          ),
+        );
+        saved = result.value;
+      } catch (err) {
+        if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+        return c.json(
+          {
+            error: err.persisted
+              ? 'Host integration was updated, but runtime cleanup failed; retry the same request'
+              : 'Failed to quiesce active workspaces; host integration was not updated',
+            persisted: err.persisted,
+            retryable: true,
+          },
+          503,
+        );
+      }
+    } else {
+      saved = commit();
+    }
+    const response = toHostIntegrationResponse(saved);
+    const changedFields = changedSettingFields(
+      before,
+      response,
+      validation.data,
+    );
+    const actor = c.get('user') as AuthUser;
+    if (changedFields.length > 0) {
+      logAuthEvent({
+        event_type: 'host_integration_updated',
+        username: actor.username,
+        actor_username: actor.username,
+        ip_address: getClientIp(c),
+        user_agent: c.req.header('user-agent') ?? null,
+        // Only names and a boolean are recorded; the host path is never logged.
+        details: {
+          changed_fields: changedFields,
+          external_claude_dir_configured: Boolean(response.externalClaudeDir),
+        },
+      });
+    }
+
+    return c.json(response);
+  },
+);
+
 // ─── External Claude resources (admin only) ─────────────────────────
 
 configRoutes.get(
   '/external-resources',
   authMiddleware,
-  systemConfigMiddleware,
+  adminRoleMiddleware,
   (c) => {
-    // 仅 admin 可查看宿主机资源，普通用户不允许看到宿主机任何内容
-    const user = c.get('user') as AuthUser;
-    if (user.role !== 'admin') {
-      return c.json({ dir: '', rules: [], claudeMd: null });
-    }
     const effectiveDir = getEffectiveExternalDir();
 
     const result: {

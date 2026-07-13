@@ -1,14 +1,32 @@
-import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'react';
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useMemo,
+  useCallback,
+} from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Message, useChatStore } from '../../stores/chat';
-import { useAuthStore } from '../../stores/auth';
 import { MessageBubble } from './MessageBubble';
 import { StreamingDisplay } from './StreamingDisplay';
 import { EmojiAvatar } from '../common/EmojiAvatar';
 import { ErrorBoundary } from '../common';
-import { Loader2, ChevronUp, ChevronDown, AlertTriangle, Square, Code2, Zap, BookOpen, Wrench } from 'lucide-react';
+import {
+  Loader2,
+  ChevronUp,
+  ChevronDown,
+  AlertTriangle,
+  Square,
+  Code2,
+  Zap,
+  BookOpen,
+  Wrench,
+} from 'lucide-react';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { resolveSystemMessage } from '../../lib/system-message-registry';
+import { resolveAgentDisplayIdentity } from '../../utils/agent-identity';
+import { useAuthStore } from '../../stores/auth';
 
 interface MessageListProps {
   messages: Message[];
@@ -27,6 +45,11 @@ interface MessageListProps {
   agentId?: string;
   /** Human-readable name of the active conversation for empty-state clarity */
   contextLabel?: string;
+  /** Agent Profile identity for every conversation in this workspace */
+  agentName?: string;
+  agentAvatarUrl?: string | null;
+  agentAvatarEmoji?: string | null;
+  agentAvatarColor?: string | null;
   /** Callback to send a message (used for quick prompts in empty state) */
   onSend?: (content: string) => void;
 }
@@ -53,24 +76,57 @@ const quickPrompts = [
   { icon: Wrench, title: '调试问题', desc: '帮我定位和修复一个 Bug' },
 ];
 
-export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid, isWaiting, onInterrupt, agentId, contextLabel, onSend }: MessageListProps) {
+export function MessageList({
+  messages,
+  loading,
+  hasMore,
+  onLoadMore,
+  scrollTrigger,
+  groupJid,
+  isWaiting,
+  onInterrupt,
+  agentId,
+  contextLabel,
+  agentName,
+  agentAvatarUrl,
+  agentAvatarEmoji,
+  agentAvatarColor,
+  onSend,
+}: MessageListProps) {
   const { mode: displayMode } = useDisplayMode();
-  const thinkingCache = useChatStore(s => s.thinkingCache ?? {});
-  const thinkingDurationCache = useChatStore(s => s.thinkingDurationCache ?? {});
+  const thinkingCache = useChatStore((s) => s.thinkingCache ?? {});
+  const thinkingDurationCache = useChatStore(
+    (s) => s.thinkingDurationCache ?? {},
+  );
   // Spawn agents: selector returns stable reference (the agents array itself),
   // then useMemo filters for spawn kind. Direct .filter() in selector causes
   // infinite re-render because Zustand sees a new array reference every time.
-  const allAgentsForSpawn = useChatStore(s => groupJid ? s.agents[groupJid] : undefined);
+  const allAgentsForSpawn = useChatStore((s) =>
+    groupJid ? s.agents[groupJid] : undefined,
+  );
   const spawnAgents = useMemo(
-    () => (allAgentsForSpawn ?? []).filter(a => a.kind === 'spawn' && a.status === 'running'),
+    () =>
+      (allAgentsForSpawn ?? []).filter(
+        (a) => a.kind === 'spawn' && a.status === 'running',
+      ),
     [allAgentsForSpawn],
   );
-  const currentUser = useAuthStore(s => s.user);
-  const appearance = useAuthStore(s => s.appearance);
-  const aiName = currentUser?.ai_name || appearance?.aiName || 'AI 助手';
-  const aiEmoji = currentUser?.ai_avatar_emoji || appearance?.aiAvatarEmoji;
-  const aiColor = currentUser?.ai_avatar_color || appearance?.aiAvatarColor;
-  const aiImageUrl = currentUser?.ai_avatar_url;
+  const appearance = useAuthStore((state) => state.appearance);
+  const agentIdentity = resolveAgentDisplayIdentity({
+    agentName,
+    avatarUrl: agentAvatarUrl,
+    avatarEmoji: agentAvatarEmoji,
+    avatarColor: agentAvatarColor,
+    mainAvatarUrl: appearance?.aiAvatarUrl,
+    mainAvatarEmoji:
+      appearance?.aiAvatarMode === 'emoji'
+        ? appearance.aiAvatarEmoji
+        : undefined,
+    mainAvatarColor:
+      appearance?.aiAvatarMode === 'emoji'
+        ? appearance.aiAvatarColor
+        : undefined,
+  });
   const parentRef = useRef<HTMLDivElement>(null);
   const scrollStateRef = useRef({ autoScroll: true, atTop: false });
   const [autoScroll, setAutoScroll] = useState(true);
@@ -107,12 +163,15 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
 
   // Compute flatMessages (with date headers) before virtualizer
   const flatMessages = useMemo<FlatItem[]>(() => {
-    const grouped = messages.reduce((acc, msg) => {
-      const date = DATE_LABEL_FORMATTER.format(new Date(msg.timestamp));
-      if (!acc[date]) acc[date] = [];
-      acc[date].push(msg);
-      return acc;
-    }, {} as Record<string, Message[]>);
+    const grouped = messages.reduce(
+      (acc, msg) => {
+        const date = DATE_LABEL_FORMATTER.format(new Date(msg.timestamp));
+        if (!acc[date]) acc[date] = [];
+        acc[date].push(msg);
+        return acc;
+      },
+      {} as Record<string, Message[]>,
+    );
 
     const items: FlatItem[] = [];
     Object.entries(grouped).forEach(([date, msgs]) => {
@@ -127,7 +186,10 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
           }
         } else if (!msg.is_from_me && /^\/(sw|spawn)\s+/i.test(msg.content)) {
           // /sw or /spawn commands render as compact spawn-task cards
-          items.push({ type: 'spawn', content: msg.content.replace(/^\/(sw|spawn)\s+/i, '') });
+          items.push({
+            type: 'spawn',
+            content: msg.content.replace(/^\/(sw|spawn)\s+/i, ''),
+          });
         } else {
           items.push({ type: 'message', content: msg });
         }
@@ -146,21 +208,28 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
       const item = flatMessages[index];
       if (!item) return index;
       switch (item.type) {
-        case 'date': return `date-${item.content}`;
-        case 'divider': return `div-${index}`;
-        case 'spawn': return `spawn-${index}`;
-        case 'error': return `err-${index}`;
-        case 'message': return item.content.id;
+        case 'date':
+          return `date-${item.content}`;
+        case 'divider':
+          return `div-${index}`;
+        case 'spawn':
+          return `spawn-${index}`;
+        case 'error':
+          return `err-${index}`;
+        case 'message':
+          return item.content.id;
       }
     },
     estimateSize: (index) => {
       const item = flatMessages[index];
       if (!item) return 100;
       switch (item.type) {
-        case 'date': return 48;
+        case 'date':
+          return 48;
         case 'divider':
         case 'spawn':
-        case 'error': return 56;
+        case 'error':
+          return 56;
         case 'message': {
           const len = item.content.content.length;
           if (item.content.is_from_me) {
@@ -172,7 +241,8 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
           }
           return Math.max(48, Math.min(200, Math.ceil(len / 80) * 24 + 40));
         }
-        default: return 100;
+        default:
+          return 100;
       }
     },
     overscan: window.innerWidth < 1024 ? 12 : 8,
@@ -280,14 +350,16 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
     if (flatMessages.length === 0) return;
     const timers: number[] = [];
     for (const delay of [50, 150, 300, 500]) {
-      timers.push(window.setTimeout(() => {
-        const el = parentRef.current;
-        if (!el) return;
-        const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
-        if (gap > 100) {
-          el.scrollTop = el.scrollHeight;
-        }
-      }, delay));
+      timers.push(
+        window.setTimeout(() => {
+          const el = parentRef.current;
+          if (!el) return;
+          const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+          if (gap > 100) {
+            el.scrollTop = el.scrollHeight;
+          }
+        }, delay),
+      );
     }
     return () => timers.forEach(clearTimeout);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -299,8 +371,8 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
   // thinking_delta updates land. This replaces the 100ms setInterval poll
   // (PR #455 era) which competed with smooth scrolls and caused 3-4 visible
   // jumps when the user scrolled to the bottom mid-stream.
-  const hasStreaming = useChatStore(s =>
-    agentId ? !!s.agentStreaming[agentId] : !!s.streaming[groupJid ?? '']
+  const hasStreaming = useChatStore((s) =>
+    agentId ? !!s.agentStreaming[agentId] : !!s.streaming[groupJid ?? ''],
   );
   useEffect(() => {
     if (!hasStreaming) return;
@@ -326,7 +398,8 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
       agentId ? state.agentStreaming[agentId] : state.streaming[groupJid ?? ''];
 
     let prevText = readStreaming(useChatStore.getState())?.partialText ?? '';
-    let prevThinking = readStreaming(useChatStore.getState())?.thinkingText ?? '';
+    let prevThinking =
+      readStreaming(useChatStore.getState())?.thinkingText ?? '';
 
     const unsubscribe = useChatStore.subscribe((state) => {
       const cur = readStreaming(state);
@@ -367,207 +440,261 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
         ref={parentRef}
         className="h-full overflow-y-auto overflow-x-hidden py-6"
       >
-        <div className={displayMode === 'compact' ? 'mx-auto px-4 min-w-0' : 'max-w-4xl mx-auto px-4 min-w-0'}>
-        {loading && hasMore && (
-          <div className="flex justify-center py-4">
-            <Loader2 className="animate-spin text-primary" size={24} />
-          </div>
-        )}
-
         <div
-          style={{
-            height: `${virtualizer.getTotalSize()}px`,
-            width: '100%',
-            position: 'relative',
-          }}
+          className={
+            displayMode === 'compact'
+              ? 'mx-auto px-4 min-w-0'
+              : 'max-w-4xl mx-auto px-4 min-w-0'
+          }
         >
-          {virtualizer.getVirtualItems().map((virtualItem) => {
-            const item = flatMessages[virtualItem.index];
-            if (!item) return null;
-
-            if (item.type === 'date') {
-              return (
-                <div
-                  key={virtualItem.key}
-                  ref={virtualizer.measureElement}
-                  data-index={virtualItem.index}
-                  style={{
-                    position: 'absolute',
-                    top: 0,
-                    left: 0,
-                    width: '100%',
-                    transform: `translateY(${virtualItem.start}px)`,
-                  }}
-                >
-                  <div className="flex justify-center my-6">
-                    <span className="bg-surface px-4 py-1 rounded-full text-xs text-muted-foreground border border-border">
-                      {item.content}
-                    </span>
-                  </div>
-                </div>
-              );
-            }
-
-            if (item.type === 'divider') {
-              return (
-                <div
-                  key={virtualItem.key}
-                  ref={virtualizer.measureElement}
-                  data-index={virtualItem.index}
-                  style={{
-                    position: 'absolute',
-                    top: 0,
-                    left: 0,
-                    width: '100%',
-                    transform: `translateY(${virtualItem.start}px)`,
-                  }}
-                >
-                  <div className="flex items-center gap-3 my-6 px-4">
-                    <div className="flex-1 border-t border-amber-300" />
-                    <span className="text-xs text-amber-600 whitespace-pre-wrap">
-                      {item.content}
-                    </span>
-                    <div className="flex-1 border-t border-amber-300" />
-                  </div>
-                </div>
-              );
-            }
-
-            if (item.type === 'spawn') {
-              return (
-                <div
-                  key={virtualItem.key}
-                  ref={virtualizer.measureElement}
-                  data-index={virtualItem.index}
-                  style={{
-                    position: 'absolute',
-                    top: 0,
-                    left: 0,
-                    width: '100%',
-                    transform: `translateY(${virtualItem.start}px)`,
-                  }}
-                >
-                  <div className="flex items-center gap-2 my-4 px-4">
-                    <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-violet-50 dark:bg-violet-950/40 text-xs text-violet-600 dark:text-violet-400 border border-violet-200 dark:border-violet-800">
-                      <span>⚡</span>
-                      <span className="font-medium">并行任务</span>
-                      <span className="text-violet-400 dark:text-violet-500">|</span>
-                      <span className="max-w-[400px] truncate">{item.content}</span>
-                    </span>
-                  </div>
-                </div>
-              );
-            }
-
-            if (item.type === 'error') {
-              return (
-                <div
-                  key={virtualItem.key}
-                  ref={virtualizer.measureElement}
-                  data-index={virtualItem.index}
-                  style={{
-                    position: 'absolute',
-                    top: 0,
-                    left: 0,
-                    width: '100%',
-                    transform: `translateY(${virtualItem.start}px)`,
-                  }}
-                >
-                  <div className="flex items-center gap-3 my-6 px-4">
-                    <div className="flex-1 border-t border-red-300" />
-                    <span className="text-xs text-red-600 whitespace-pre-wrap flex items-center gap-1">
-                      <AlertTriangle size={14} />
-                      {item.content}
-                    </span>
-                    <div className="flex-1 border-t border-red-300" />
-                  </div>
-                </div>
-              );
-            }
-
-            const message = item.content;
-            const showTime = true;
-
-            return (
-              <div
-                key={virtualItem.key}
-                style={{
-                  position: 'absolute',
-                  top: 0,
-                  left: 0,
-                  width: '100%',
-                  transform: `translateY(${virtualItem.start}px)`,
-                }}
-                ref={virtualizer.measureElement}
-                data-index={virtualItem.index}
-              >
-                <ErrorBoundary>
-                  <MessageBubble message={message} showTime={showTime} thinkingContent={thinkingCache[message.id]} thinkingDurationMs={thinkingDurationCache[message.id]} />
-                </ErrorBoundary>
-              </div>
-            );
-          })}
-        </div>
-
-        {messages.length === 0 && !loading && (
-          <div data-hc-empty-state className="absolute inset-x-0 top-0 bottom-0 flex justify-center px-6 pt-[clamp(4.5rem,14vh,9rem)]">
-            <div className="w-full max-w-3xl">
-              <div className="flex items-start gap-3">
-                <EmojiAvatar
-                  imageUrl={aiImageUrl}
-                  emoji={aiEmoji}
-                  color={aiColor}
-                  fallbackChar={aiName[0]}
-                  size="md"
-                  className="mt-0.5 !h-10 !w-10 shrink-0 !text-lg"
-                />
-                <div className="min-w-0 flex-1">
-                  <h2 className="text-xl font-semibold leading-7 text-foreground">
-                    {agentId ? '开始当前会话' : '开始主会话'}
-                  </h2>
-                  <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
-                    {agentId && contextLabel
-                      ? `“${contextLabel}”使用独立上下文。直接输入你的问题。`
-                      : `我是 ${aiName}。直接输入你的问题，或从下面选择一个常用起点。`}
-                  </p>
-                </div>
-              </div>
-
-              {onSend && (
-                <div className="mt-6 grid gap-2.5 sm:grid-cols-2">
-                  {quickPrompts.map((prompt) => (
-                    <button
-                      key={prompt.title}
-                      onClick={() => onSend(prompt.desc)}
-                      className="group min-h-[72px] rounded-lg border border-border/70 bg-background/70 px-3.5 py-3 text-left transition-colors hover:border-border hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.99] cursor-pointer"
-                    >
-                      <div className="flex items-start gap-3">
-                        <prompt.icon className="mt-0.5 h-4.5 w-4.5 shrink-0 text-muted-foreground group-hover:text-foreground" strokeWidth={1.75} />
-                        <span className="min-w-0">
-                          <span className="block truncate text-sm font-medium text-foreground">{prompt.title}</span>
-                          <span className="mt-0.5 block overflow-hidden text-ellipsis text-xs leading-5 text-muted-foreground">{prompt.desc}</span>
-                        </span>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              )}
+          {loading && hasMore && (
+            <div className="flex justify-center py-4">
+              <Loader2 className="animate-spin text-primary" size={24} />
             </div>
+          )}
+
+          <div
+            style={{
+              height: `${virtualizer.getTotalSize()}px`,
+              width: '100%',
+              position: 'relative',
+            }}
+          >
+            {virtualizer.getVirtualItems().map((virtualItem) => {
+              const item = flatMessages[virtualItem.index];
+              if (!item) return null;
+
+              if (item.type === 'date') {
+                return (
+                  <div
+                    key={virtualItem.key}
+                    ref={virtualizer.measureElement}
+                    data-index={virtualItem.index}
+                    style={{
+                      position: 'absolute',
+                      top: 0,
+                      left: 0,
+                      width: '100%',
+                      transform: `translateY(${virtualItem.start}px)`,
+                    }}
+                  >
+                    <div className="flex justify-center my-6">
+                      <span className="bg-surface px-4 py-1 rounded-full text-xs text-muted-foreground border border-border">
+                        {item.content}
+                      </span>
+                    </div>
+                  </div>
+                );
+              }
+
+              if (item.type === 'divider') {
+                return (
+                  <div
+                    key={virtualItem.key}
+                    ref={virtualizer.measureElement}
+                    data-index={virtualItem.index}
+                    style={{
+                      position: 'absolute',
+                      top: 0,
+                      left: 0,
+                      width: '100%',
+                      transform: `translateY(${virtualItem.start}px)`,
+                    }}
+                  >
+                    <div className="flex items-center gap-3 my-6 px-4">
+                      <div className="flex-1 border-t border-amber-300" />
+                      <span className="text-xs text-amber-600 whitespace-pre-wrap">
+                        {item.content}
+                      </span>
+                      <div className="flex-1 border-t border-amber-300" />
+                    </div>
+                  </div>
+                );
+              }
+
+              if (item.type === 'spawn') {
+                return (
+                  <div
+                    key={virtualItem.key}
+                    ref={virtualizer.measureElement}
+                    data-index={virtualItem.index}
+                    style={{
+                      position: 'absolute',
+                      top: 0,
+                      left: 0,
+                      width: '100%',
+                      transform: `translateY(${virtualItem.start}px)`,
+                    }}
+                  >
+                    <div className="flex items-center gap-2 my-4 px-4">
+                      <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-violet-50 dark:bg-violet-950/40 text-xs text-violet-600 dark:text-violet-400 border border-violet-200 dark:border-violet-800">
+                        <span>⚡</span>
+                        <span className="font-medium">并行任务</span>
+                        <span className="text-violet-400 dark:text-violet-500">
+                          |
+                        </span>
+                        <span className="max-w-[400px] truncate">
+                          {item.content}
+                        </span>
+                      </span>
+                    </div>
+                  </div>
+                );
+              }
+
+              if (item.type === 'error') {
+                return (
+                  <div
+                    key={virtualItem.key}
+                    ref={virtualizer.measureElement}
+                    data-index={virtualItem.index}
+                    style={{
+                      position: 'absolute',
+                      top: 0,
+                      left: 0,
+                      width: '100%',
+                      transform: `translateY(${virtualItem.start}px)`,
+                    }}
+                  >
+                    <div className="flex items-center gap-3 my-6 px-4">
+                      <div className="flex-1 border-t border-red-300" />
+                      <span className="text-xs text-red-600 whitespace-pre-wrap flex items-center gap-1">
+                        <AlertTriangle size={14} />
+                        {item.content}
+                      </span>
+                      <div className="flex-1 border-t border-red-300" />
+                    </div>
+                  </div>
+                );
+              }
+
+              const message = item.content;
+              const showTime = true;
+
+              return (
+                <div
+                  key={virtualItem.key}
+                  style={{
+                    position: 'absolute',
+                    top: 0,
+                    left: 0,
+                    width: '100%',
+                    transform: `translateY(${virtualItem.start}px)`,
+                  }}
+                  ref={virtualizer.measureElement}
+                  data-index={virtualItem.index}
+                >
+                  <ErrorBoundary>
+                    <MessageBubble
+                      message={message}
+                      showTime={showTime}
+                      thinkingContent={thinkingCache[message.id]}
+                      thinkingDurationMs={thinkingDurationCache[message.id]}
+                      agentName={agentIdentity.name}
+                      agentAvatarUrl={agentAvatarUrl}
+                      agentAvatarEmoji={agentAvatarEmoji}
+                      agentAvatarColor={agentAvatarColor}
+                    />
+                  </ErrorBoundary>
+                </div>
+              );
+            })}
           </div>
-        )}
 
-        {groupJid && !agentId && (
-          <StreamingDisplay groupJid={groupJid} isWaiting={!!isWaiting} />
-        )}
-        {groupJid && agentId && (
-          <StreamingDisplay groupJid={groupJid} isWaiting={!!isWaiting} agentId={agentId} />
-        )}
+          {messages.length === 0 && !loading && (
+            <div
+              data-hc-empty-state
+              className="absolute inset-x-0 top-0 bottom-0 flex justify-center px-6 pt-[clamp(4.5rem,14vh,9rem)]"
+            >
+              <div className="w-full max-w-3xl">
+                <div className="flex items-start gap-3">
+                  <EmojiAvatar
+                    imageUrl={agentIdentity.imageUrl}
+                    emoji={agentIdentity.emoji}
+                    color={agentIdentity.color}
+                    fallbackChar={agentIdentity.fallbackChar}
+                    size="md"
+                    className="mt-0.5 !h-10 !w-10 shrink-0 !text-lg"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <h2 className="text-xl font-semibold leading-7 text-foreground">
+                      {agentId ? '开始当前会话' : '开始主会话'}
+                    </h2>
+                    <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
+                      {agentId && contextLabel
+                        ? `“${contextLabel}”使用独立上下文。直接输入你的问题。`
+                        : `我是 ${agentIdentity.name}。直接输入你的问题，或从下面选择一个常用起点。`}
+                    </p>
+                  </div>
+                </div>
 
-        {/* Inline streaming for spawn agents — parallel tasks in same chat */}
-        {groupJid && !agentId && spawnAgents.map(a => (
-          <StreamingDisplay key={a.id} groupJid={groupJid} isWaiting={true} agentId={a.id} senderName={a.name} />
-        ))}
+                {onSend && (
+                  <div className="mt-6 grid gap-2.5 sm:grid-cols-2">
+                    {quickPrompts.map((prompt) => (
+                      <button
+                        key={prompt.title}
+                        onClick={() => onSend(prompt.desc)}
+                        className="group min-h-[72px] rounded-lg border border-border/70 bg-background/70 px-3.5 py-3 text-left transition-colors hover:border-border hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.99] cursor-pointer"
+                      >
+                        <div className="flex items-start gap-3">
+                          <prompt.icon
+                            className="mt-0.5 h-4.5 w-4.5 shrink-0 text-muted-foreground group-hover:text-foreground"
+                            strokeWidth={1.75}
+                          />
+                          <span className="min-w-0">
+                            <span className="block truncate text-sm font-medium text-foreground">
+                              {prompt.title}
+                            </span>
+                            <span className="mt-0.5 block overflow-hidden text-ellipsis text-xs leading-5 text-muted-foreground">
+                              {prompt.desc}
+                            </span>
+                          </span>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
 
+          {groupJid && !agentId && (
+            <StreamingDisplay
+              groupJid={groupJid}
+              isWaiting={!!isWaiting}
+              senderName={agentIdentity.name}
+              agentAvatarUrl={agentAvatarUrl}
+              agentAvatarEmoji={agentAvatarEmoji}
+              agentAvatarColor={agentAvatarColor}
+            />
+          )}
+          {groupJid && agentId && (
+            <StreamingDisplay
+              groupJid={groupJid}
+              isWaiting={!!isWaiting}
+              agentId={agentId}
+              senderName={agentIdentity.name}
+              agentAvatarUrl={agentAvatarUrl}
+              agentAvatarEmoji={agentAvatarEmoji}
+              agentAvatarColor={agentAvatarColor}
+            />
+          )}
+
+          {/* Inline streaming for spawn agents — parallel tasks in same chat */}
+          {groupJid &&
+            !agentId &&
+            spawnAgents.map((a) => (
+              <StreamingDisplay
+                key={a.id}
+                groupJid={groupJid}
+                isWaiting={true}
+                agentId={a.id}
+                senderName={a.name}
+                agentAvatarUrl={agentAvatarUrl}
+                agentAvatarEmoji={agentAvatarEmoji}
+                agentAvatarColor={agentAvatarColor}
+              />
+            ))}
         </div>
       </div>
 

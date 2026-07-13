@@ -344,6 +344,19 @@ function shouldIncludeHostClaudeContext(
   return agentProfile?.runtimePolicy?.context?.source === 'host_claude';
 }
 
+function getAgentAutoCompactWindow(agentProfile?: RunnerAgentProfile): number {
+  const value = agentProfile?.runtimePolicy?.context?.auto_compact_window ?? 0;
+  return value === 0 || (value >= 100_000 && value <= 1_000_000) ? value : 0;
+}
+
+function getAgentAutoCompactPercentage(
+  agentProfile?: RunnerAgentProfile,
+): number {
+  const value =
+    agentProfile?.runtimePolicy?.context?.auto_compact_percentage ?? 0;
+  return value === 0 || (value >= 50 && value <= 90) ? value : 0;
+}
+
 function resolveAgentProfileUserSkillsPolicy(
   ownerId: string | undefined,
   agentProfile?: RunnerAgentProfile,
@@ -986,15 +999,21 @@ export function buildVolumeMounts(
     containerOverride,
     resolvedProvider?.customEnv,
   );
-  // SystemSettings.autoCompactWindow > 0 时注入到容器，让 agent-runner 通过 query() settings 传给 SDK
-  const sysSettings = getSystemSettings();
-  if (sysSettings.autoCompactWindow > 0) {
-    envLines.push(`AUTO_COMPACT_WINDOW=${sysSettings.autoCompactWindow}`);
+  // Agent policy is authoritative; do not inherit the former global/custom env.
+  for (let index = envLines.length - 1; index >= 0; index -= 1) {
+    if (
+      envLines[index]?.startsWith('AUTO_COMPACT_WINDOW=') ||
+      envLines[index]?.startsWith('AUTO_COMPACT_PERCENTAGE=')
+    ) {
+      envLines.splice(index, 1);
+    }
   }
-  // SubAgent 模型：仅在显式配置了非默认值时注入。默认 'inherit' 与省略 model 等价，
-  // 此时不注入，避免覆盖用户可能在 provider customEnv 里设的 SUBAGENT_MODEL（与 autoCompact 对称）。
-  if (sysSettings.subagentModel && sysSettings.subagentModel !== 'inherit') {
-    envLines.push(`SUBAGENT_MODEL=${sysSettings.subagentModel}`);
+  const autoCompactPercentage = getAgentAutoCompactPercentage(agentProfile);
+  const autoCompactWindow = getAgentAutoCompactWindow(agentProfile);
+  if (autoCompactPercentage > 0) {
+    envLines.push(`AUTO_COMPACT_PERCENTAGE=${autoCompactPercentage}`);
+  } else if (autoCompactWindow > 0) {
+    envLines.push(`AUTO_COMPACT_WINDOW=${autoCompactWindow}`);
   }
   const disallowedTools = resolveAgentProfileDisallowedTools(agentProfile);
   const toolPolicyMode = getAgentProfileToolPolicyMode(agentProfile);
@@ -1546,22 +1565,6 @@ export function killProcessTree(
 }
 
 /**
- * admin 主容器 + 系统设置 disableMemoryLayerForAdminHost 开启时，
- * HappyClaw 记忆层被禁用，agent 完全按本机 ~/.claude/ Playbook 运行。
- * 供 host 启动路径多处复用，保证判断口径一致。
- */
-function isAdminHomeMemoryDisabled(
-  isAdminHome: boolean,
-  group: RegisteredGroup,
-): boolean {
-  return (
-    isAdminHome &&
-    !!group.is_home &&
-    getSystemSettings().disableMemoryLayerForAdminHost
-  );
-}
-
-/**
  * Run agent directly on the host machine (no Docker container).
  * Used for host execution mode — the agent gets full access to the host filesystem.
  */
@@ -1729,8 +1732,7 @@ export async function runHostAgent(
   });
 
   // 4. Skills / Rules / CLAUDE.md 自动链接到 session 目录
-  // happyclawMemoryActive：记忆层未禁用 + admin 原生 ~/.claude/CLAUDE.md 并存时触发 audit 告警。
-  // 与下方 disableMemoryLayer 同源（共用 isAdminHomeMemoryDisabled），口径保持一致。
+  // 宿主 Claude 配置与 HappyClaw 记忆层始终叠加，冲突通过 audit 明示。
   const hostUserSkillsPolicy = resolveAgentProfileUserSkillsPolicy(
     group.created_by,
     input.agentProfile,
@@ -1748,10 +1750,7 @@ export async function runHostAgent(
     ),
     mountUserSkills: hostUserSkillsPolicy.mountUserSkills,
     userSkillsDirOverride: hostUserSkillsPolicy.userSkillsDirOverride,
-    happyclawMemoryActive: !isAdminHomeMemoryDisabled(
-      !!input.isAdminHome,
-      group,
-    ),
+    happyclawMemoryActive: true,
   });
   const hostClaudeContextSync = syncHostClaudeContext(
     hostClaudeContextPlan,
@@ -1893,19 +1892,17 @@ export async function runHostAgent(
       }
     }
 
-    // SystemSettings.autoCompactWindow > 0 时注入到 host 进程，agent-runner 通过 query() settings 传给 SDK
-    const hostSysSettings = getSystemSettings();
-    if (hostSysSettings.autoCompactWindow > 0) {
-      hostEnv['AUTO_COMPACT_WINDOW'] = String(
-        hostSysSettings.autoCompactWindow,
-      );
-    }
-    // SubAgent 模型：仅非默认 'inherit' 时注入，避免覆盖 customEnv 同名值。
-    if (
-      hostSysSettings.subagentModel &&
-      hostSysSettings.subagentModel !== 'inherit'
-    ) {
-      hostEnv['SUBAGENT_MODEL'] = hostSysSettings.subagentModel;
+    // Agent policy is authoritative; clear inherited legacy process env first.
+    delete hostEnv['AUTO_COMPACT_WINDOW'];
+    delete hostEnv['AUTO_COMPACT_PERCENTAGE'];
+    const autoCompactPercentage = getAgentAutoCompactPercentage(
+      input.agentProfile,
+    );
+    const autoCompactWindow = getAgentAutoCompactWindow(input.agentProfile);
+    if (autoCompactPercentage > 0) {
+      hostEnv['AUTO_COMPACT_PERCENTAGE'] = String(autoCompactPercentage);
+    } else if (autoCompactWindow > 0) {
+      hostEnv['AUTO_COMPACT_WINDOW'] = String(autoCompactWindow);
     }
     const hostDisallowedTools = resolveAgentProfileDisallowedTools(
       input.agentProfile,
@@ -1927,39 +1924,29 @@ export async function runHostAgent(
         JSON.stringify(hostDisallowedTools);
     }
 
-    // 禁用 HappyClaw 记忆层：不注入 memory MCP 工具 / WORKSPACE_GLOBAL/MEMORY env / 记忆提示，
-    // 三件套仍通过同步后的 session .claude 生效，避免 externalClaudeDir 漂移。
-    // 仅作用于 admin 主容器，不影响 admin 创建的其他工作区。
-    const disableMemoryLayer = isAdminHomeMemoryDisabled(
-      !!input.isAdminHome,
-      group,
-    );
-
     // 路径映射
     hostEnv['HAPPYCLAW_WORKSPACE_GROUP'] = groupDir;
     hostEnv['HAPPYCLAW_WORKSPACE_IPC'] = groupIpcDir;
 
-    if (!disableMemoryLayer) {
-      // Per-user global memory（HappyClaw 自带 memory 层）
-      const ownerId = group.created_by;
-      if (ownerId) {
-        const userGlobalDir = path.join(GROUPS_DIR, 'user-global', ownerId);
-        fs.mkdirSync(userGlobalDir, { recursive: true });
-        hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = userGlobalDir;
-      } else {
-        const legacyGlobalDir = path.join(GROUPS_DIR, 'global');
-        fs.mkdirSync(legacyGlobalDir, { recursive: true });
-        hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = legacyGlobalDir;
-      }
-      const memoryFolder = group.is_home
-        ? group.folder
-        : ownerHomeFolder || group.folder;
-      hostEnv['HAPPYCLAW_WORKSPACE_MEMORY'] = path.join(
-        DATA_DIR,
-        'memory',
-        memoryFolder,
-      );
+    // Per-user global memory（HappyClaw 自带 memory 层）
+    const ownerId = group.created_by;
+    if (ownerId) {
+      const userGlobalDir = path.join(GROUPS_DIR, 'user-global', ownerId);
+      fs.mkdirSync(userGlobalDir, { recursive: true });
+      hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = userGlobalDir;
+    } else {
+      const legacyGlobalDir = path.join(GROUPS_DIR, 'global');
+      fs.mkdirSync(legacyGlobalDir, { recursive: true });
+      hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = legacyGlobalDir;
     }
+    const memoryFolder = group.is_home
+      ? group.folder
+      : ownerHomeFolder || group.folder;
+    hostEnv['HAPPYCLAW_WORKSPACE_MEMORY'] = path.join(
+      DATA_DIR,
+      'memory',
+      memoryFolder,
+    );
 
     // Resolve symlinks so CLAUDE_CONFIG_DIR ends up as the real on-disk path.
     // Host mode also goes through the synchronized session .claude directory so
@@ -1972,15 +1959,6 @@ export async function runHostAgent(
     }
     hostEnv['CLAUDE_CONFIG_DIR'] = resolvedSessionsDir;
 
-    if (disableMemoryLayer) {
-      hostEnv['HAPPYCLAW_DISABLE_MEMORY_LAYER'] = 'true';
-      // 直接注入到进程 env，SDK 按 process.env 读，避免 settings.json 合并差异影响必需项。
-      for (const [key, value] of Object.entries(REQUIRED_SETTINGS_ENV)) {
-        hostEnv[key] = value;
-      }
-      // 同样，per-user MCP servers 通过 env 透传，agent-runner 合并进 SDK mcpServers 参数。
-      replaceHostMcpServersEnv(hostEnv, hostMcpPolicy.servers);
-    }
     // 让 SDK 捕获 CLI 的 stderr 输出，便于排查启动失败
     hostEnv['DEBUG_CLAUDE_AGENT_SDK'] = '1';
     // Claude Code 2.1.114+ 禁止 root 使用 --dangerously-skip-permissions，

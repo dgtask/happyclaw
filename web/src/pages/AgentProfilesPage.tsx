@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useSearchParams } from 'react-router-dom';
 import {
   ArrowRight,
@@ -8,8 +8,10 @@ import {
   MessagesSquare,
   Plus,
   RefreshCw,
+  RotateCcw,
   Save,
   Trash2,
+  Upload,
   Wand2,
   Workflow,
   X,
@@ -36,6 +38,9 @@ import {
 } from '@/components/ui/dialog';
 import { AgentPromptAssistant } from '../components/agents/AgentPromptAssistant';
 import { PolicyResourcePicker } from '../components/agents/PolicyResourcePicker';
+import { EmojiAvatar } from '../components/common/EmojiAvatar';
+import { EmojiPicker } from '../components/common/EmojiPicker';
+import { ColorPicker } from '../components/common/ColorPicker';
 import { useAgentProfilesStore } from '../stores/agent-profiles';
 import { useAuthStore } from '../stores/auth';
 import { useSkillsStore } from '../stores/skills';
@@ -49,7 +54,11 @@ import { getCustomAgentProfiles } from '../utils/agent-product';
 
 const DEFAULT_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
   provider_id: null,
-  context: { source: 'managed' },
+  context: {
+    source: 'managed',
+    auto_compact_window: 0,
+    auto_compact_percentage: 0,
+  },
   skills: { mode: 'inherit', ids: [] },
   mcp: { mode: 'inherit', ids: [] },
   tools: { mode: 'inherit' },
@@ -63,7 +72,17 @@ function normalizeRuntimePolicy(
 ): AgentProfileRuntimePolicy {
   return {
     provider_id: null,
-    context: { source: getAgentContextSource(policy) },
+    context: {
+      source: getAgentContextSource(policy),
+      auto_compact_window:
+        typeof policy?.context?.auto_compact_window === 'number'
+          ? policy.context.auto_compact_window
+          : 0,
+      auto_compact_percentage:
+        typeof policy?.context?.auto_compact_percentage === 'number'
+          ? policy.context.auto_compact_percentage
+          : 0,
+    },
     skills: {
       mode: policy?.skills?.mode ?? 'inherit',
       ids: policy?.skills?.ids ?? [],
@@ -104,6 +123,8 @@ export function AgentProfilesPage() {
     generateProfileDraft,
     createProfile,
     updateProfile,
+    uploadProfileAvatar,
+    removeProfileAvatar,
     deleteProfile,
     setWorkspaceAgentProfile,
   } = useAgentProfilesStore();
@@ -113,8 +134,17 @@ export function AgentProfilesPage() {
   const [name, setName] = useState('');
   const [identityPrompt, setIdentityPrompt] = useState('');
   const [includeClaudePreset, setIncludeClaudePreset] = useState(true);
+  const [avatarEmoji, setAvatarEmoji] = useState<string | null>(null);
+  const [avatarColor, setAvatarColor] = useState<string | null>(null);
+  const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
+  const [uploadingAvatar, setUploadingAvatar] = useState(false);
+  const [avatarStyleOpen, setAvatarStyleOpen] = useState(false);
+  const avatarInputRef = useRef<HTMLInputElement>(null);
   const [contextSource, setContextSource] =
     useState<AgentContextSource>('managed');
+  const [useSdkCompactDefault, setUseSdkCompactDefault] = useState(true);
+  const [autoCompactPercentage, setAutoCompactPercentage] = useState('80');
+  const [legacyAutoCompactWindow, setLegacyAutoCompactWindow] = useState(0);
   const [skillsMode, setSkillsMode] = useState<RuntimePolicyMode>('inherit');
   const [skillIds, setSkillIds] = useState<string[]>([]);
   const [mcpMode, setMcpMode] = useState<RuntimePolicyMode>('inherit');
@@ -135,6 +165,7 @@ export function AgentProfilesPage() {
   const [deleteTargetId, setDeleteTargetId] = useState('');
   const [createPanelOpen, setCreatePanelOpen] = useState(false);
   const isAdmin = useAuthStore((state) => state.user?.role === 'admin');
+  const mainAppearance = useAuthStore((state) => state.appearance);
 
   const customProfiles = useMemo(
     () => getCustomAgentProfiles(profiles),
@@ -219,18 +250,62 @@ export function AgentProfilesPage() {
     setMcpIds(normalized.mcp.ids);
     setToolsMode(normalized.tools.mode);
     setContextSource(getAgentContextSource(normalized));
+    const compactWindow = normalized.context?.auto_compact_window ?? 0;
+    const compactPercentage = normalized.context?.auto_compact_percentage ?? 0;
+    setUseSdkCompactDefault(compactWindow === 0 && compactPercentage === 0);
+    setAutoCompactPercentage(
+      compactPercentage > 0
+        ? String(compactPercentage)
+        : compactWindow > 0
+          ? 'legacy'
+          : '80',
+    );
+    setLegacyAutoCompactWindow(compactWindow);
   };
+
+  const autoCompactError = useMemo(() => {
+    if (useSdkCompactDefault) return null;
+    if (autoCompactPercentage === 'legacy') return null;
+    if (!autoCompactPercentage.trim()) return '请输入压缩比例。';
+    const value = Number(autoCompactPercentage);
+    if (!Number.isInteger(value) || value < 50 || value > 90) {
+      return '请输入 50–90 之间的整数。';
+    }
+    return null;
+  }, [autoCompactPercentage, useSdkCompactDefault]);
 
   const currentRuntimePolicy = useMemo(
     () =>
       normalizeRuntimePolicy({
         provider_id: null,
-        context: { source: contextSource },
+        context: {
+          source: contextSource,
+          auto_compact_window: useSdkCompactDefault
+            ? 0
+            : autoCompactPercentage === 'legacy'
+              ? legacyAutoCompactWindow
+              : 0,
+          auto_compact_percentage: useSdkCompactDefault
+            ? 0
+            : autoCompactPercentage === 'legacy'
+              ? 0
+              : Number(autoCompactPercentage),
+        },
         skills: { mode: skillsMode, ids: skillIds },
         mcp: { mode: mcpMode, ids: mcpIds },
         tools: { mode: toolsMode },
       }),
-    [contextSource, mcpIds, mcpMode, skillIds, skillsMode, toolsMode],
+    [
+      autoCompactPercentage,
+      contextSource,
+      legacyAutoCompactWindow,
+      mcpIds,
+      mcpMode,
+      skillIds,
+      skillsMode,
+      toolsMode,
+      useSdkCompactDefault,
+    ],
   );
 
   useEffect(() => {
@@ -239,14 +314,22 @@ export function AgentProfilesPage() {
       setName('');
       setIdentityPrompt('');
       setIncludeClaudePreset(true);
+      setAvatarEmoji(null);
+      setAvatarColor(null);
+      setAvatarUrl(null);
+      setAvatarStyleOpen(false);
       applyRuntimePolicyToForm(DEFAULT_RUNTIME_POLICY);
       return;
     }
     setName(selected.name);
     setIdentityPrompt(selected.identity_prompt);
     setIncludeClaudePreset(selected.include_claude_preset);
+    setAvatarEmoji(selected.avatar_emoji);
+    setAvatarColor(selected.avatar_color);
+    setAvatarUrl(selected.avatar_url);
+    setAvatarStyleOpen(!!(selected.avatar_emoji || selected.avatar_color));
     applyRuntimePolicyToForm(selected.runtime_policy);
-  }, [draftMode, selected]);
+  }, [draftMode, selected?.id]);
 
   useEffect(() => {
     if (draftMode || !selected) return;
@@ -261,6 +344,8 @@ export function AgentProfilesPage() {
     (name.trim() !== selected.name ||
       identityPrompt.trim() !== selected.identity_prompt ||
       includeClaudePreset !== selected.include_claude_preset ||
+      avatarEmoji !== selected.avatar_emoji ||
+      avatarColor !== selected.avatar_color ||
       !sameRuntimePolicy(currentRuntimePolicy, selected.runtime_policy));
 
   const draftDirty =
@@ -268,6 +353,8 @@ export function AgentProfilesPage() {
     (!!name.trim() ||
       !!identityPrompt.trim() ||
       !includeClaudePreset ||
+      avatarEmoji !== null ||
+      avatarColor !== null ||
       !sameRuntimePolicy(currentRuntimePolicy, DEFAULT_RUNTIME_POLICY));
   const hasUnsavedChanges = dirty || draftDirty;
 
@@ -287,6 +374,10 @@ export function AgentProfilesPage() {
     setName('');
     setIdentityPrompt('');
     setIncludeClaudePreset(true);
+    setAvatarEmoji(null);
+    setAvatarColor(null);
+    setAvatarUrl(null);
+    setAvatarStyleOpen(false);
     applyRuntimePolicyToForm(DEFAULT_RUNTIME_POLICY);
     setCreatePanelOpen(false);
     setSearchParams(next, { replace: true });
@@ -402,6 +493,10 @@ export function AgentProfilesPage() {
       setName(draft.name);
       setIdentityPrompt(draft.identity_prompt);
       setIncludeClaudePreset(true);
+      setAvatarEmoji(null);
+      setAvatarColor(null);
+      setAvatarUrl(null);
+      setAvatarStyleOpen(false);
       applyRuntimePolicyToForm(DEFAULT_RUNTIME_POLICY);
       setCreatePanelOpen(false);
       toast.success('已生成 Agent 配置');
@@ -419,6 +514,10 @@ export function AgentProfilesPage() {
     setName('');
     setIdentityPrompt('');
     setIncludeClaudePreset(true);
+    setAvatarEmoji(null);
+    setAvatarColor(null);
+    setAvatarUrl(null);
+    setAvatarStyleOpen(false);
     applyRuntimePolicyToForm(DEFAULT_RUNTIME_POLICY);
     setCreatePanelOpen(false);
   };
@@ -432,13 +531,15 @@ export function AgentProfilesPage() {
 
   const handleCreate = async () => {
     const trimmed = name.trim();
-    if (!trimmed) return;
+    if (!trimmed || autoCompactError) return;
     setCreating(true);
     try {
       const profile = await createProfile({
         name: trimmed,
         identity_prompt: identityPrompt.trim(),
         include_claude_preset: includeClaudePreset,
+        avatar_emoji: avatarEmoji,
+        avatar_color: avatarColor,
         runtime_policy: currentRuntimePolicy,
       });
       setCreateDescription('');
@@ -454,13 +555,15 @@ export function AgentProfilesPage() {
   };
 
   const handleSave = async () => {
-    if (!selected || !name.trim()) return;
+    if (!selected || !name.trim() || autoCompactError) return;
     setSaving(true);
     try {
       const profile = await updateProfile(selected.id, {
         name: name.trim(),
         identity_prompt: identityPrompt.trim(),
         include_claude_preset: includeClaudePreset,
+        avatar_emoji: avatarEmoji,
+        avatar_color: avatarColor,
         runtime_policy: currentRuntimePolicy,
       });
       setSelectedId(profile.id);
@@ -469,6 +572,63 @@ export function AgentProfilesPage() {
       toast.error(getErrorMessage(err, '保存失败'));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleAvatarUpload = async (
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file || !selected || draftMode) return;
+    if (file.size > 3 * 1024 * 1024) {
+      toast.error('图片文件不能超过 3MB');
+      return;
+    }
+    if (
+      !['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(
+        file.type,
+      )
+    ) {
+      toast.error('仅支持 jpg、png、gif、webp 格式');
+      return;
+    }
+    setUploadingAvatar(true);
+    try {
+      const profile = await uploadProfileAvatar(selected.id, file);
+      setAvatarUrl(profile.avatar_url);
+      toast.success('Agent 头像已更新');
+    } catch (error) {
+      toast.error(getErrorMessage(error, '上传头像失败'));
+    } finally {
+      setUploadingAvatar(false);
+    }
+  };
+
+  const handleInheritMainAvatar = async () => {
+    if (!selected || draftMode) {
+      setAvatarEmoji(null);
+      setAvatarColor(null);
+      setAvatarUrl(null);
+      setAvatarStyleOpen(false);
+      return;
+    }
+    setUploadingAvatar(true);
+    try {
+      if (selected.avatar_url) await removeProfileAvatar(selected.id);
+      const profile = await updateProfile(selected.id, {
+        avatar_emoji: null,
+        avatar_color: null,
+      });
+      setAvatarEmoji(profile.avatar_emoji);
+      setAvatarColor(profile.avatar_color);
+      setAvatarUrl(profile.avatar_url);
+      setAvatarStyleOpen(false);
+      toast.success('已改为继承主 HappyClaw 头像');
+    } catch (error) {
+      toast.error(getErrorMessage(error, '恢复主头像失败'));
+    } finally {
+      setUploadingAvatar(false);
     }
   };
 
@@ -767,6 +927,123 @@ export function AgentProfilesPage() {
                           onChange={(event) => setName(event.target.value)}
                         />
                       </div>
+                      <div className="space-y-3 rounded-lg border bg-muted/20 p-4">
+                        <div className="flex flex-wrap items-center gap-4">
+                          <EmojiAvatar
+                            imageUrl={
+                              avatarUrl ||
+                              (!avatarEmoji && !avatarColor
+                                ? mainAppearance?.aiAvatarUrl ||
+                                  (mainAppearance?.aiAvatarMode !== 'emoji'
+                                    ? `${import.meta.env.BASE_URL}icons/icon-192.png`
+                                    : undefined)
+                                : undefined)
+                            }
+                            emoji={
+                              avatarEmoji ||
+                              (!avatarUrl && !avatarColor
+                                ? mainAppearance?.aiAvatarMode === 'emoji'
+                                  ? mainAppearance.aiAvatarEmoji
+                                  : undefined
+                                : undefined)
+                            }
+                            color={
+                              avatarColor ||
+                              (!avatarUrl && !avatarEmoji
+                                ? mainAppearance?.aiAvatarMode === 'emoji'
+                                  ? mainAppearance.aiAvatarColor
+                                  : undefined
+                                : undefined)
+                            }
+                            fallbackChar={name || 'A'}
+                            size="lg"
+                            className="!h-12 !w-12 !text-xl"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="text-sm font-medium text-foreground">
+                              Agent 头像
+                            </div>
+                            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                              {avatarUrl || avatarEmoji || avatarColor
+                                ? '当前使用这个 Agent 的自定义头像。'
+                                : '未单独设置，自动继承主 HappyClaw 头像。'}
+                            </p>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            <input
+                              ref={avatarInputRef}
+                              type="file"
+                              accept="image/jpeg,image/png,image/gif,image/webp"
+                              className="hidden"
+                              onChange={handleAvatarUpload}
+                            />
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              disabled={draftMode || uploadingAvatar}
+                              onClick={() => avatarInputRef.current?.click()}
+                            >
+                              {uploadingAvatar ? (
+                                <Loader2 className="size-3.5 animate-spin" />
+                              ) : (
+                                <Upload className="size-3.5" />
+                              )}
+                              上传图片
+                            </Button>
+                            {!avatarStyleOpen && (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => setAvatarStyleOpen(true)}
+                              >
+                                使用 Emoji
+                              </Button>
+                            )}
+                            {(avatarUrl || avatarEmoji || avatarColor) && (
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                disabled={uploadingAvatar}
+                                onClick={handleInheritMainAvatar}
+                              >
+                                <RotateCcw className="size-3.5" />
+                                使用主头像
+                              </Button>
+                            )}
+                          </div>
+                        </div>
+                        {avatarStyleOpen && (
+                          <div className="grid gap-3 border-t pt-3 sm:grid-cols-2">
+                            <div>
+                              <span className="mb-1.5 block text-xs text-muted-foreground">
+                                Emoji（可选）
+                              </span>
+                              <EmojiPicker
+                                value={avatarEmoji ?? undefined}
+                                onChange={setAvatarEmoji}
+                              />
+                            </div>
+                            <div>
+                              <span className="mb-1.5 block text-xs text-muted-foreground">
+                                背景色（可选）
+                              </span>
+                              <ColorPicker
+                                value={avatarColor ?? undefined}
+                                onChange={setAvatarColor}
+                              />
+                            </div>
+                          </div>
+                        )}
+                        {draftMode && (
+                          <p className="text-[11px] text-muted-foreground">
+                            创建 Agent 后即可上传图片；Emoji
+                            与背景色会随创建一起保存。
+                          </p>
+                        )}
+                      </div>
                       <div>
                         <label
                           htmlFor="agent-profile-identity-prompt"
@@ -933,6 +1210,105 @@ export function AgentProfilesPage() {
                             MCP；“只读”或“严格只读” 能力边界会统一关闭 MCP。
                           </p>
                         </div>
+                      </div>
+
+                      <div className="border-t border-border pt-5">
+                        <div className="flex min-h-14 items-start justify-between gap-5">
+                          <div className="min-w-0">
+                            <label
+                              htmlFor="agent-auto-compact-default"
+                              className="text-xs font-medium text-muted-foreground"
+                            >
+                              SDK 自动压缩（推荐）
+                            </label>
+                            <p
+                              id="agent-auto-compact-default-description"
+                              className="mt-1 text-[11px] leading-5 text-muted-foreground"
+                            >
+                              根据当前模型自动决定压缩时机。普通模型通常为 200K
+                              上下文；模型名带 [1m] 时按 1M 处理。
+                            </p>
+                          </div>
+                          <Switch
+                            id="agent-auto-compact-default"
+                            checked={useSdkCompactDefault}
+                            onCheckedChange={setUseSdkCompactDefault}
+                            aria-describedby="agent-auto-compact-default-description"
+                          />
+                        </div>
+                        {!useSdkCompactDefault && (
+                          <div className="mt-4 max-w-xs">
+                            {autoCompactPercentage === 'legacy' ? (
+                              <div className="rounded-md border border-warning/30 bg-warning-bg p-3">
+                                <p className="text-[11px] leading-5 text-warning">
+                                  当前保留旧版固定阈值{' '}
+                                  {Math.round(legacyAutoCompactWindow / 1000)}
+                                  K。 固定值无法同时适配 200K 与 1M 模型。
+                                </p>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  className="mt-2"
+                                  onClick={() => {
+                                    setAutoCompactPercentage('80');
+                                    setLegacyAutoCompactWindow(0);
+                                  }}
+                                >
+                                  改用 80% 模型比例
+                                </Button>
+                              </div>
+                            ) : (
+                              <>
+                                <label
+                                  htmlFor="agent-auto-compact-percentage"
+                                  className="mb-1.5 block text-xs font-medium text-muted-foreground"
+                                >
+                                  上下文使用比例
+                                </label>
+                                <div className="flex items-center gap-2">
+                                  <Input
+                                    id="agent-auto-compact-percentage"
+                                    type="number"
+                                    inputMode="numeric"
+                                    min={50}
+                                    max={90}
+                                    step={5}
+                                    value={autoCompactPercentage}
+                                    onChange={(event) => {
+                                      setAutoCompactPercentage(
+                                        event.target.value,
+                                      );
+                                      setLegacyAutoCompactWindow(0);
+                                    }}
+                                    aria-invalid={!!autoCompactError}
+                                    aria-describedby={`agent-auto-compact-percentage-description${autoCompactError ? ' agent-auto-compact-percentage-error' : ''}`}
+                                    className="h-11"
+                                  />
+                                  <span className="shrink-0 text-xs text-muted-foreground">
+                                    %
+                                  </span>
+                                </div>
+                                <p
+                                  id="agent-auto-compact-percentage-description"
+                                  className="mt-1.5 text-[11px] leading-5 text-muted-foreground"
+                                >
+                                  可设置 50–90%。例如 80% 在普通模型下为
+                                  160K，在 [1m] 模型下为 800K。
+                                </p>
+                              </>
+                            )}
+                            {autoCompactError && (
+                              <p
+                                id="agent-auto-compact-percentage-error"
+                                role="alert"
+                                className="mt-1 text-xs text-destructive"
+                              >
+                                {autoCompactError}
+                              </p>
+                            )}
+                          </div>
+                        )}
                       </div>
 
                       <div className="min-w-0">
@@ -1224,7 +1600,9 @@ export function AgentProfilesPage() {
                     <>
                       <Button
                         onClick={handleCreate}
-                        disabled={creating || !name.trim()}
+                        disabled={
+                          creating || !name.trim() || !!autoCompactError
+                        }
                       >
                         {creating ? (
                           <Loader2 className="h-4 w-4 animate-spin" />
@@ -1242,7 +1620,9 @@ export function AgentProfilesPage() {
                     <>
                       <Button
                         onClick={handleSave}
-                        disabled={!dirty || saving || !name.trim()}
+                        disabled={
+                          !dirty || saving || !name.trim() || !!autoCompactError
+                        }
                       >
                         {saving ? (
                           <Loader2 className="h-4 w-4 animate-spin" />

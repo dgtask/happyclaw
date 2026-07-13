@@ -56,7 +56,6 @@ import agentRoutes from './routes/agents.js';
 import mcpServersRoutes from './routes/mcp-servers.js';
 import pluginsRoutes from './routes/plugins.js';
 import workspaceConfigRoutes from './routes/workspace-config.js';
-import agentDefinitionsRoutes from './routes/agent-definitions.js';
 import agentProfileRoutes from './routes/agent-profiles.js';
 import workspaceRoutes from './routes/workspaces.js';
 import { usage as usageRoutes } from './routes/usage.js';
@@ -247,7 +246,6 @@ app.route('/api/admin', adminRoutes);
 app.route('/api/browse', browseRoutes);
 app.route('/api/mcp-servers', mcpServersRoutes);
 app.route('/api/plugins', pluginsRoutes);
-app.route('/api/agent-definitions', agentDefinitionsRoutes);
 app.route('/api/agent-profiles', agentProfileRoutes);
 app.route('/api/workspaces', workspaceRoutes);
 app.route('/api/groups', agentRoutes); // Workspace session routes; /agents paths remain compatibility aliases

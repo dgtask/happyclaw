@@ -216,6 +216,9 @@ export function WhatsAppChannelCard() {
           <div>
             <h3 className="text-sm font-semibold text-foreground">
               WhatsApp
+              <span className="ml-2 rounded border border-warning/30 bg-warning-bg px-1.5 py-0.5 text-[10px] font-medium text-warning">
+                实验连接
+              </span>
               <span className="ml-2 text-xs font-normal text-muted-foreground">
                 {STATUS_LABEL[state.status]}
               </span>
@@ -223,7 +226,7 @@ export function WhatsAppChannelCard() {
             <p className="text-xs text-muted-foreground mt-0.5">
               {state.status === 'connected' && state.meName
                 ? `已登录：${state.meName}`
-                : '基于 Baileys 通过 WhatsApp Web 协议扫码登录'}
+                : '当前仅支持扫码和连接状态验证，尚不支持消息收发'}
             </p>
           </div>
         </div>
@@ -244,9 +247,10 @@ export function WhatsAppChannelCard() {
         ) : (
           <>
             <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
-              ⚠️ Baileys 是逆向 WhatsApp Web 协议的社区方案，
-              Meta 在 2025-2026 收紧了对非官方客户端的封禁，存在封号风险。
-              **商用场景建议使用 Meta 官方 Cloud API。**
+              <strong>实验功能：</strong>
+              当前版本只用于验证扫码登录和连接状态，不能作为可用的消息渠道。
+              Baileys 使用社区维护的 WhatsApp Web
+              协议，存在账号限制风险；商用场景建议使用 Meta 官方 Cloud API。
             </div>
 
             {state.status === 'qr' && state.qrDataUrl && (
@@ -364,8 +368,8 @@ export function WhatsAppChannelCard() {
 
             <div className="text-xs text-muted-foreground mt-2 space-y-1">
               <p>
-                M1 阶段范围：QR 扫码登录、连接状态显示、自动重连。M2/M3 后续 PR 接入：
-                收发消息、文件下载、群组、Reaction 等。
+                当前范围：二维码登录、连接状态与自动重连。消息收发、文件、群组和
+                Reaction 尚未开放。
               </p>
             </div>
           </>

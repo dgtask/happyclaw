@@ -38,7 +38,7 @@ export function SkillsPage() {
       (s) =>
         !q ||
         s.name.toLowerCase().includes(q) ||
-        s.description.toLowerCase().includes(q)
+        s.description.toLowerCase().includes(q),
     );
   }, [skills, searchQuery]);
 
@@ -62,8 +62,15 @@ export function SkillsPage() {
             subtitle={`用户级 ${userSkills.length}${externalSkills.length > 0 ? ` · 宿主机 ${externalSkills.length}` : ''} · 项目级 ${projectSkills.length} · 启用 ${enabledCount}`}
             actions={
               <div className="flex items-center gap-3">
-                <Button variant="outline" onClick={loadSkills} disabled={loading}>
-                  <RefreshCw size={18} className={loading ? 'animate-spin' : ''} />
+                <Button
+                  variant="outline"
+                  onClick={loadSkills}
+                  disabled={loading}
+                >
+                  <RefreshCw
+                    size={18}
+                    className={loading ? 'animate-spin' : ''}
+                  />
                   刷新
                 </Button>
                 <Button onClick={() => setShowInstallDialog(true)}>
@@ -73,6 +80,12 @@ export function SkillsPage() {
               </div>
             }
           />
+        </div>
+
+        <div className="mx-6 mt-4 rounded-lg bg-muted px-4 py-3 text-xs leading-5 text-muted-foreground">
+          用户级 Skills 可由你安装和管理；项目级 Skills 由 HappyClaw
+          提供；宿主机 Skills 仅管理员可见且只读。启用后仍需由对应 Agent
+          的能力策略决定是否可以使用。
         </div>
 
         {/* Content */}
@@ -113,18 +126,25 @@ export function SkillsPage() {
                           className="text-xs text-muted-foreground hover:text-error flex items-center gap-1 cursor-pointer"
                           disabled={deletingAll}
                           onClick={async () => {
-                            if (!confirm('确定删除所有用户级技能？宿主机技能不受影响。')) return;
+                            if (
+                              !confirm(
+                                '确定删除所有用户级技能？宿主机技能不受影响。',
+                              )
+                            )
+                              return;
                             setDeletingAll(true);
                             try {
                               const n = await deleteAllUserSkills();
                               setSelectedId(null);
                               toast.success(`已删除 ${n} 个用户级技能`);
-                            } catch { /* handled by store */ }
+                            } catch {
+                              /* handled by store */
+                            }
                             setDeletingAll(false);
                           }}
                         >
                           <Trash2 size={12} />
-                          {deletingAll ? '删除中...' : '清空'}
+                          {deletingAll ? '删除中...' : '删除全部用户 Skills'}
                         </button>
                       </div>
                       <div className="space-y-2">
@@ -182,14 +202,20 @@ export function SkillsPage() {
 
           {/* 右侧详情（桌面端） */}
           <div className="hidden lg:block lg:w-1/2 xl:w-3/5">
-            <SkillDetail skillId={selectedId} onDeleted={() => setSelectedId(null)} />
+            <SkillDetail
+              skillId={selectedId}
+              onDeleted={() => setSelectedId(null)}
+            />
           </div>
         </div>
 
         {/* 移动端详情 */}
         {selectedId && (
           <div className="lg:hidden p-4">
-            <SkillDetail skillId={selectedId} onDeleted={() => setSelectedId(null)} />
+            <SkillDetail
+              skillId={selectedId}
+              onDeleted={() => setSelectedId(null)}
+            />
           </div>
         )}
       </div>

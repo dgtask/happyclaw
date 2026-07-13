@@ -20,11 +20,15 @@ export interface GroupInfo {
     | 'when_mentioned'
     | 'owner_mentioned'
     | 'disabled';
+  require_mention?: boolean;
   conversation_source?: 'manual' | 'feishu_thread';
   conversation_nav_mode?: 'horizontal' | 'vertical_threads';
   agent_profile_id?: string;
   agent_profile_name?: string;
   agent_profile_version?: number;
+  agent_profile_avatar_emoji?: string | null;
+  agent_profile_avatar_color?: string | null;
+  agent_profile_avatar_url?: string | null;
 }
 
 export interface AgentProfile {
@@ -33,6 +37,9 @@ export interface AgentProfile {
   name: string;
   identity_prompt: string;
   include_claude_preset: boolean;
+  avatar_emoji: string | null;
+  avatar_color: string | null;
+  avatar_url: string | null;
   runtime_policy: AgentProfileRuntimePolicy;
   identity_hash: string;
   version: number;
@@ -46,6 +53,8 @@ export interface AgentProfileRuntimePolicy {
   provider_id: string | null;
   context?: {
     source: 'managed' | 'host_claude';
+    auto_compact_window?: number;
+    auto_compact_percentage?: number;
   };
   skills: {
     mode: 'inherit' | 'custom' | 'disabled';
@@ -76,7 +85,7 @@ export function withAgentContextSource(
 ): AgentProfileRuntimePolicy {
   return {
     ...policy,
-    context: { source },
+    context: { ...policy.context, source },
   };
 }
 
@@ -162,6 +171,7 @@ export interface AvailableImGroup {
     | 'when_mentioned'
     | 'owner_mentioned'
     | 'disabled';
+  require_mention?: boolean;
   owner_im_id?: string | null;
   binding_mode?: 'single_context' | 'thread_map';
   routing_mode?: 'single_session' | 'thread_map';

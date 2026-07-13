@@ -25,7 +25,6 @@ function registeredHappyClawTools(): string[] {
     workspaceGroup: '/tmp/policy-group',
     workspaceGlobal: '/tmp/policy-global',
     workspaceMemory: '/tmp/policy-memory',
-    disableMemoryLayer: false,
   }).map((tool) => tool.name);
 }
 
@@ -99,7 +98,6 @@ describe('AgentProfile runtime tool capability matrix', () => {
       workspaceGroup: '/tmp/policy-group',
       workspaceGlobal: '/tmp/policy-global',
       workspaceMemory: '/tmp/policy-memory',
-      disableMemoryLayer: false,
     });
     const policy = resolveAgentToolPolicy(
       'readonly',

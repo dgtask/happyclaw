@@ -618,6 +618,9 @@ export function initDatabase(): void {
       name TEXT NOT NULL,
       identity_prompt TEXT NOT NULL DEFAULT '',
       include_claude_preset INTEGER NOT NULL DEFAULT 1,
+      avatar_emoji TEXT,
+      avatar_color TEXT,
+      avatar_url TEXT,
       runtime_policy TEXT NOT NULL DEFAULT '{}',
       identity_hash TEXT NOT NULL DEFAULT '',
       version INTEGER NOT NULL DEFAULT 1,
@@ -1451,6 +1454,11 @@ export function initDatabase(): void {
     'runtime_policy',
     "TEXT NOT NULL DEFAULT '{}'",
   );
+  // v46 → v47: profile-level avatar overrides. Null means inherit the
+  // globally configured main HappyClaw avatar.
+  ensureColumn('agent_profiles', 'avatar_emoji', 'TEXT');
+  ensureColumn('agent_profiles', 'avatar_color', 'TEXT');
+  ensureColumn('agent_profiles', 'avatar_url', 'TEXT');
 
   // v44 → v45: make the SDK resume-state projection explicit. The former
   // `workspace_sessions` name looked like a product conversation model even
@@ -1548,7 +1556,7 @@ export function initDatabase(): void {
   backfillAgentProfileDefaultsAndWorkspaceMappings();
   reconcileCanonicalRuntimeProjections();
 
-  const SCHEMA_VERSION = '46';
+  const SCHEMA_VERSION = '47';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -2822,7 +2830,11 @@ export function getSessionAgentIdentity(
 
 const DEFAULT_AGENT_PROFILE_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
   provider_id: null,
-  context: { source: 'managed' },
+  context: {
+    source: 'managed',
+    auto_compact_window: 0,
+    auto_compact_percentage: 0,
+  },
   skills: { mode: 'inherit', ids: [] },
   mcp: { mode: 'inherit', ids: [] },
   tools: { mode: 'inherit' },
@@ -2862,7 +2874,7 @@ export function normalizeAgentProfileRuntimePolicy(
   input?: RuntimePolicyInput | AgentProfileRuntimePolicy | null,
 ): AgentProfileRuntimePolicy {
   const raw = (input ?? {}) as RuntimePolicyInput | AgentProfileRuntimePolicy;
-  return {
+  const normalized: AgentProfileRuntimePolicy = {
     provider_id: null,
     context: {
       source: normalizeMode(
@@ -2870,6 +2882,28 @@ export function normalizeAgentProfileRuntimePolicy(
         ['managed', 'host_claude'] as const,
         'managed',
       ),
+      auto_compact_window: (() => {
+        const value = raw.context?.auto_compact_window;
+        if (
+          typeof value !== 'number' ||
+          !Number.isFinite(value) ||
+          value <= 0
+        ) {
+          return 0;
+        }
+        return Math.min(1_000_000, Math.max(100_000, Math.floor(value)));
+      })(),
+      auto_compact_percentage: (() => {
+        const value = raw.context?.auto_compact_percentage;
+        if (
+          typeof value !== 'number' ||
+          !Number.isFinite(value) ||
+          value <= 0
+        ) {
+          return 0;
+        }
+        return Math.min(90, Math.max(50, Math.floor(value)));
+      })(),
     },
     skills: {
       mode: normalizeMode(
@@ -2895,6 +2929,10 @@ export function normalizeAgentProfileRuntimePolicy(
       ),
     },
   };
+  if (normalized.context.auto_compact_percentage > 0) {
+    normalized.context.auto_compact_window = 0;
+  }
+  return normalized;
 }
 
 /** Merge a PATCH-shaped policy without resetting omitted sibling fields. */
@@ -2921,6 +2959,12 @@ export function mergeAgentProfileRuntimePolicy(
         ? DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.context
         : {
             source: patch.context?.source ?? current.context.source,
+            auto_compact_window:
+              patch.context?.auto_compact_window ??
+              current.context.auto_compact_window,
+            auto_compact_percentage:
+              patch.context?.auto_compact_percentage ??
+              current.context.auto_compact_percentage,
           }
       : current.context,
     skills: has('skills') ? mergeCapability('skills') : current.skills,
@@ -2941,6 +2985,54 @@ export function serializeAgentProfileRuntimePolicy(
   return JSON.stringify(normalizeAgentProfileRuntimePolicy(input));
 }
 
+export function migrateAgentProfileAutoCompactWindow(
+  legacyValue: number | undefined,
+): number {
+  if (legacyValue === undefined) return 0;
+  const value = Math.min(1_000_000, Math.max(100_000, Math.floor(legacyValue)));
+  const rows = db
+    .prepare(
+      'SELECT id, runtime_policy FROM agent_profiles WHERE is_default = 0',
+    )
+    .all() as Array<{ id: string; runtime_policy: unknown }>;
+  const update = db.prepare(
+    'UPDATE agent_profiles SET runtime_policy = ? WHERE id = ?',
+  );
+  let migrated = 0;
+  db.transaction(() => {
+    for (const row of rows) {
+      let raw: Record<string, unknown> = {};
+      try {
+        const parsed =
+          typeof row.runtime_policy === 'string'
+            ? JSON.parse(row.runtime_policy)
+            : row.runtime_policy;
+        if (parsed && typeof parsed === 'object') {
+          raw = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // Invalid legacy policy is normalized below.
+      }
+      const rawContext =
+        raw.context && typeof raw.context === 'object'
+          ? (raw.context as Record<string, unknown>)
+          : {};
+      if (
+        Object.prototype.hasOwnProperty.call(rawContext, 'auto_compact_window')
+      ) {
+        continue;
+      }
+      const normalized = normalizeAgentProfileRuntimePolicy(
+        raw as RuntimePolicyInput,
+      );
+      normalized.context.auto_compact_window = value;
+      update.run(JSON.stringify(normalized), row.id);
+      migrated += 1;
+    }
+  })();
+  return migrated;
+}
+
 function parseAgentProfileRuntimePolicy(
   raw: unknown,
 ): AgentProfileRuntimePolicy {
@@ -2958,15 +3050,6 @@ function parseAgentProfileRuntimePolicy(
   return normalizeAgentProfileRuntimePolicy();
 }
 
-function isDefaultAgentProfileRuntimePolicy(
-  policy: AgentProfileRuntimePolicy,
-): boolean {
-  return (
-    serializeAgentProfileRuntimePolicy(policy) ===
-    serializeAgentProfileRuntimePolicy(DEFAULT_AGENT_PROFILE_RUNTIME_POLICY)
-  );
-}
-
 export function computeAgentProfileIdentityHash(
   identityPrompt: string,
   includeClaudePreset = true,
@@ -2977,12 +3060,28 @@ export function computeAgentProfileIdentityHash(
   const payload: {
     identityPrompt: string;
     includeClaudePreset: boolean;
-    runtimePolicy?: AgentProfileRuntimePolicy;
+    runtimePolicy?: Record<string, unknown>;
     name?: string;
   } = { identityPrompt, includeClaudePreset };
+  const identityPolicy = {
+    provider_id: normalizedPolicy.provider_id,
+    context: { source: normalizedPolicy.context.source },
+    skills: normalizedPolicy.skills,
+    mcp: normalizedPolicy.mcp,
+    tools: normalizedPolicy.tools,
+  };
+  const defaultIdentityPolicy = {
+    provider_id: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.provider_id,
+    context: { source: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.context.source },
+    skills: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.skills,
+    mcp: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.mcp,
+    tools: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.tools,
+  };
   if (name) payload.name = name;
-  if (!isDefaultAgentProfileRuntimePolicy(normalizedPolicy)) {
-    payload.runtimePolicy = normalizedPolicy;
+  if (
+    JSON.stringify(identityPolicy) !== JSON.stringify(defaultIdentityPolicy)
+  ) {
+    payload.runtimePolicy = identityPolicy;
   }
   return crypto
     .createHash('sha256')
@@ -3001,6 +3100,11 @@ function mapAgentProfileRow(row: Record<string, unknown>): AgentProfile {
     name,
     identity_prompt: prompt,
     include_claude_preset: includeClaudePreset,
+    avatar_emoji:
+      typeof row.avatar_emoji === 'string' ? row.avatar_emoji : null,
+    avatar_color:
+      typeof row.avatar_color === 'string' ? row.avatar_color : null,
+    avatar_url: typeof row.avatar_url === 'string' ? row.avatar_url : null,
     runtime_policy: runtimePolicy,
     identity_hash: String(
       row.identity_hash ??
@@ -3041,27 +3145,7 @@ export function getAgentProfileForUser(
 const DEFAULT_AGENT_PROFILE_NAME = 'HappyClaw';
 const LEGACY_DEFAULT_AGENT_PROFILE_NAME = 'Default Agent';
 
-function runtimePolicyHasExplicitContext(raw: unknown): boolean {
-  let parsed = raw;
-  if (typeof raw === 'string') {
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return false;
-    }
-  }
-  return (
-    !!parsed &&
-    typeof parsed === 'object' &&
-    Object.prototype.hasOwnProperty.call(parsed, 'context')
-  );
-}
-
 export function getOrCreateDefaultAgentProfile(userId: string): AgentProfile {
-  const owner = db
-    .prepare("SELECT role FROM users WHERE id = ? AND status = 'active'")
-    .get(userId) as { role: string } | undefined;
-  const isAdmin = owner?.role === 'admin';
   const existing = db
     .prepare(
       "SELECT * FROM agent_profiles WHERE owner_user_id = ? AND is_default = 1 AND status = 'active' LIMIT 1",
@@ -3069,18 +3153,12 @@ export function getOrCreateDefaultAgentProfile(userId: string): AgentProfile {
     .get(userId) as Record<string, unknown> | undefined;
   if (existing) {
     const profile = mapAgentProfileRow(existing);
-    const migrateHostContext =
-      isAdmin && !runtimePolicyHasExplicitContext(existing.runtime_policy);
     const migrateName = profile.name === LEGACY_DEFAULT_AGENT_PROFILE_NAME;
-    if (!migrateHostContext && !migrateName) return profile;
+    if (!migrateName) return profile;
 
     const now = new Date().toISOString();
     const name = migrateName ? DEFAULT_AGENT_PROFILE_NAME : profile.name;
-    const runtimePolicy = migrateHostContext
-      ? mergeAgentProfileRuntimePolicy(profile.runtime_policy, {
-          context: { source: 'host_claude' },
-        })
-      : profile.runtime_policy;
+    const runtimePolicy = profile.runtime_policy;
     const identityHash = computeAgentProfileIdentityHash(
       profile.identity_prompt,
       profile.include_claude_preset,
@@ -3106,9 +3184,7 @@ export function getOrCreateDefaultAgentProfile(userId: string): AgentProfile {
   const name = DEFAULT_AGENT_PROFILE_NAME;
   const identityPrompt = '';
   const includeClaudePreset = true;
-  const runtimePolicy = normalizeAgentProfileRuntimePolicy(
-    isAdmin ? { context: { source: 'host_claude' } } : undefined,
-  );
+  const runtimePolicy = normalizeAgentProfileRuntimePolicy();
   const identityHash = computeAgentProfileIdentityHash(
     identityPrompt,
     includeClaudePreset,
@@ -3152,6 +3228,8 @@ export function createAgentProfile(input: {
   name: string;
   identityPrompt?: string;
   includeClaudePreset?: boolean;
+  avatarEmoji?: string | null;
+  avatarColor?: string | null;
   runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null;
 }): AgentProfile {
   const now = new Date().toISOString();
@@ -3168,15 +3246,17 @@ export function createAgentProfile(input: {
   );
   db.prepare(
     `INSERT INTO agent_profiles (
-      id, owner_user_id, name, identity_prompt, include_claude_preset, runtime_policy, identity_hash, version,
+      id, owner_user_id, name, identity_prompt, include_claude_preset, avatar_emoji, avatar_color, runtime_policy, identity_hash, version,
       is_default, status, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, 'active', ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 'active', ?, ?)`,
   ).run(
     id,
     input.ownerUserId,
     input.name,
     identityPrompt,
     includeClaudePreset ? 1 : 0,
+    input.avatarEmoji ?? null,
+    input.avatarColor ?? null,
     runtimePolicyJson,
     identityHash,
     now,
@@ -3192,20 +3272,16 @@ export function updateAgentProfile(
     name?: string;
     identityPrompt?: string;
     includeClaudePreset?: boolean;
+    avatarEmoji?: string | null;
+    avatarColor?: string | null;
+    avatarUrl?: string | null;
     runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null;
   },
 ): AgentProfile | undefined {
   const existing = getAgentProfileForUser(profileId, ownerUserId);
   if (!existing) return undefined;
   const nextName = updates.name ?? existing.name;
-  const nameChanged = updates.name !== undefined && nextName !== existing.name;
-  const promptChanged =
-    updates.identityPrompt !== undefined &&
-    updates.identityPrompt !== existing.identity_prompt;
   const nextPrompt = updates.identityPrompt ?? existing.identity_prompt;
-  const includeChanged =
-    updates.includeClaudePreset !== undefined &&
-    updates.includeClaudePreset !== existing.include_claude_preset;
   const nextIncludeClaudePreset =
     updates.includeClaudePreset ?? existing.include_claude_preset;
   const nextRuntimePolicy =
@@ -3215,30 +3291,36 @@ export function updateAgentProfile(
           updates.runtimePolicy,
         )
       : existing.runtime_policy;
-  const runtimePolicyChanged =
-    updates.runtimePolicy !== undefined &&
-    serializeAgentProfileRuntimePolicy(nextRuntimePolicy) !==
-      serializeAgentProfileRuntimePolicy(existing.runtime_policy);
-  const identityChanged =
-    nameChanged || promptChanged || includeChanged || runtimePolicyChanged;
-  const nextHash = identityChanged
-    ? computeAgentProfileIdentityHash(
-        nextPrompt,
-        nextIncludeClaudePreset,
-        nextRuntimePolicy,
-        nextName,
-      )
-    : existing.identity_hash;
+  const nextAvatarEmoji =
+    updates.avatarEmoji === undefined
+      ? existing.avatar_emoji
+      : updates.avatarEmoji;
+  const nextAvatarColor =
+    updates.avatarColor === undefined
+      ? existing.avatar_color
+      : updates.avatarColor;
+  const nextAvatarUrl =
+    updates.avatarUrl === undefined ? existing.avatar_url : updates.avatarUrl;
+  const nextHash = computeAgentProfileIdentityHash(
+    nextPrompt,
+    nextIncludeClaudePreset,
+    nextRuntimePolicy,
+    nextName,
+  );
+  const identityChanged = nextHash !== existing.identity_hash;
   const nextVersion = identityChanged ? existing.version + 1 : existing.version;
   const now = new Date().toISOString();
   db.prepare(
     `UPDATE agent_profiles
-     SET name = ?, identity_prompt = ?, include_claude_preset = ?, runtime_policy = ?, identity_hash = ?, version = ?, updated_at = ?
+     SET name = ?, identity_prompt = ?, include_claude_preset = ?, avatar_emoji = ?, avatar_color = ?, avatar_url = ?, runtime_policy = ?, identity_hash = ?, version = ?, updated_at = ?
      WHERE id = ? AND owner_user_id = ? AND status = 'active'`,
   ).run(
     nextName,
     nextPrompt,
     nextIncludeClaudePreset ? 1 : 0,
+    nextAvatarEmoji,
+    nextAvatarColor,
+    nextAvatarUrl,
     serializeAgentProfileRuntimePolicy(nextRuntimePolicy),
     nextHash,
     nextVersion,

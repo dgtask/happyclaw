@@ -192,7 +192,7 @@ export function useImBindings() {
         await loadBindings();
         return null;
       } catch (err) {
-        const msg = err instanceof Error ? err.message : '重置白名单失败';
+        const msg = err instanceof Error ? err.message : '解除发言者限制失败';
         setError(msg);
         return msg;
       }

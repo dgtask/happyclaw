@@ -31,6 +31,7 @@ const {
   getSessionAgentIdentity,
   computeAgentProfileIdentityHash,
   normalizeAgentProfileRuntimePolicy,
+  migrateAgentProfileAutoCompactWindow,
   getAgentChannelMount,
 } = await import('../src/db.js');
 
@@ -70,7 +71,11 @@ describe('AgentProfile DB model', () => {
     expect(profiles[0].include_claude_preset).toBe(true);
     expect(profiles[0].runtime_policy).toEqual({
       provider_id: null,
-      context: { source: 'managed' },
+      context: {
+        source: 'managed',
+        auto_compact_window: 0,
+        auto_compact_percentage: 0,
+      },
       skills: { mode: 'inherit', ids: [] },
       mcp: { mode: 'inherit', ids: [] },
       tools: { mode: 'inherit' },
@@ -80,20 +85,20 @@ describe('AgentProfile DB model', () => {
     );
   });
 
-  test('defaults admin HappyClaw to host context and never overwrites an explicit managed choice', () => {
+  test('persists admin HappyClaw as managed; global host policy is resolved at runtime', () => {
     const userId = 'agent-profile-admin-context';
     seedUser(userId, 'admin');
 
     const original = listAgentProfilesForUser(userId)[0];
     expect(original).toMatchObject({
       is_default: true,
-      runtime_policy: { context: { source: 'host_claude' } },
+      runtime_policy: { context: { source: 'managed' } },
     });
 
     const managed = updateAgentProfile(original.id, userId, {
       runtimePolicy: { context: { source: 'managed' } },
     });
-    expect(managed?.version).toBe(original.version + 1);
+    expect(managed?.version).toBe(original.version);
     expect(managed?.runtime_policy.context.source).toBe('managed');
 
     const reread = listAgentProfilesForUser(userId)[0];
@@ -101,7 +106,7 @@ describe('AgentProfile DB model', () => {
     expect(reread.runtime_policy.context.source).toBe('managed');
   });
 
-  test('migrates an admin HappyClaw legacy policy without context exactly once', () => {
+  test('does not rewrite legacy admin context policy during profile reads', () => {
     const userId = 'agent-profile-admin-legacy-context';
     seedUser(userId, 'admin');
     const original = listAgentProfilesForUser(userId)[0];
@@ -117,9 +122,11 @@ describe('AgentProfile DB model', () => {
       .run(JSON.stringify(legacyPolicy), original.id);
     rawDb.close();
 
-    const migrated = listAgentProfilesForUser(userId)[0];
-    expect(migrated.runtime_policy.context.source).toBe('host_claude');
-    expect(migrated.version).toBe(original.version + 1);
+    const migrated = listAgentProfilesForUser(userId).find(
+      (candidate) => candidate.id === original.id,
+    )!;
+    expect(migrated.runtime_policy.context.source).toBe('managed');
+    expect(migrated.version).toBe(original.version);
     expect(migrated.identity_hash).toBe(
       computeAgentProfileIdentityHash(
         migrated.identity_prompt,
@@ -170,7 +177,11 @@ describe('AgentProfile DB model', () => {
       } as any),
     ).toEqual({
       provider_id: null,
-      context: { source: 'managed' },
+      context: {
+        source: 'managed',
+        auto_compact_window: 0,
+        auto_compact_percentage: 0,
+      },
       skills: { mode: 'inherit', ids: [] },
       mcp: { mode: 'inherit', ids: [] },
       tools: { mode: 'readonly' },
@@ -267,6 +278,32 @@ describe('AgentProfile DB model', () => {
     );
   });
 
+  test('stores avatar overrides without changing runtime identity version', () => {
+    seedUser('agent-profile-avatar-user');
+    const profile = createAgentProfile({
+      ownerUserId: 'agent-profile-avatar-user',
+      name: 'Designer',
+    });
+
+    const updated = updateAgentProfile(
+      profile.id,
+      'agent-profile-avatar-user',
+      {
+        avatarEmoji: '🎨',
+        avatarColor: '#123456',
+        avatarUrl: '/api/auth/avatars/agent-profile-test.png',
+      },
+    );
+
+    expect(updated).toMatchObject({
+      avatar_emoji: '🎨',
+      avatar_color: '#123456',
+      avatar_url: '/api/auth/avatars/agent-profile-test.png',
+      version: profile.version,
+      identity_hash: profile.identity_hash,
+    });
+  });
+
   test('versions AgentProfile runtime policy changes', () => {
     seedUser('agent-profile-user-policy');
     const profile = createAgentProfile({
@@ -283,7 +320,11 @@ describe('AgentProfile DB model', () => {
 
     expect(profile.runtime_policy).toEqual({
       provider_id: null,
-      context: { source: 'managed' },
+      context: {
+        source: 'managed',
+        auto_compact_window: 0,
+        auto_compact_percentage: 0,
+      },
       skills: { mode: 'custom', ids: ['review', 'research'] },
       mcp: { mode: 'disabled', ids: ['ignored'] },
       tools: { mode: 'readonly' },
@@ -322,7 +363,11 @@ describe('AgentProfile DB model', () => {
     expect(updated?.version).toBe(profile.version + 1);
     expect(updated?.runtime_policy).toEqual({
       provider_id: null,
-      context: { source: 'host_claude' },
+      context: {
+        source: 'host_claude',
+        auto_compact_window: 0,
+        auto_compact_percentage: 0,
+      },
       skills: { mode: 'inherit', ids: [] },
       mcp: { mode: 'custom', ids: ['github'] },
       tools: { mode: 'restricted' },
@@ -359,11 +404,64 @@ describe('AgentProfile DB model', () => {
 
     expect(updated?.runtime_policy).toEqual({
       provider_id: null,
-      context: { source: 'host_claude' },
+      context: {
+        source: 'host_claude',
+        auto_compact_window: 0,
+        auto_compact_percentage: 0,
+      },
       skills: { mode: 'disabled', ids: ['kept-for-audit'] },
       mcp: { mode: 'custom', ids: ['github'] },
       tools: { mode: 'readonly' },
     });
+  });
+
+  test('migrates the legacy system compact threshold without bumping identity metadata', () => {
+    const userId = 'agent-profile-auto-compact-migration';
+    seedUser(userId);
+    const profile = createAgentProfile({
+      ownerUserId: userId,
+      name: 'Legacy Compact Agent',
+    });
+    const rawDb = new Database(path.join(tmpStoreDir, 'messages.db'));
+    rawDb
+      .prepare('UPDATE agent_profiles SET runtime_policy = ? WHERE id = ?')
+      .run(JSON.stringify({ context: { source: 'managed' } }), profile.id);
+    rawDb.close();
+
+    expect(migrateAgentProfileAutoCompactWindow(240_000)).toBeGreaterThan(0);
+    const migrated = listAgentProfilesForUser(userId).find(
+      (candidate) => candidate.id === profile.id,
+    )!;
+    expect(migrated.runtime_policy.context.auto_compact_window).toBe(240_000);
+    expect(migrated.version).toBe(profile.version);
+    expect(migrated.identity_hash).toBe(profile.identity_hash);
+    expect(migrateAgentProfileAutoCompactWindow(240_000)).toBe(0);
+  });
+
+  test('updates auto compact policy without bumping Agent identity', () => {
+    const userId = 'agent-profile-auto-compact-update';
+    seedUser(userId);
+    const profile = createAgentProfile({
+      ownerUserId: userId,
+      name: 'Compact Agent',
+    });
+    const updated = updateAgentProfile(profile.id, userId, {
+      runtimePolicy: { context: { auto_compact_window: 300_000 } },
+    });
+    expect(updated?.runtime_policy.context.auto_compact_window).toBe(300_000);
+    expect(updated?.version).toBe(profile.version);
+    expect(updated?.identity_hash).toBe(profile.identity_hash);
+  });
+
+  test('model-relative compact percentage takes precedence over a legacy window', () => {
+    const policy = normalizeAgentProfileRuntimePolicy({
+      context: {
+        auto_compact_window: 300_000,
+        auto_compact_percentage: 80,
+      },
+    });
+    expect(policy.context.auto_compact_window).toBe(0);
+    expect(policy.context.auto_compact_percentage).toBe(80);
   });
 
   test('stores AgentProfile identity metadata on sessions', () => {

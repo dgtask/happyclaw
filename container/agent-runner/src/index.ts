@@ -56,7 +56,6 @@ import {
   parseTranscript,
 } from './session-history.js';
 import { StreamEventProcessor } from './stream-processor.js';
-import { PREDEFINED_AGENTS } from './agent-definitions.js';
 import { createMcpTools } from './mcp-tools.js';
 import {
   filterHappyclawToolsForPolicy,
@@ -72,6 +71,7 @@ import {
   requeueIpcInputMessages,
   type IpcInputMessage,
 } from './ipc-delivery.js';
+import { resolveAutoCompactWindow } from './context-window.js';
 
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
 const WORKSPACE_GROUP =
@@ -328,12 +328,8 @@ function buildPromptAudit(
   };
 }
 
-function buildSecurityRulesPrompt(disableMemoryLayer: boolean): string {
-  if (!disableMemoryLayer) return SECURITY_RULES;
-  return SECURITY_RULES.replace(
-    /\n### 黄线操作[\s\S]*?(?=\n### Skill \/ MCP 安装审查)/,
-    '',
-  );
+function buildSecurityRulesPrompt(): string {
+  return SECURITY_RULES;
 }
 
 function runtimeContextAuditBase(
@@ -954,7 +950,6 @@ function trimSessionJsonl(jsonlPath: string): void {
 function createPreCompactHook(
   isHome: boolean,
   _isAdminHome: boolean,
-  disableMemoryLayer: boolean,
   deps: {
     emit: (output: ContainerOutput) => void;
     getFullText: () => string;
@@ -1035,8 +1030,7 @@ function createPreCompactHook(
     hadCompaction = true;
 
     // Flag memory flush for home containers (full memory write access)
-    // Skip in native Claude mode — user's ~/.claude/ Playbook handles memory persistence
-    if (isHome && !disableMemoryLayer) {
+    if (isHome) {
       needsMemoryFlush = true;
       log('PreCompact: flagged memory flush for home container');
     }
@@ -1492,12 +1486,7 @@ function waitForIpcMessage(): Promise<
   });
 }
 
-function buildMemoryRecallPrompt(
-  isHome: boolean,
-  disableMemoryLayer: boolean,
-): string {
-  // 禁用记忆层：完全跳过 HappyClaw 的记忆系统提示，让用户本机 ~/.claude/ Playbook 接管
-  if (disableMemoryLayer) return '';
+function buildMemoryRecallPrompt(isHome: boolean): string {
   return isHome ? MEMORY_SYSTEM_HOME : MEMORY_SYSTEM_GUEST;
 }
 
@@ -1826,16 +1815,11 @@ async function runQuery(
   const processor = new StreamEventProcessor(emit, log);
 
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
-  const disableMemoryLayer =
-    process.env.HAPPYCLAW_DISABLE_MEMORY_LAYER === 'true';
-
   const channel = getChannelFromJid(containerInput.chatJid);
   const channelGuidelines = CHANNEL_GUIDELINES[channel] ?? '';
-  const memoryPromptName = !disableMemoryLayer
-    ? isHome
-      ? 'memory-system.home.md'
-      : 'memory-system.guest.md'
-    : null;
+  const memoryPromptName = isHome
+    ? 'memory-system.home.md'
+    : 'memory-system.guest.md';
 
   const promptPieces: PromptPiece[] = [
     {
@@ -1849,9 +1833,9 @@ async function runQuery(
     },
     {
       name: 'security-rules.md',
-      text: `<security>\n${buildSecurityRulesPrompt(disableMemoryLayer)}\n</security>`,
+      text: `<security>\n${buildSecurityRulesPrompt()}\n</security>`,
     },
-    ...(memoryRecall && memoryPromptName
+    ...(memoryRecall
       ? [
           {
             name: memoryPromptName,
@@ -1896,13 +1880,9 @@ async function runQuery(
   // Home containers (admin & member) can access global and memory directories.
   // Non-home containers only access memory directory; global CLAUDE.md is NOT
   // injected into systemPrompt but remains accessible via filesystem (readonly mount).
-  // 禁用记忆层时 WORKSPACE_GLOBAL/MEMORY 环境变量未设置，fallback 到 /workspace/xxx
-  // 容器路径在宿主机不存在，会让 SDK 报警告；此时直接给空数组。
-  const extraDirs = disableMemoryLayer
-    ? []
-    : isHome
-      ? [WORKSPACE_GLOBAL, WORKSPACE_MEMORY]
-      : [WORKSPACE_MEMORY];
+  const extraDirs = isHome
+    ? [WORKSPACE_GLOBAL, WORKSPACE_MEMORY]
+    : [WORKSPACE_MEMORY];
 
   if (shouldInterrupt()) {
     log('Interrupt sentinel detected before query start, skipping query');
@@ -1921,15 +1901,28 @@ async function runQuery(
     };
   }
 
-  // SystemSettings.autoCompactWindow（通过 AUTO_COMPACT_WINDOW 环境变量注入）
-  // 0 = SDK 默认（约 1M）；>0 = 通过 settings flag-layer 提前触发对话压缩
-  const autoCompactWindow = parseInt(
+  // No override = SDK model-aware default: normally 200K; [1m] requests 1M.
+  // Percentage policy takes precedence over the legacy absolute-token setting.
+  const autoCompactPercentage = parseInt(
+    process.env.AUTO_COMPACT_PERCENTAGE ?? '0',
+    10,
+  );
+  const percentageWindow = resolveAutoCompactWindow(
+    CLAUDE_MODEL,
+    autoCompactPercentage,
+  );
+  const legacyAutoCompactWindow = parseInt(
     process.env.AUTO_COMPACT_WINDOW ?? '0',
     10,
   );
   const flagSettings: Record<string, unknown> = {};
-  if (Number.isFinite(autoCompactWindow) && autoCompactWindow > 0) {
-    flagSettings.autoCompactWindow = autoCompactWindow;
+  if (percentageWindow !== undefined) {
+    flagSettings.autoCompactWindow = percentageWindow;
+  } else if (
+    Number.isFinite(legacyAutoCompactWindow) &&
+    legacyAutoCompactWindow > 0
+  ) {
+    flagSettings.autoCompactWindow = legacyAutoCompactWindow;
   }
   Object.assign(
     flagSettings,
@@ -2049,7 +2042,7 @@ async function runQuery(
           PreCompact: [
             {
               hooks: [
-                createPreCompactHook(isHome, isAdminHome, disableMemoryLayer, {
+                createPreCompactHook(isHome, isAdminHome, {
                   emit,
                   getFullText: () => processor.getFullText(),
                   resetFullText: () => processor.resetFullTextAccumulator(),
@@ -2058,7 +2051,6 @@ async function runQuery(
             },
           ],
         },
-        agents: PREDEFINED_AGENTS,
       },
     });
     queryRef = q;
@@ -2295,7 +2287,7 @@ async function runQuery(
           promptAudit,
           contextUsage,
         );
-        // 1M 上下文缩水告警：默认 opus[1m] 期望约 1M 上下文窗口，若 SDK / 模型资格判定
+        // 1M 上下文缩水告警：带 [1m] 后缀的模型期望约 1M 上下文窗口，若 SDK / 模型资格判定
         // 静默退回（例如 200K），在此立即暴露而非等到溢出。push 进 warnings 会让下方
         // emit 的 displayLevel 自动升为 'primary'，在前端醒目展示。
         if (
@@ -2861,10 +2853,6 @@ async function main(): Promise<void> {
   latestSessionId = sessionId;
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
 
-  // 禁用 HappyClaw 记忆层：不注册 memory MCP 工具，让 Agent 按用户本机 Playbook 行事
-  const disableMemoryLayer =
-    process.env.HAPPYCLAW_DISABLE_MEMORY_LAYER === 'true';
-
   // Create in-process SDK MCP server (replaces the stdio subprocess)
   // NOTE: chatJid and currentTaskId are mutated in-place by the main loop
   // below so that createMcpTools() closures observe updates via ctx reference.
@@ -2885,7 +2873,6 @@ async function main(): Promise<void> {
     workspaceGroup: WORKSPACE_GROUP,
     workspaceGlobal: WORKSPACE_GLOBAL,
     workspaceMemory: WORKSPACE_MEMORY,
-    disableMemoryLayer,
   };
   const happyclawToolNames = createMcpTools(mcpToolsConfig).map(
     (tool) => tool.name,
@@ -2916,10 +2903,7 @@ async function main(): Promise<void> {
       .filter((n) => !MEMORY_FLUSH_KEEP_MCP.has(n)),
   ];
 
-  const memoryRecallPrompt = buildMemoryRecallPrompt(
-    isHome,
-    disableMemoryLayer,
-  );
+  const memoryRecallPrompt = buildMemoryRecallPrompt(isHome);
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
   // Clean up stale sentinels from previous container runs.

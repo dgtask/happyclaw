@@ -102,6 +102,7 @@ import {
   updateAgentContextInfo,
   backfillEmptyAllowlistsForUser,
   getChannelMount,
+  migrateAgentProfileAutoCompactWindow,
 } from './db.js';
 import {
   buildSessionMountUpdate,
@@ -151,6 +152,7 @@ import {
 } from './im-context-isolation.js';
 import { canSendCrossGroupMessage as canSendCrossGroupMessagePure } from './cross-group-acl.js';
 import { invalidateSessionCache, getWebDeps } from './web-context.js';
+import { resolveEffectiveAgentProfile } from './agent-profile-runtime.js';
 import {
   getFeishuProviderConfigWithSource,
   getTelegramProviderConfig,
@@ -163,6 +165,7 @@ import {
   getUserDiscordConfig,
   getUserWhatsAppConfig,
   getSystemSettings,
+  getLegacySystemAutoCompactWindow,
   saveUserFeishuConfig,
   saveFeishuOwnerOpenId,
   saveUserTelegramConfig,
@@ -1209,6 +1212,7 @@ function resolveOwnerHomeFolder(group: RegisteredGroup): string {
 function toContainerAgentProfile(
   profile: AgentProfile | undefined,
 ): ContainerInput['agentProfile'] | undefined {
+  profile = resolveEffectiveAgentProfile(profile);
   if (!profile) return undefined;
   return {
     id: profile.id,
@@ -3355,9 +3359,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   }
 
-  const agentProfile = getAgentProfileForWorkspace(
-    effectiveGroup.folder,
-    effectiveGroup.created_by,
+  const agentProfile = resolveEffectiveAgentProfile(
+    getAgentProfileForWorkspace(
+      effectiveGroup.folder,
+      effectiveGroup.created_by,
+    ),
   );
   const resetForAgentProfile = resetMainSessionForAgentProfileMismatch(
     effectiveGroup,
@@ -5035,8 +5041,9 @@ async function runAgent(
   const isHome = !!group.is_home;
   const owner = group.created_by ? getUserById(group.created_by) : undefined;
   const isAdminHome = isHome && owner?.role === 'admin';
-  const resolvedAgentProfile =
-    agentProfile ?? getAgentProfileForWorkspace(group.folder, group.created_by);
+  const resolvedAgentProfile = resolveEffectiveAgentProfile(
+    agentProfile ?? getAgentProfileForWorkspace(group.folder, group.created_by),
+  );
   if (resetMainSessionForAgentProfileMismatch(group, resolvedAgentProfile)) {
     logger.info(
       { groupFolder: group.folder, chatJid },
@@ -7338,9 +7345,11 @@ async function processAgentConversation(
   updateAgentStatus(agentId, 'running');
   broadcastAgentStatus(chatJid, agentId, 'running', agent.name, agent.prompt);
 
-  const agentProfile = getAgentProfileForWorkspace(
-    effectiveGroup.folder,
-    effectiveGroup.created_by,
+  const agentProfile = resolveEffectiveAgentProfile(
+    getAgentProfileForWorkspace(
+      effectiveGroup.folder,
+      effectiveGroup.created_by,
+    ),
   );
   const resetForAgentProfile = resetConversationSessionForAgentProfileMismatch(
     effectiveGroup,
@@ -10427,6 +10436,16 @@ async function main(): Promise<void> {
   migrateDataDirectories();
   initDatabase();
   logger.info('Database initialized');
+
+  const migratedAutoCompactProfiles = migrateAgentProfileAutoCompactWindow(
+    getLegacySystemAutoCompactWindow(),
+  );
+  if (migratedAutoCompactProfiles > 0) {
+    logger.info(
+      { migrated: migratedAutoCompactProfiles },
+      'Migrated system auto compact threshold to Agent profiles',
+    );
+  }
 
   // Clean up stale completed agents (task + spawn, older than 1 hour) to prevent DB bloat
   try {
