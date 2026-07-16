@@ -651,6 +651,8 @@ make backup           # 备份运行时数据到 happyclaw-backup-{date}.tar.gz
 make restore          # 从备份恢复数据（make restore 或 make restore FILE=xxx.tar.gz）
 ```
 
+`make backup` 会在线创建 SQLite 一致性快照，并保留工作区内可安全迁移的相对符号链接。会话中由宿主机 `~/.claude` 继承生成的链接会在运行时自动重建；指向工作区外部的绝对链接不可移植，因此备份时会明确提示并忽略。执行 `make restore` 前必须先停止 HappyClaw，恢复过程会校验归档路径、文件类型、链接目标、清单与数据库完整性。
+
 | 服务           | 默认端口 | 说明                                            |
 | -------------- | -------- | ----------------------------------------------- |
 | 后端           | 3000     | Hono + WebSocket                                |

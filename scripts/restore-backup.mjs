@@ -20,6 +20,7 @@ const MANAGED_BACKUP_COMPONENTS = [
   'builtin-skills',
   'db',
 ];
+const TAR_LISTING_BUFFER_LIMIT = 64 * 1024 * 1024;
 
 function usage() {
   console.error(
@@ -65,7 +66,15 @@ async function assertPortFree(port) {
 }
 
 function runTar(args, errorPrefix) {
-  const result = spawnSync('tar', args, { encoding: 'utf8' });
+  const result = spawnSync('tar', args, {
+    encoding: 'utf8',
+    maxBuffer: TAR_LISTING_BUFFER_LIMIT,
+  });
+  if (result.error?.code === 'ENOBUFS') {
+    throw new Error(
+      `${errorPrefix}: archive listing exceeds the ${TAR_LISTING_BUFFER_LIMIT / 1024 / 1024} MiB safety limit`,
+    );
+  }
   if (result.error) throw result.error;
   if (result.status !== 0) {
     throw new Error(
@@ -158,6 +167,85 @@ function validateDatabase(dbPath) {
     }
   } finally {
     probe.close();
+  }
+}
+
+function restoreRecordedSymlinks(stagedDataDir) {
+  const metadataPath = path.join(stagedDataDir, 'backup-symlinks.json');
+  if (!fs.existsSync(metadataPath)) return;
+  const parsed = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+  if (parsed?.formatVersion !== 1 || !Array.isArray(parsed.links)) {
+    throw new Error('Unsupported or malformed backup symlink metadata');
+  }
+  if (parsed.links.length > 100_000) {
+    throw new Error('Backup contains too many symbolic links');
+  }
+
+  const seen = new Set();
+  const normalizedLinks = parsed.links.map((link) => {
+    if (
+      !link ||
+      typeof link.path !== 'string' ||
+      typeof link.target !== 'string' ||
+      link.path.length === 0 ||
+      link.target.length === 0 ||
+      link.path.includes('\\') ||
+      path.posix.isAbsolute(link.path) ||
+      path.isAbsolute(link.target)
+    ) {
+      throw new Error('Backup contains invalid symbolic link metadata');
+    }
+    const segments = link.path.split('/');
+    if (
+      segments.some(
+        (segment) => segment === '' || segment === '.' || segment === '..',
+      ) ||
+      !MANAGED_BACKUP_COMPONENTS.includes(segments[0]) ||
+      seen.has(link.path)
+    ) {
+      throw new Error(`Unsafe backup symbolic link path: ${link.path}`);
+    }
+    seen.add(link.path);
+    return link;
+  });
+
+  for (const link of normalizedLinks) {
+    const segments = link.path.split('/');
+    for (let index = 1; index < segments.length; index += 1) {
+      if (seen.has(segments.slice(0, index).join('/'))) {
+        throw new Error(
+          `Backup symbolic link is nested beneath another link: ${link.path}`,
+        );
+      }
+    }
+    const candidate = path.join(stagedDataDir, ...segments);
+    const resolvedTarget = path.resolve(path.dirname(candidate), link.target);
+    const relativeTarget = path.relative(stagedDataDir, resolvedTarget);
+    if (
+      relativeTarget === '..' ||
+      relativeTarget.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relativeTarget)
+    ) {
+      throw new Error(
+        `Backup symbolic link escapes restored data: ${link.path}`,
+      );
+    }
+    const parent = path.dirname(candidate);
+    if (!fs.statSync(parent, { throwIfNoEntry: false })?.isDirectory()) {
+      throw new Error(`Backup symbolic link parent is missing: ${link.path}`);
+    }
+    if (fs.existsSync(candidate)) {
+      throw new Error(
+        `Backup symbolic link collides with an archive entry: ${link.path}`,
+      );
+    }
+  }
+
+  for (const link of normalizedLinks) {
+    fs.symlinkSync(
+      link.target,
+      path.join(stagedDataDir, ...link.path.split('/')),
+    );
   }
 }
 
@@ -304,6 +392,7 @@ async function restore(archiveArg, dataDirArg, port) {
     // retains WAL journal mode. They are not part of the restored state.
     fs.rmSync(`${stagedDbPath}-wal`, { force: true });
     fs.rmSync(`${stagedDbPath}-shm`, { force: true });
+    restoreRecordedSymlinks(stagedDataDir);
     replaceComponents(stagedDataDir, dataDir, stageRoot, manifest);
   } finally {
     fs.rmSync(stageRoot, { recursive: true, force: true });

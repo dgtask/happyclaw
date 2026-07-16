@@ -35,6 +35,70 @@ function close(server: net.Server): Promise<void> {
 }
 
 describe('runtime backup and restore safety', () => {
+  test('omits generated session .claude links but preserves the surrounding session', async () => {
+    const sourceData = path.join(tmp, 'generated-link-source-data');
+    const backupDir = path.join(tmp, 'generated-link-backups');
+    const extractDir = path.join(tmp, 'generated-link-extract');
+    const dbDir = path.join(sourceData, 'db');
+    const sessionRoot = path.join(
+      sourceData,
+      'sessions',
+      'workspace-1',
+      'agents',
+      'agent-1',
+    );
+    const claudeDir = path.join(sessionRoot, '.claude');
+    fs.mkdirSync(dbDir, { recursive: true });
+    const db = new Database(path.join(dbDir, 'messages.db'));
+    db.exec('CREATE TABLE sample (id INTEGER PRIMARY KEY)');
+    db.close();
+    fs.mkdirSync(path.join(claudeDir, 'skills'), { recursive: true });
+    fs.writeFileSync(path.join(sessionRoot, 'conversation.json'), '{}');
+    fs.symlinkSync('/tmp', path.join(claudeDir, 'skills', 'host-skill'));
+
+    const { stdout } = await execFileAsync(
+      'make',
+      ['backup', `RUNTIME_DATA_DIR=${sourceData}`, `BACKUP_DIR=${backupDir}`],
+      { cwd: root },
+    );
+    expect(stdout).toContain('可在运行时重建');
+    const archive = path.join(
+      backupDir,
+      fs.readdirSync(backupDir).find((name) => name.endsWith('.tar.gz'))!,
+    );
+    fs.mkdirSync(extractDir, { recursive: true });
+    await execFileAsync('tar', ['-xzf', archive, '-C', extractDir]);
+    expect(
+      fs.readFileSync(
+        path.join(
+          extractDir,
+          'data',
+          'sessions',
+          'workspace-1',
+          'agents',
+          'agent-1',
+          'conversation.json',
+        ),
+        'utf8',
+      ),
+    ).toBe('{}');
+    expect(
+      fs.existsSync(
+        path.join(
+          extractDir,
+          'data',
+          'sessions',
+          'workspace-1',
+          'agents',
+          'agent-1',
+          '.claude',
+          'skills',
+          'host-skill',
+        ),
+      ),
+    ).toBe(false);
+  });
+
   test('refuses to create an unrestorable archive from runtime symlinks', async () => {
     const sourceData = path.join(tmp, 'symlink-source-data');
     const backupDir = path.join(tmp, 'symlink-backups');
@@ -86,6 +150,80 @@ describe('runtime backup and restore safety', () => {
     expect(fs.existsSync(restoreData)).toBe(false);
   });
 
+  test('rejects forged symlink metadata that escapes restored data', async () => {
+    const archiveRoot = path.join(tmp, 'malicious-metadata-archive');
+    const archive = path.join(tmp, 'malicious-metadata-backup.tar.gz');
+    const restoreData = path.join(tmp, 'malicious-metadata-restore');
+    const dbDir = path.join(archiveRoot, 'data', 'db');
+    fs.mkdirSync(dbDir, { recursive: true });
+    const db = new Database(path.join(dbDir, 'messages.db'));
+    db.exec('CREATE TABLE sample (id INTEGER PRIMARY KEY)');
+    db.close();
+    fs.mkdirSync(path.join(archiveRoot, 'data', 'groups'), { recursive: true });
+    fs.writeFileSync(
+      path.join(archiveRoot, 'data', 'backup-symlinks.json'),
+      JSON.stringify({
+        formatVersion: 1,
+        links: [{ path: 'groups/escape', target: '../../../tmp' }],
+      }),
+    );
+    await execFileAsync('tar', ['-czf', archive, '-C', archiveRoot, 'data']);
+
+    const portProbe = net.createServer();
+    const port = await listen(portProbe);
+    await close(portProbe);
+    await expect(
+      execFileAsync(
+        'node',
+        [
+          'scripts/restore-backup.mjs',
+          'restore',
+          archive,
+          restoreData,
+          String(port),
+        ],
+        { cwd: root },
+      ),
+    ).rejects.toThrow(/escapes restored data/);
+    expect(fs.existsSync(restoreData)).toBe(false);
+  });
+
+  test('restores realistic archives whose validated file listing exceeds one MiB', async () => {
+    const archiveRoot = path.join(tmp, 'large-listing-archive');
+    const archive = path.join(tmp, 'large-listing-backup.tar.gz');
+    const restoreData = path.join(tmp, 'large-listing-restore');
+    const dbDir = path.join(archiveRoot, 'data', 'db');
+    const groupsDir = path.join(archiveRoot, 'data', 'groups');
+    fs.mkdirSync(dbDir, { recursive: true });
+    fs.mkdirSync(groupsDir, { recursive: true });
+    const db = new Database(path.join(dbDir, 'messages.db'));
+    db.exec('CREATE TABLE sample (id INTEGER PRIMARY KEY)');
+    db.close();
+    const suffix = 'x'.repeat(180);
+    for (let index = 0; index < 5_000; index += 1) {
+      fs.writeFileSync(path.join(groupsDir, `entry-${index}-${suffix}`), 'x');
+    }
+    await execFileAsync('tar', ['-czf', archive, '-C', archiveRoot, 'data']);
+
+    const portProbe = net.createServer();
+    const port = await listen(portProbe);
+    await close(portProbe);
+    await execFileAsync(
+      'node',
+      [
+        'scripts/restore-backup.mjs',
+        'restore',
+        archive,
+        restoreData,
+        String(port),
+      ],
+      { cwd: root },
+    );
+    expect(fs.readdirSync(path.join(restoreData, 'groups'))).toHaveLength(
+      5_000,
+    );
+  }, 20_000);
+
   test('includes committed WAL rows and refuses restore while the service port is active', async () => {
     const sourceData = path.join(tmp, 'source-data');
     const backupDir = path.join(tmp, 'backups');
@@ -112,6 +250,11 @@ describe('runtime backup and restore safety', () => {
       fs.mkdirSync(path.dirname(markerPath), { recursive: true });
       fs.writeFileSync(markerPath, `marker:${parts.join('/')}`);
     }
+    const workspaceRoot = path.join(sourceData, 'groups', 'workspace-1');
+    fs.mkdirSync(workspaceRoot, { recursive: true });
+    fs.writeFileSync(path.join(workspaceRoot, 'CLAUDE.md'), 'workspace rules');
+    fs.symlinkSync('CLAUDE.md', path.join(workspaceRoot, 'AGENTS.md'));
+    fs.symlinkSync('/tmp', path.join(workspaceRoot, 'external-cache'));
 
     const writer = new Database(dbPath);
     try {
@@ -197,6 +340,22 @@ describe('runtime backup and restore safety', () => {
           `marker:${parts.join('/')}`,
         );
       }
+      const restoredWorkspaceLink = path.join(
+        restoreData,
+        'groups',
+        'workspace-1',
+        'AGENTS.md',
+      );
+      expect(fs.lstatSync(restoredWorkspaceLink).isSymbolicLink()).toBe(true);
+      expect(fs.readlinkSync(restoredWorkspaceLink)).toBe('CLAUDE.md');
+      expect(fs.readFileSync(restoredWorkspaceLink, 'utf8')).toBe(
+        'workspace rules',
+      );
+      expect(
+        fs.existsSync(
+          path.join(restoreData, 'groups', 'workspace-1', 'external-cache'),
+        ),
+      ).toBe(false);
       expect(fs.existsSync(path.join(restoreData, 'extra'))).toBe(false);
       expect(fs.existsSync(`${restoredDbPath}-wal`)).toBe(false);
       expect(fs.existsSync(`${restoredDbPath}-shm`)).toBe(false);

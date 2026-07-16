@@ -265,6 +265,7 @@ backup: ## 备份运行时数据到 happyclaw-backup-{date}.tar.gz
 	    cp -a "$(RUNTIME_DATA_DIR)/$$DIR/." "$$TMP_ROOT/data/$$DIR/"; \
 	  fi; \
 	done; \
+	node scripts/prepare-backup-tree.mjs "$$TMP_ROOT/data"; \
 	UNSAFE_ENTRY=$$(find "$$TMP_ROOT/data" \( -type l -o \( ! -type f ! -type d \) \) -print -quit); \
 	if [ -n "$$UNSAFE_ENTRY" ]; then \
 	  echo "❌ 运行时数据包含不安全的链接或特殊文件，拒绝创建不可安全恢复的备份：$$UNSAFE_ENTRY"; \
