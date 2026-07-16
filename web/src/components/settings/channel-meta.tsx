@@ -99,3 +99,21 @@ export function ChannelBadge({ channelType }: { channelType: string }) {
     </span>
   );
 }
+
+export function ChannelAccountBadge({
+  accountId,
+  accountName,
+}: {
+  accountId?: string | null;
+  accountName?: string | null;
+}) {
+  return (
+    <span
+      className="inline-flex max-w-40 items-center gap-1 rounded-full border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground"
+      title={accountId ? `Bot 账号 ID：${accountId}` : '兼容旧版默认账号'}
+    >
+      <span className="size-1.5 shrink-0 rounded-full bg-current opacity-60" />
+      <span className="truncate">{accountName || '默认账号（旧版）'}</span>
+    </span>
+  );
+}

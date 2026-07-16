@@ -46,8 +46,7 @@ export function resolveEffectiveAgentProfile(
   return {
     ...profile,
     identity_hash: computeAgentProfileIdentityHash(
-      profile.identity_prompt,
-      profile.include_claude_preset,
+      profile,
       {
         ...profile.runtime_policy,
         context: {
@@ -219,15 +218,13 @@ async function forceStopRuntimeJids(
  * Stop every affected runtime, synchronously commit the identity/ownership
  * change, then stop the same (plus newly discovered) runtime JIDs again.
  *
- * The second pass closes the stop-before-persist TOCTOU window. In the JS
- * event loop, `commit` contains no await. Immediately afterward stopGroup
- * synchronously observes/marks an active GroupState before its first await;
- * inactive runtimes return without awaiting. Therefore a runner created after
- * pass one either exists when pass two starts and is awaited to inactive, or
- * starts only after the commit and can observe only the new DB state. This is
- * the required commit -> post-stop happens-before relationship. A scoped,
- * ref-counted mutation pause parks accepted work across both passes and the
- * finally block resumes it, so the quiesce cannot drop messages/tasks.
+ * The second pass closes the stop-before-persist TOCTOU window. A scoped,
+ * ref-counted mutation pause parks accepted work across both passes and stays
+ * held while a synchronous or asynchronous commit runs. Therefore a runner
+ * created after pass one either exists when pass two starts and is awaited to
+ * inactive, or starts only after the pause is released and can observe only
+ * the new persisted state. The finally block resumes parked work, so the
+ * quiesce cannot drop messages/tasks.
  */
 export async function quiesceWorkspaceRunnersAroundCommit<T>(
   deps: WebDeps,
@@ -239,7 +236,7 @@ export async function quiesceWorkspaceRunnersAroundCommit<T>(
      * queue gate without a resume/drain race. */
     onPostCommitFailure?: (runtimeJids: string[]) => void;
   },
-  commit: () => T,
+  commit: () => Promise<T> | T,
 ): Promise<{ value: T; runtimeJids: string[] }> {
   const preCommitJids = collectWorkspaceRuntimeJids(deps, targets);
   // Lock all serialization/folder keys synchronously before the first await.
@@ -263,7 +260,7 @@ export async function quiesceWorkspaceRunnersAroundCommit<T>(
       throw new WorkspaceRuntimeQuiesceError('pre_commit', preCommitFailures);
     }
 
-    const value = commit();
+    const value = await commit();
 
     const postCommitJids = Array.from(
       new Set([

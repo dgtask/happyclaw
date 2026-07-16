@@ -11,7 +11,6 @@ import { useAuthStore } from '../stores/auth';
 import { McpServerCard } from '../components/mcp-servers/McpServerCard';
 import { McpServerDetail } from '../components/mcp-servers/McpServerDetail';
 import { AddMcpServerDialog } from '../components/mcp-servers/AddMcpServerDialog';
-import { api } from '../api/client';
 import type { McpServer } from '../stores/mcp-servers';
 
 export function McpServersPage() {
@@ -22,12 +21,15 @@ export function McpServersPage() {
     syncing,
     loadServers,
     addServer,
+    getServer,
     syncHostServers,
   } = useMcpServersStore();
 
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
 
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedSourceKey, setSelectedSourceKey] = useState<string | null>(
+    null,
+  );
   const [selectedServer, setSelectedServer] = useState<McpServer | null>(null);
   const [selectedLoading, setSelectedLoading] = useState(false);
   const [selectedError, setSelectedError] = useState<string | null>(null);
@@ -51,14 +53,18 @@ export function McpServersPage() {
     );
   }, [servers, searchQuery]);
 
-  const manualServers = filtered.filter((s) => !s.syncedFromHost);
-  const syncedServers = filtered.filter((s) => s.syncedFromHost);
+  const userServers = filtered.filter((server) => server.source === 'user');
+  const systemServers = filtered.filter((server) => server.source === 'system');
+  const importedCount = servers.filter(
+    (server) => server.importedFromHost || server.syncedFromHost,
+  ).length;
 
   const enabledCount = servers.filter((s) => s.enabled).length;
-  const selectedSummary = servers.find((s) => s.id === selectedId) || null;
+  const selectedSummary =
+    servers.find((server) => server.sourceKey === selectedSourceKey) || null;
 
   useEffect(() => {
-    if (!selectedId || !selectedSummary) {
+    if (!selectedSourceKey || !selectedSummary) {
       setSelectedServer(null);
       setSelectedError(null);
       return;
@@ -67,12 +73,15 @@ export function McpServersPage() {
     let cancelled = false;
     setSelectedLoading(true);
     setSelectedError(null);
-    api
-      .get<{ server: McpServer }>(
-        `/api/mcp-servers/${encodeURIComponent(selectedId)}`,
-      )
-      .then(({ server }) => {
-        if (!cancelled) setSelectedServer(server);
+    getServer(selectedSourceKey)
+      .then((server) => {
+        if (!cancelled) {
+          setSelectedServer({
+            ...server,
+            conflictSources: selectedSummary.conflictSources,
+            effective: selectedSummary.effective,
+          });
+        }
       })
       .catch((error) => {
         if (!cancelled) {
@@ -89,15 +98,15 @@ export function McpServersPage() {
     return () => {
       cancelled = true;
     };
-  }, [selectedId, selectedSummary]);
+  }, [getServer, selectedSourceKey, selectedSummary]);
 
   const handleSync = async () => {
     setSyncMessage(null);
     try {
       const result = await syncHostServers();
-      const { added, updated, deleted, skipped } = result;
+      const { added, skipped } = result;
       setSyncMessage(
-        `同步完成：新增 ${added}，更新 ${updated}，删除 ${deleted}，跳过 ${skipped}`,
+        `导入完成：新增 ${added}，跳过 ${skipped}。已导入的是独立副本，不会覆盖现有配置。`,
       );
       setTimeout(() => setSyncMessage(null), 5000);
     } catch {
@@ -116,7 +125,7 @@ export function McpServersPage() {
         <div className="bg-background border-b border-border px-6 py-4">
           <PageHeader
             title="MCP 服务器"
-            subtitle={`共 ${servers.length} 个${syncedServers.length > 0 ? `（含同步 ${syncedServers.length}）` : ''} · 启用 ${enabledCount}`}
+            subtitle={`我的 ${servers.filter((server) => server.source === 'user').length} · 系统 ${servers.filter((server) => server.source === 'system').length} · 启用 ${enabledCount}${importedCount > 0 ? ` · 宿主机副本 ${importedCount}` : ''}`}
             actions={
               <div className="flex items-center gap-3">
                 {isAdmin && (
@@ -129,7 +138,7 @@ export function McpServersPage() {
                       size={18}
                       className={syncing ? 'animate-pulse' : ''}
                     />
-                    {syncing ? '同步中...' : '同步宿主机'}
+                    {syncing ? '导入中...' : '导入宿主机副本'}
                   </Button>
                 )}
                 <Button
@@ -153,9 +162,10 @@ export function McpServersPage() {
         </div>
 
         <div className="mx-6 mt-4 rounded-lg border border-warning/20 bg-warning-bg px-4 py-3 text-xs leading-5 text-warning">
-          这里的 MCP 仅属于当前用户，再由各 Agent 决定是否允许使用。STDIO
-          命令会在 Agent 的实际运行环境中执行；环境变量和请求 Header
-          可能包含敏感凭据，请只添加可信服务器。
+          这里管理 HappyClaw 额外提供的 MCP，再由各 Agent 决定是否允许使用。
+          继承宿主机 ~/.claude 的 Agent 会自动获得宿主机全部
+          MCP，无需导入或勾选。 密钥写入后不会再次显示；STDIO 命令会在 Agent
+          的实际运行环境中执行。
         </div>
 
         {/* Sync message toast */}
@@ -202,36 +212,45 @@ export function McpServersPage() {
                 />
               ) : (
                 <>
-                  {manualServers.length > 0 && (
+                  {userServers.length > 0 && (
                     <div>
                       <h2 className="text-sm font-semibold text-muted-foreground mb-3">
-                        手动添加 ({manualServers.length})
+                        我的 MCP ({userServers.length})
                       </h2>
                       <div className="space-y-2">
-                        {manualServers.map((server) => (
+                        {userServers.map((server) => (
                           <McpServerCard
-                            key={server.id}
+                            key={server.sourceKey}
                             server={server}
-                            selected={selectedId === server.id}
-                            onSelect={() => setSelectedId(server.id)}
+                            selected={selectedSourceKey === server.sourceKey}
+                            onSelect={() =>
+                              setSelectedSourceKey(server.sourceKey)
+                            }
                           />
                         ))}
                       </div>
                     </div>
                   )}
 
-                  {syncedServers.length > 0 && (
+                  {systemServers.length > 0 && (
                     <div>
                       <h2 className="text-sm font-semibold text-muted-foreground mb-3">
-                        宿主机同步 ({syncedServers.length})
+                        系统 MCP ({systemServers.length})
                       </h2>
+                      <p className="mb-3 text-xs leading-5 text-muted-foreground">
+                        系统列表对所有用户可见，仅管理员可修改；是否允许成员的
+                        Agent
+                        使用由每项配置决定。系统与个人存在同名配置时，个人配置优先。
+                      </p>
                       <div className="space-y-2">
-                        {syncedServers.map((server) => (
+                        {systemServers.map((server) => (
                           <McpServerCard
-                            key={server.id}
+                            key={server.sourceKey}
                             server={server}
-                            selected={selectedId === server.id}
-                            onSelect={() => setSelectedId(server.id)}
+                            selected={selectedSourceKey === server.sourceKey}
+                            onSelect={() =>
+                              setSelectedSourceKey(server.sourceKey)
+                            }
                           />
                         ))}
                       </div>
@@ -258,14 +277,14 @@ export function McpServersPage() {
             ) : (
               <McpServerDetail
                 server={selectedServer}
-                onDeleted={() => setSelectedId(null)}
+                onDeleted={() => setSelectedSourceKey(null)}
               />
             )}
           </div>
         </div>
 
         {/* Mobile detail */}
-        {selectedId && (
+        {selectedSourceKey && (
           <div className="lg:hidden p-4">
             {selectedLoading ? (
               <div className="flex min-h-32 items-center justify-center rounded-xl border border-border">
@@ -281,7 +300,7 @@ export function McpServersPage() {
             ) : (
               <McpServerDetail
                 server={selectedServer}
-                onDeleted={() => setSelectedId(null)}
+                onDeleted={() => setSelectedSourceKey(null)}
               />
             )}
           </div>
@@ -290,6 +309,7 @@ export function McpServersPage() {
 
       <AddMcpServerDialog
         open={showAddDialog}
+        isAdmin={isAdmin}
         onClose={() => setShowAddDialog(false)}
         onAdd={handleAdd}
       />

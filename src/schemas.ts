@@ -5,6 +5,52 @@ import { ALL_PERMISSIONS } from './permissions.js';
 import type { Permission } from './types.js';
 import { MAX_GROUP_NAME_LEN } from './web-context.js';
 
+export const ChannelProviderSchema = z.enum([
+  'feishu',
+  'telegram',
+  'qq',
+  'wechat',
+  'dingtalk',
+  'discord',
+  'whatsapp',
+]);
+
+const ChannelCredentialsSchema = z
+  .record(z.string(), z.string().max(8192))
+  .refine(
+    (value) => Object.keys(value).length <= 16,
+    'Too many credential fields',
+  );
+
+export const ChannelAccountCreateSchema = z.object({
+  provider: ChannelProviderSchema,
+  name: z.string().trim().min(1).max(80),
+  enabled: z.boolean().optional().default(true),
+  is_default: z.boolean().optional().default(false),
+  default_workspace_jid: z
+    .string()
+    .trim()
+    .min(1)
+    .max(512)
+    .nullable()
+    .optional(),
+  credentials: ChannelCredentialsSchema.optional().default({}),
+});
+
+export const ChannelAccountPatchSchema = z.object({
+  name: z.string().trim().min(1).max(80).optional(),
+  enabled: z.boolean().optional(),
+  is_default: z.boolean().optional(),
+  default_workspace_jid: z
+    .string()
+    .trim()
+    .min(1)
+    .max(512)
+    .nullable()
+    .optional(),
+  credentials: ChannelCredentialsSchema.optional(),
+});
+
 export const TaskPatchSchema = z.object({
   chat_jid: z.string().min(1).optional(),
   prompt: z.string().optional(),
@@ -250,58 +296,108 @@ export const AgentProfileRuntimePolicySchema = z
   })
   .strict();
 
-export const AgentProfileCreateSchema = z.object({
-  name: z.string().trim().min(1).max(80),
-  identity_prompt: z
-    .string()
-    .max(20000)
-    .optional()
-    .transform((val) => (val == null ? undefined : val.trim())),
-  include_claude_preset: z.boolean().optional(),
-  avatar_emoji: z.string().max(8).nullable().optional(),
-  avatar_color: z
-    .string()
-    .regex(/^#[0-9a-fA-F]{6}$/)
-    .nullable()
-    .optional(),
-  runtime_policy: AgentProfileRuntimePolicySchema.optional(),
+const AgentPromptTextSchema = z.string().max(20000);
+const AgentPromptModeSchema = z.enum(['append', 'replace']);
+const AgentPromptSectionsSchema = z.object({
+  identity_prompt: AgentPromptTextSchema,
+  soul_prompt: AgentPromptTextSchema,
+  agents_prompt: AgentPromptTextSchema,
+  tools_prompt: AgentPromptTextSchema,
 });
 
-export const AgentProfilePatchSchema = z.object({
-  name: z.string().trim().min(1).max(80).optional(),
-  identity_prompt: z
-    .string()
-    .max(20000)
-    .optional()
-    .transform((val) => (val == null ? undefined : val.trim())),
-  include_claude_preset: z.boolean().optional(),
-  avatar_emoji: z.string().max(8).nullable().optional(),
-  avatar_color: z
-    .string()
-    .regex(/^#[0-9a-fA-F]{6}$/)
-    .nullable()
-    .optional(),
-  runtime_policy: AgentProfileRuntimePolicySchema.optional(),
-});
+function validatePromptModeCompatibility(
+  value: {
+    prompt_mode?: 'append' | 'replace';
+    include_claude_preset?: boolean;
+  },
+  ctx: z.RefinementCtx,
+): void {
+  if (
+    value.prompt_mode !== undefined &&
+    value.include_claude_preset !== undefined &&
+    (value.prompt_mode === 'append') !== value.include_claude_preset
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['include_claude_preset'],
+      message: 'include_claude_preset conflicts with prompt_mode',
+    });
+  }
+}
+
+export const AgentProfileCreateSchema = z
+  .object({
+    name: z.string().trim().min(1).max(80),
+    /** Explicitly disambiguates four-part clients from legacy identity_prompt. */
+    prompt_schema_version: z.literal(2).optional(),
+    identity_prompt: AgentPromptTextSchema.optional(),
+    soul_prompt: AgentPromptTextSchema.optional(),
+    agents_prompt: AgentPromptTextSchema.optional(),
+    tools_prompt: AgentPromptTextSchema.optional(),
+    prompt_mode: AgentPromptModeSchema.optional(),
+    include_claude_preset: z.boolean().optional(),
+    avatar_emoji: z.string().max(8).nullable().optional(),
+    avatar_color: z
+      .string()
+      .regex(/^#[0-9a-fA-F]{6}$/)
+      .nullable()
+      .optional(),
+    runtime_policy: AgentProfileRuntimePolicySchema.optional(),
+  })
+  .superRefine(validatePromptModeCompatibility);
+
+export const AgentProfilePatchSchema = z
+  .object({
+    name: z.string().trim().min(1).max(80).optional(),
+    /** Explicitly disambiguates four-part clients from legacy identity_prompt. */
+    prompt_schema_version: z.literal(2).optional(),
+    identity_prompt: AgentPromptTextSchema.optional(),
+    soul_prompt: AgentPromptTextSchema.optional(),
+    agents_prompt: AgentPromptTextSchema.optional(),
+    tools_prompt: AgentPromptTextSchema.optional(),
+    prompt_mode: AgentPromptModeSchema.optional(),
+    include_claude_preset: z.boolean().optional(),
+    avatar_emoji: z.string().max(8).nullable().optional(),
+    avatar_color: z
+      .string()
+      .regex(/^#[0-9a-fA-F]{6}$/)
+      .nullable()
+      .optional(),
+    runtime_policy: AgentProfileRuntimePolicySchema.optional(),
+  })
+  .superRefine(validatePromptModeCompatibility);
 
 export const AgentProfileGenerateSchema = z.object({
   description: z.string().trim().min(1).max(4000),
 });
 
-export const AgentProfileRefinePromptSchema = z.object({
-  message: z.string().trim().min(1).max(4000),
-  current_prompt: z.string().max(20000),
-  history: z
-    .array(
-      z.object({
-        role: z.enum(['user', 'assistant']),
-        content: z.string().trim().min(1).max(4000),
-      }),
-    )
-    .max(12)
-    .optional()
-    .default([]),
-});
+export const AgentProfileRefinePromptSchema = z
+  .object({
+    message: z.string().trim().min(1).max(4000),
+    section: z.enum(['identity', 'soul', 'agents', 'tools']).optional(),
+    current_prompts: AgentPromptSectionsSchema.optional(),
+    /** @deprecated Legacy all-in-one prompt, interpreted as AGENTS. */
+    current_prompt: AgentPromptTextSchema.optional(),
+    history: z
+      .array(
+        z.object({
+          role: z.enum(['user', 'assistant']),
+          content: z.string().trim().min(1).max(4000),
+        }),
+      )
+      .max(12)
+      .optional()
+      .default([]),
+  })
+  .superRefine((value, ctx) => {
+    if (!value.current_prompts && value.current_prompt === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['current_prompts'],
+        message: 'current_prompts or current_prompt is required',
+      });
+    }
+  });
 
 // Schema 层 cap：路由 handler 还有 byteLength 校验作为底线。Schema 层 cap
 // 让 Hono 在 c.req.json() 之后立刻拒绝，攻击者无法用单条巨大 JSON 把内存
@@ -977,7 +1073,13 @@ export const DiscordConfigSchema = z
 
 export const WhatsAppConfigSchema = z
   .object({
-    accountId: z.string().max(64).optional(),
+    accountId: z
+      .union([
+        z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
+        // Historical clients may submit an empty value to mean "default".
+        z.literal(''),
+      ])
+      .optional(),
     phoneNumber: z.string().max(32).optional(),
     enabled: z.boolean().optional(),
     // `paired` 由 Baileys 登录回调（saveUserWhatsAppConfig 内部）写入，

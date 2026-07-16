@@ -70,6 +70,7 @@ vi.mock('../src/web.js', () => ({
 
 const agentRoutesModule = await import('../src/routes/agents.js');
 const db = await import('../src/db.js');
+const mountService = await import('../src/channel-mount-service.js');
 
 const agentRoutes = agentRoutesModule.default;
 
@@ -242,6 +243,37 @@ describe('formal sessions API', () => {
       { jid: 'telegram:bound-session', name: 'Bound Telegram' },
     ]);
   });
+
+  test('native-thread sessions have read-only titles and cannot be deleted directly', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const sessionId = `native-session-${Date.now()}`;
+    db.createAgent({
+      id: sessionId,
+      group_folder: GROUP_FOLDER,
+      chat_jid: GROUP_JID,
+      name: 'Native topic',
+      prompt: '',
+      status: 'idle',
+      kind: 'conversation',
+      created_by: OWNER_ID,
+      created_at: new Date().toISOString(),
+      completed_at: null,
+      result_summary: null,
+      last_im_jid: null,
+      spawned_from_jid: null,
+      source_kind: 'native_thread',
+      title_source: 'native_root',
+    });
+
+    const rename = await patchAgent(sessionId, { name: 'Do not rename' });
+    expect(rename.status, JSON.stringify(rename.body)).toBe(400);
+    expect(rename.body.error).toMatch(/read-only/i);
+
+    const deletion = await deleteSessionRoute(sessionId);
+    expect(deletion.status).toBe(409);
+    expect(deletion.body.error).toMatch(/managed by their channel container/i);
+  });
 });
 
 describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
@@ -269,5 +301,284 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
     });
     expect(status).toBe(404);
     expect(body.error).toMatch(/not found/i);
+  });
+
+  test('IM candidates expose account identity and keep same-chat bots distinct', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const suffix = Date.now().toString(36);
+    const first = db.createChannelAccount({
+      id: `account-a-${suffix}`,
+      owner_user_id: OWNER_ID,
+      provider: 'telegram',
+      name: 'Support bot',
+      secret_ref: `channel-account:account-a-${suffix}`,
+    });
+    const second = db.createChannelAccount({
+      id: `account-b-${suffix}`,
+      owner_user_id: OWNER_ID,
+      provider: 'telegram',
+      name: 'Review bot',
+      secret_ref: `channel-account:account-b-${suffix}`,
+    });
+    for (const account of [first, second]) {
+      db.setRegisteredGroup(`telegram:shared#account:${account.id}`, {
+        name: 'Shared external chat',
+        folder: GROUP_FOLDER,
+        added_at: new Date().toISOString(),
+        created_by: OWNER_ID,
+        channel_account_id: account.id,
+      });
+    }
+
+    const { status, body } = await req('/im-groups', 'GET');
+    expect(status).toBe(200);
+    const matching = body.imGroups.filter((item: any) =>
+      item.jid.startsWith('telegram:shared#account:'),
+    );
+    expect(matching).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          channel_account_id: first.id,
+          channel_account_name: 'Support bot',
+        }),
+        expect.objectContaining({
+          channel_account_id: second.id,
+          channel_account_name: 'Review bot',
+        }),
+      ]),
+    );
+    expect(new Set(matching.map((item: any) => item.jid)).size).toBe(2);
+  });
+
+  test('ordinary chats can bind to a workspace main conversation', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const suffix = Date.now().toString(36);
+    const account = db.createChannelAccount({
+      id: `qq-workspace-${suffix}`,
+      owner_user_id: OWNER_ID,
+      provider: 'qq',
+      name: 'QQ bot',
+      secret_ref: `channel-account:qq-workspace-${suffix}`,
+      default_workspace_jid: GROUP_JID,
+    });
+    const imJid = `qq:c2c:user-${suffix}#account:${account.id}`;
+    db.setRegisteredGroup(imJid, {
+      name: 'QQ direct chat',
+      folder: GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+      channel_account_id: account.id,
+      native_context_type: 'none',
+    });
+
+    const { status } = await req('/sessions/main/im-binding', 'PUT', {
+      im_jid: imJid,
+    });
+    expect(status).toBe(200);
+    expect(db.getRegisteredGroup(imJid)).toMatchObject({
+      target_main_jid: GROUP_JID,
+      binding_mode: 'single_context',
+    });
+  });
+
+  test('native thread containers reject a fixed session target', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const created = await postSession({ name: 'Fixed session' });
+    const sessionId = created.body.session.id as string;
+    const suffix = Date.now().toString(36);
+    const account = db.createChannelAccount({
+      id: `telegram-forum-${suffix}`,
+      owner_user_id: OWNER_ID,
+      provider: 'telegram',
+      name: 'Forum bot',
+      secret_ref: `channel-account:telegram-forum-${suffix}`,
+      default_workspace_jid: GROUP_JID,
+    });
+    const imJid = `telegram:forum-${suffix}#account:${account.id}`;
+    db.setRegisteredGroup(imJid, {
+      name: 'Telegram Forum',
+      folder: GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+      channel_account_id: account.id,
+      native_context_type: 'thread',
+    });
+
+    const { status, body } = await req(
+      `/sessions/${sessionId}/im-binding`,
+      'PUT',
+      { im_jid: imJid },
+    );
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/native thread/i);
+    expect(db.getRegisteredGroup(imJid)?.target_agent_id).toBeUndefined();
+  });
+
+  test('deleting a session binding restores the account default workspace', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const created = await postSession({ name: 'Temporary session' });
+    const sessionId = created.body.session.id as string;
+    const suffix = Date.now().toString(36);
+    const account = db.createChannelAccount({
+      id: `whatsapp-default-${suffix}`,
+      owner_user_id: OWNER_ID,
+      provider: 'whatsapp',
+      name: 'WhatsApp account',
+      secret_ref: `channel-account:whatsapp-default-${suffix}`,
+      default_workspace_jid: GROUP_JID,
+    });
+    const imJid = `whatsapp:user-${suffix}@s.whatsapp.net#account:${account.id}`;
+    db.setRegisteredGroup(imJid, {
+      name: 'WhatsApp chat',
+      folder: GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+      channel_account_id: account.id,
+      target_agent_id: sessionId,
+      activation_mode: 'when_mentioned',
+      owner_im_id: 'owner-im',
+      sender_allowlist: ['owner-im'],
+      reply_policy: 'mirror',
+    });
+
+    const { status, body } = await req(
+      `/sessions/${sessionId}/im-binding/${encodeURIComponent(imJid)}`,
+      'DELETE',
+    );
+    expect(status).toBe(200);
+    expect(body.target_main_jid).toBe(GROUP_JID);
+    expect(db.getRegisteredGroup(imJid)).toMatchObject({
+      target_main_jid: GROUP_JID,
+      target_agent_id: undefined,
+      binding_mode: 'single_context',
+      activation_mode: 'when_mentioned',
+      owner_im_id: 'owner-im',
+      sender_allowlist: ['owner-im'],
+      reply_policy: 'source_only',
+    });
+  });
+
+  test('multiple native-context containers can share one workspace', () => {
+    asUser(OWNER_ID);
+    const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const workspaceJid = `web:native-upgrade-${suffix}`;
+    const firstJid = `telegram:forum-upgrade-a-${suffix}`;
+    const secondJid = `telegram:forum-upgrade-b-${suffix}`;
+    db.setRegisteredGroup(workspaceJid, {
+      name: 'Native upgrade workspace',
+      folder: `native-upgrade-${suffix}`,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+    });
+    const base = {
+      name: 'Forum',
+      folder: `native-upgrade-${suffix}`,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+      target_main_jid: workspaceJid,
+      binding_mode: 'single_context' as const,
+      native_context_type: 'thread' as const,
+    };
+    db.setRegisteredGroup(firstJid, base);
+    db.setRegisteredGroup(secondJid, base);
+
+    expect(
+      mountService.upgradeNativeContextChannelMount(firstJid, base),
+    ).toMatchObject({
+      status: 'upgraded',
+      updated: { binding_mode: 'thread_map' },
+    });
+    expect(
+      mountService.upgradeNativeContextChannelMount(secondJid, base),
+    ).toMatchObject({
+      status: 'upgraded',
+      updated: { binding_mode: 'thread_map' },
+    });
+    expect(db.getRegisteredGroup(firstJid)?.binding_mode).toBe('thread_map');
+    expect(db.getRegisteredGroup(secondJid)?.binding_mode).toBe('thread_map');
+
+    db.deleteRegisteredGroup(firstJid);
+    db.deleteRegisteredGroup(secondJid);
+    db.deleteRegisteredGroup(workspaceJid);
+  });
+
+  test('REST restore detaches native navigation only after the last source leaves', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const defaultWorkspaceJid = `web:native-default-${suffix}`;
+    db.setRegisteredGroup(defaultWorkspaceJid, {
+      name: 'Native default workspace',
+      folder: `native-default-${suffix}`,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+    });
+
+    const sourceJids: string[] = [];
+    for (const name of ['first', 'second']) {
+      const account = db.createChannelAccount({
+        id: `native-restore-${name}-${suffix}`,
+        owner_user_id: OWNER_ID,
+        provider: name === 'first' ? 'feishu' : 'telegram',
+        name: `${name} bot`,
+        secret_ref: `channel-account:native-restore-${name}-${suffix}`,
+        default_workspace_jid: defaultWorkspaceJid,
+      });
+      const sourceJid = `${account.provider}:native-${name}-${suffix}#account:${account.id}`;
+      sourceJids.push(sourceJid);
+      db.setRegisteredGroup(sourceJid, {
+        name: `${name} native container`,
+        folder: GROUP_FOLDER,
+        added_at: new Date().toISOString(),
+        created_by: OWNER_ID,
+        channel_account_id: account.id,
+        native_context_type: 'thread',
+      });
+
+      const bound = await req('/sessions/main/im-binding', 'PUT', {
+        im_jid: sourceJid,
+      });
+      expect(bound.status, JSON.stringify(bound.body)).toBe(200);
+      expect(db.getRegisteredGroup(sourceJid)).toMatchObject({
+        target_main_jid: GROUP_JID,
+        binding_mode: 'thread_map',
+      });
+    }
+
+    expect(db.getRegisteredGroup(GROUP_JID)).toMatchObject({
+      conversation_source: 'native_thread',
+      conversation_nav_mode: 'vertical_threads',
+    });
+
+    const firstRestored = await req(
+      `/im-binding/${encodeURIComponent(sourceJids[0])}`,
+      'DELETE',
+    );
+    expect(firstRestored.status, JSON.stringify(firstRestored.body)).toBe(200);
+    expect(db.getRegisteredGroup(GROUP_JID)).toMatchObject({
+      conversation_source: 'native_thread',
+      conversation_nav_mode: 'vertical_threads',
+    });
+
+    const lastRestored = await req(
+      `/im-binding/${encodeURIComponent(sourceJids[1])}`,
+      'DELETE',
+    );
+    expect(lastRestored.status, JSON.stringify(lastRestored.body)).toBe(200);
+    expect(db.getRegisteredGroup(GROUP_JID)).toMatchObject({
+      conversation_source: 'manual',
+      conversation_nav_mode: 'horizontal',
+    });
+    expect(db.getRegisteredGroup(defaultWorkspaceJid)).toMatchObject({
+      conversation_source: 'native_thread',
+      conversation_nav_mode: 'vertical_threads',
+    });
+
+    for (const sourceJid of sourceJids) db.deleteRegisteredGroup(sourceJid);
+    db.deleteRegisteredGroup(defaultWorkspaceJid);
   });
 });

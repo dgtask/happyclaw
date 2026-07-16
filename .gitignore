@@ -28,13 +28,9 @@ dist/
 *.db-shm
 *.sqlite
 
-# Lockfiles（agent-runner 是可复现容器构建的例外，必须跟踪）
-package-lock.json
-container/agent-runner/package-lock.json
-web/package-lock.json
+# npm lockfiles are build inputs and must be version-controlled for reproducible installs.
 bun.lock
 bun.lockb
-!container/agent-runner/package-lock.json
 
 # Build cache
 .build-sentinel

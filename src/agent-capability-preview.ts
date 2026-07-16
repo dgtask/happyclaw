@@ -2,8 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DATA_DIR, GROUPS_DIR } from './config.js';
 import { getEffectiveExternalDir } from './runtime-config.js';
-import { loadUserMcpServers } from './mcp-utils.js';
-import { readMcpServersFile } from './mcp-context.js';
+import { loadManagedMcpLayers, parseManagedMcpReference } from './mcp-utils.js';
+import {
+  getHostClaudeMcpSourcePaths,
+  readMcpServersFile,
+} from './mcp-context.js';
 import { scanSkillDirectory } from './skill-utils.js';
 import type { AgentProfile, RegisteredGroup } from './types.js';
 
@@ -12,13 +15,16 @@ export type CapabilityLayerSource =
   | 'host'
   | 'project'
   | 'workspace'
-  | 'managed';
+  | 'managed'
+  | 'system'
+  | 'user';
 
 export interface EffectiveCapabilityEntry {
   id: string;
   source: CapabilityLayerSource;
   overrides: CapabilityLayerSource[];
   available: boolean;
+  unavailableReason?: 'tool_boundary' | 'system_admin_only';
 }
 
 export interface AgentCapabilityPreview {
@@ -67,7 +73,12 @@ function countEntries(root: string): number {
 }
 
 function mergeLayers(
-  layers: Array<{ source: CapabilityLayerSource; ids: string[] }>,
+  layers: Array<{
+    source: CapabilityLayerSource;
+    ids: string[];
+    available?: boolean;
+    unavailableReason?: EffectiveCapabilityEntry['unavailableReason'];
+  }>,
   available = true,
 ): { entries: EffectiveCapabilityEntry[]; conflicts: string[] } {
   const entries = new Map<string, EffectiveCapabilityEntry>();
@@ -84,7 +95,12 @@ function mergeLayers(
               (source, index, all) => all.indexOf(source) === index,
             )
           : [],
-        available,
+        available: available && layer.available !== false,
+        ...(!available
+          ? { unavailableReason: 'tool_boundary' as const }
+          : layer.available === false && layer.unavailableReason
+            ? { unavailableReason: layer.unavailableReason }
+            : {}),
       });
     }
   }
@@ -103,6 +119,7 @@ function mcpIds(filePath: string): string[] {
 export function buildAgentCapabilityPreview(options: {
   profile: AgentProfile;
   workspace?: { jid: string; group: RegisteredGroup };
+  ownerRole?: 'admin' | 'member';
 }): AgentCapabilityPreview {
   const { profile, workspace } = options;
   const policy = profile.runtime_policy;
@@ -150,21 +167,44 @@ export function buildAgentCapabilityPreview(options: {
   ];
   const skills = mergeLayers(skillLayers);
 
-  const allManagedMcp = loadUserMcpServers(profile.owner_user_id);
-  const managedMcpIds =
-    policy.mcp.mode === 'disabled'
-      ? []
-      : policy.mcp.mode === 'custom'
-        ? Object.keys(allManagedMcp).filter((id) => policy.mcp.ids.includes(id))
-        : Object.keys(allManagedMcp);
-  const mcpLayers: Array<{ source: CapabilityLayerSource; ids: string[] }> = [];
+  const allowAdminOnlySystemMcp = options.ownerRole === 'admin';
+  const managedMcpLayers = loadManagedMcpLayers(profile.owner_user_id, {
+    // Preview needs the complete catalogue so it can explain why a system
+    // server is unavailable instead of making it disappear.
+    allowAdminOnlySystemMcp: true,
+  });
+  const restrictedSystemIds = new Set(
+    allowAdminOnlySystemMcp ? [] : managedMcpLayers.restrictedSystemIds,
+  );
+  let selectedSystemMcpIds: string[] = [];
+  let selectedUserMcpIds: string[] = [];
+  if (policy.mcp.mode === 'inherit') {
+    selectedSystemMcpIds = Object.keys(managedMcpLayers.system);
+    selectedUserMcpIds = Object.keys(managedMcpLayers.user);
+  } else if (policy.mcp.mode === 'custom') {
+    for (const reference of policy.mcp.ids) {
+      const parsed = parseManagedMcpReference(reference);
+      if (
+        Object.prototype.hasOwnProperty.call(
+          managedMcpLayers[parsed.scope],
+          parsed.id,
+        )
+      ) {
+        if (parsed.scope === 'system') selectedSystemMcpIds.push(parsed.id);
+        else selectedUserMcpIds.push(parsed.id);
+      }
+    }
+  }
+  const mcpLayers: Array<{
+    source: CapabilityLayerSource;
+    ids: string[];
+    available?: boolean;
+    unavailableReason?: EffectiveCapabilityEntry['unavailableReason'];
+  }> = [];
   if (hostContext) {
     mcpLayers.push({
       source: 'host',
-      ids: [
-        ...mcpIds(path.join(externalClaudeDir, 'settings.json')),
-        ...mcpIds(path.join(path.dirname(externalClaudeDir), '.claude.json')),
-      ],
+      ids: getHostClaudeMcpSourcePaths(externalClaudeDir).flatMap(mcpIds),
     });
   }
   if (workspaceDir) {
@@ -177,7 +217,17 @@ export function buildAgentCapabilityPreview(options: {
       ],
     });
   }
-  mcpLayers.push({ source: 'managed', ids: managedMcpIds });
+  mcpLayers.push({
+    source: 'system',
+    ids: selectedSystemMcpIds.filter((id) => !restrictedSystemIds.has(id)),
+  });
+  mcpLayers.push({
+    source: 'system',
+    ids: selectedSystemMcpIds.filter((id) => restrictedSystemIds.has(id)),
+    available: false,
+    unavailableReason: 'system_admin_only',
+  });
+  mcpLayers.push({ source: 'user', ids: selectedUserMcpIds });
   const mcpDisabled = policy.tools.mode !== 'inherit';
   const mcp = mergeLayers(mcpLayers, !mcpDisabled);
 
@@ -192,8 +242,15 @@ export function buildAgentCapabilityPreview(options: {
     );
   }
   if (mcp.conflicts.length > 0)
-    notes.push('同名 MCP 以 HappyClaw 系统附加配置为最终值。');
+    notes.push(
+      '同名 MCP 按宿主机 → 工作区 → 系统 MCP → 用户 MCP 的稳定顺序覆盖。',
+    );
   if (mcpDisabled) notes.push('当前工具边界会在执行时关闭所有外部 MCP。');
+  if (restrictedSystemIds.size > 0) {
+    notes.push(
+      `有 ${restrictedSystemIds.size} 个系统 MCP 仅限管理员，普通成员 Agent 不会继承。`,
+    );
+  }
 
   return {
     workspace: workspace

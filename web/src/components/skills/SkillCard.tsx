@@ -3,6 +3,11 @@ import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
 import type { Skill } from '../../stores/skills';
 import { useSkillsStore } from '../../stores/skills';
+import {
+  SKILL_SOURCE_LABELS,
+  isReadonlySkill,
+  skillConflictLabel,
+} from '../../utils/skill-sources';
 
 interface SkillCardProps {
   skill: Skill;
@@ -10,15 +15,10 @@ interface SkillCardProps {
   onSelect: () => void;
 }
 
-const SOURCE_LABELS: Record<Skill['source'], string> = {
-  user: '用户级',
-  project: '项目级',
-  external: '宿主机',
-};
-
 export function SkillCard({ skill, selected, onSelect }: SkillCardProps) {
   const toggleSkill = useSkillsStore((s) => s.toggleSkill);
-  const isReadonly = skill.source !== 'user';
+  const isReadonly = isReadonlySkill(skill);
+  const conflictLabel = skillConflictLabel(skill);
 
   return (
     <div
@@ -45,12 +45,24 @@ export function SkillCard({ skill, selected, onSelect }: SkillCardProps) {
                   : 'bg-muted text-muted-foreground'
               }`}
             >
-              {SOURCE_LABELS[skill.source]}
+              {SKILL_SOURCE_LABELS[skill.source]}
             </span>
             {skill.userInvocable && (
               <span className="px-2 py-0.5 rounded text-xs font-medium bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300">
                 可调用
               </span>
+            )}
+            {conflictLabel && (
+              <Badge
+                variant="outline"
+                className={
+                  skill.effective
+                    ? 'border-success/40 text-success'
+                    : 'border-warning/40 text-warning'
+                }
+              >
+                {conflictLabel}
+              </Badge>
             )}
           </div>
           <p className="text-sm text-muted-foreground line-clamp-2">
@@ -70,7 +82,7 @@ export function SkillCard({ skill, selected, onSelect }: SkillCardProps) {
           >
             <Lock size={16} className="text-muted-foreground" />
             <Badge variant="outline">
-              {skill.enabled ? '已启用' : '已停用'}
+              由{skill.source === 'external' ? '宿主机' : '系统'}管理
             </Badge>
           </div>
         )}

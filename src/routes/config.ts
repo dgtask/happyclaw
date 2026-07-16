@@ -28,9 +28,13 @@ import {
   getUserById,
   logAuthEvent,
   clearSenderAllowlist,
+  deleteWorkspaceSessions,
   deleteSessionsByProviderId,
   VALID_ACTIVATION_MODES,
+  getDefaultChannelAccount,
+  getLegacyChannelAccount,
 } from '../db.js';
+import { parseChannelAddress } from '../channel-address.js';
 import {
   adminRoleMiddleware,
   authMiddleware,
@@ -115,19 +119,21 @@ import { testFeishuCredentials } from '../feishu-connectivity.js';
 import {
   buildSessionMountUpdate,
   buildDetachedWorkspaceUpdate,
-  buildUnmountUpdate,
   buildWorkspaceMountUpdate,
   commitChannelMountUpdate,
-  findWorkspaceThreadMapConflict,
+  hasRemainingThreadMapMount,
   hasSessionMountConflict,
   hasWorkspaceMountConflict,
+  isNativeContextContainer,
+  restoreDefaultChannelMount,
+  type NativeContextMetadata,
 } from '../channel-mount-service.js';
-import { isThreadMapCapableChat } from '../im-channel-capabilities.js';
 import { checkImChannelLimit, isBillingEnabled } from '../billing.js';
 import { providerPool } from '../provider-pool.js';
 import { getClientIp } from '../utils.js';
 import {
   quiesceWorkspaceRunnersAroundCommit,
+  resolveEffectiveAgentProfile,
   withAgentProfileLocks,
   WorkspaceRuntimeQuiesceError,
 } from '../agent-profile-runtime.js';
@@ -968,13 +974,11 @@ function applyRegisteredGroupUpdate(
   }
 }
 
-function isThreadCapableFeishuGroup(info?: {
-  channel_type?: string;
-  chat_mode?: string;
-  group_message_type?: string;
-}): boolean {
-  return isThreadMapCapableChat(info);
-}
+type ChannelChatInfo = NativeContextMetadata & {
+  avatar?: string;
+  name?: string;
+  user_count?: string;
+};
 
 async function checkThreadCapableBinding(
   userId: string,
@@ -982,22 +986,19 @@ async function checkThreadCapableBinding(
   imGroup: RegisteredGroup,
 ): Promise<{
   threadCapable: boolean;
-  feishuInfo?: { chat_mode?: string; group_message_type?: string } | null;
+  chatInfo?: ChannelChatInfo | null;
 }> {
   const channelType = getChannelType(imJid);
-  if (channelType !== 'feishu') return { threadCapable: false };
+  if (!channelType) return { threadCapable: false };
   const webDeps = getWebDeps();
-  const feishuInfo = webDeps?.getFeishuChatInfo
-    ? await webDeps.getFeishuChatInfo(userId, extractChatId(imJid))
-    : null;
+  const chatInfo = webDeps?.getChannelChatInfo
+    ? ((await webDeps.getChannelChatInfo(imJid)) as ChannelChatInfo | null)
+    : channelType === 'feishu' && webDeps?.getFeishuChatInfo
+      ? await webDeps.getFeishuChatInfo(userId, extractChatId(imJid))
+      : null;
   return {
-    threadCapable: isThreadCapableFeishuGroup({
-      channel_type: 'feishu',
-      chat_mode: feishuInfo?.chat_mode ?? imGroup.feishu_chat_mode,
-      group_message_type:
-        feishuInfo?.group_message_type ?? imGroup.feishu_group_message_type,
-    }),
-    feishuInfo,
+    threadCapable: isNativeContextContainer(imJid, imGroup, chatInfo ?? {}),
+    chatInfo,
   };
 }
 
@@ -1017,15 +1018,43 @@ function resolveWorkspaceForBinding(
   return null;
 }
 
-function detachThreadMapWorkspace(targetMainJid?: string): void {
+function detachThreadMapWorkspaceIfLast(
+  targetMainJid: string | undefined,
+  excludingImJid: string,
+  nextWorkspaceJid?: string,
+  nextRoutingMode?: 'single_session' | 'thread_map',
+): void {
   if (!targetMainJid) return;
   const workspace = resolveWorkspaceForBinding(targetMainJid);
   if (!workspace) return;
+  const nextWorkspace =
+    nextRoutingMode === 'thread_map' && nextWorkspaceJid
+      ? resolveWorkspaceForBinding(nextWorkspaceJid)
+      : null;
+  if (nextWorkspace?.jid === workspace.jid) return;
+  if (hasRemainingThreadMapMount(workspace.jid, excludingImJid)) return;
 
   applyRegisteredGroupUpdate(
     workspace.jid,
     buildDetachedWorkspaceUpdate(workspace.group),
   );
+}
+
+function markNativeContextWorkspace(targetMainJid: string): void {
+  const workspace = resolveWorkspaceForBinding(targetMainJid);
+  if (!workspace) return;
+  applyRegisteredGroupUpdate(workspace.jid, {
+    ...workspace.group,
+    conversation_source: 'native_thread',
+    conversation_nav_mode: 'vertical_threads',
+  });
+}
+
+function restoreDefaultChannelError(restored: { reason: string }): string {
+  if (restored.reason === 'account_mismatch') {
+    return 'Channel account does not match this chat or owner';
+  }
+  return 'Channel account has no default or owner home workspace';
 }
 
 configRoutes.get('/feishu', authMiddleware, systemConfigMiddleware, (c) => {
@@ -1549,12 +1578,14 @@ configRoutes.put(
     }
 
     const before = toHostIntegrationResponse(getSystemSettings());
+    const mainContextSourceChanged =
+      validation.data.mainAgentContextSource !== undefined &&
+      validation.data.mainAgentContextSource !== before.mainAgentContextSource;
+    const externalClaudeDirChanged =
+      validation.data.externalClaudeDir !== undefined &&
+      validation.data.externalClaudeDir !== before.externalClaudeDir;
     const hostContextChanged =
-      (validation.data.mainAgentContextSource !== undefined &&
-        validation.data.mainAgentContextSource !==
-          before.mainAgentContextSource) ||
-      (validation.data.externalClaudeDir !== undefined &&
-        validation.data.externalClaudeDir !== before.externalClaudeDir);
+      mainContextSourceChanged || externalClaudeDirChanged;
     const defaultCompactChanged =
       (validation.data.mainAgentAutoCompactWindow !== undefined &&
         validation.data.mainAgentAutoCompactWindow !==
@@ -1564,25 +1595,48 @@ configRoutes.put(
           before.mainAgentAutoCompactPercentage);
     const contextMutationRequested =
       hostContextChanged || defaultCompactChanged;
-    const commit = () => saveSystemSettings(validation.data);
+    const workspaces = contextMutationRequested
+      ? Object.entries(getAllRegisteredGroups())
+          .map(([jid, group]) => ({
+            jid,
+            group,
+            profile: group.created_by
+              ? getAgentProfileForWorkspace(group.folder, group.created_by)
+              : undefined,
+          }))
+          .filter(({ group, profile }) => {
+            if (!group.created_by || !profile) return false;
+            const isActiveAdmin =
+              getUserById(group.created_by)?.role === 'admin';
+            const currentContextSource =
+              resolveEffectiveAgentProfile(profile)?.runtime_policy.context
+                .source ?? 'managed';
+            const nextContextSource = profile.is_default
+              ? (validation.data.mainAgentContextSource ??
+                before.mainAgentContextSource)
+              : profile.runtime_policy.context.source;
+            return (
+              (defaultCompactChanged && profile.is_default) ||
+              (mainContextSourceChanged &&
+                profile.is_default &&
+                isActiveAdmin) ||
+              (externalClaudeDirChanged &&
+                isActiveAdmin &&
+                (currentContextSource === 'host_claude' ||
+                  nextContextSource === 'host_claude'))
+            );
+          })
+      : [];
+    const sessionResetFolders = Array.from(
+      new Set(workspaces.map(({ group }) => group.folder)),
+    );
+    const commit = () => {
+      const value = saveSystemSettings(validation.data);
+      for (const folder of sessionResetFolders) deleteWorkspaceSessions(folder);
+      return value;
+    };
     let saved: ReturnType<typeof saveSystemSettings>;
     if (contextMutationRequested && deps) {
-      const workspaces = Object.entries(getAllRegisteredGroups())
-        .map(([jid, group]) => ({
-          jid,
-          group,
-          profile: group.created_by
-            ? getAgentProfileForWorkspace(group.folder, group.created_by)
-            : undefined,
-        }))
-        .filter(({ group, profile }) => {
-          if (!group.created_by || !profile) return false;
-          return (
-            (defaultCompactChanged && profile.is_default) ||
-            (hostContextChanged &&
-              getUserById(group.created_by)?.role === 'admin')
-          );
-        });
       const profileIds = Array.from(
         new Set(
           workspaces
@@ -2125,11 +2179,22 @@ configRoutes.get('/user-im/telegram/paired-chats', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const groups = (deps?.getRegisteredGroups() ?? {}) as Record<
     string,
-    { name: string; added_at: string; created_by?: string }
+    {
+      name: string;
+      added_at: string;
+      created_by?: string;
+      channel_account_id?: string | null;
+    }
   >;
+  const legacy = getLegacyChannelAccount(user.id, 'telegram');
   const chats: Array<{ jid: string; name: string; addedAt: string }> = [];
   for (const [jid, group] of Object.entries(groups)) {
-    if (jid.startsWith('telegram:') && group.created_by === user.id) {
+    const address = parseChannelAddress(jid);
+    if (
+      address?.provider === 'telegram' &&
+      group.created_by === user.id &&
+      (address.legacy || group.channel_account_id === legacy?.id)
+    ) {
       chats.push({ jid, name: group.name, addedAt: group.added_at });
     }
   }
@@ -2154,6 +2219,11 @@ configRoutes.delete(
       return c.json({ error: 'Chat not found' }, 404);
     }
     if (group.created_by !== user.id) {
+      return c.json({ error: 'Not authorized to remove this chat' }, 403);
+    }
+    const legacy = getLegacyChannelAccount(user.id, 'telegram');
+    const address = parseChannelAddress(jid);
+    if (!address?.legacy && group.channel_account_id !== legacy?.id) {
       return c.json({ error: 'Not authorized to remove this chat' }, 403);
     }
 
@@ -2390,11 +2460,22 @@ configRoutes.get('/user-im/qq/paired-chats', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const groups = (deps?.getRegisteredGroups() ?? {}) as Record<
     string,
-    { name: string; added_at: string; created_by?: string }
+    {
+      name: string;
+      added_at: string;
+      created_by?: string;
+      channel_account_id?: string | null;
+    }
   >;
+  const legacy = getLegacyChannelAccount(user.id, 'qq');
   const chats: Array<{ jid: string; name: string; addedAt: string }> = [];
   for (const [jid, group] of Object.entries(groups)) {
-    if (jid.startsWith('qq:') && group.created_by === user.id) {
+    const address = parseChannelAddress(jid);
+    if (
+      address?.provider === 'qq' &&
+      group.created_by === user.id &&
+      (address.legacy || group.channel_account_id === legacy?.id)
+    ) {
       chats.push({ jid, name: group.name, addedAt: group.added_at });
     }
   }
@@ -2416,6 +2497,11 @@ configRoutes.put('/user-im/qq/paired-chats/:jid', authMiddleware, async (c) => {
     return c.json({ error: 'Chat not found' }, 404);
   }
   if (group.created_by !== user.id) {
+    return c.json({ error: 'Not authorized to rename this chat' }, 403);
+  }
+  const legacy = getLegacyChannelAccount(user.id, 'qq');
+  const address = parseChannelAddress(jid);
+  if (!address?.legacy && group.channel_account_id !== legacy?.id) {
     return c.json({ error: 'Not authorized to rename this chat' }, 403);
   }
 
@@ -2453,6 +2539,11 @@ configRoutes.delete('/user-im/qq/paired-chats/:jid', authMiddleware, (c) => {
     return c.json({ error: 'Chat not found' }, 404);
   }
   if (group.created_by !== user.id) {
+    return c.json({ error: 'Not authorized to remove this chat' }, 403);
+  }
+  const legacy = getLegacyChannelAccount(user.id, 'qq');
+  const address = parseChannelAddress(jid);
+  if (!address?.legacy && group.channel_account_id !== legacy?.id) {
     return c.json({ error: 'Not authorized to remove this chat' }, 403);
   }
 
@@ -3238,7 +3329,13 @@ configRoutes.put('/user-im/whatsapp', authMiddleware, async (c) => {
 configRoutes.post('/user-im/whatsapp/logout', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
   const current = getUserWhatsAppConfig(user.id);
-  const accountId = current?.accountId || 'default';
+  // Compatibility facade: the first-class default account owns the actual
+  // Baileys connection/authDir. Never use the user-editable legacy label as
+  // an auth directory key.
+  const accountId =
+    getDefaultChannelAccount(user.id, 'whatsapp')?.id ??
+    current?.accountId ??
+    'default';
 
   if (deps?.logoutUserWhatsApp) {
     try {
@@ -3313,11 +3410,40 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   if (body.unbind === true) {
     const previousTargetMainJid = imGroup.target_main_jid;
     const wasThreadMap = imGroup.binding_mode === 'thread_map';
-    const updated: RegisteredGroup = buildUnmountUpdate(imGroup);
-    applyBindingUpdate(imJid, updated);
-    if (wasThreadMap) detachThreadMapWorkspace(previousTargetMainJid);
-    logger.info({ imJid, userId: user.id }, 'IM group unbound (bindings page)');
-    return c.json({ success: true });
+    const { chatInfo } = await checkThreadCapableBinding(
+      user.id,
+      imJid,
+      imGroup,
+    );
+    const restored = restoreDefaultChannelMount(
+      imJid,
+      imGroup,
+      user.id,
+      chatInfo ?? {},
+    );
+    if (restored.status !== 'resolved') {
+      return c.json({ error: restoreDefaultChannelError(restored) }, 409);
+    }
+    if (wasThreadMap) {
+      detachThreadMapWorkspaceIfLast(
+        previousTargetMainJid,
+        imJid,
+        restored.workspaceJid,
+        restored.routingMode,
+      );
+    }
+    if (restored.routingMode === 'thread_map') {
+      markNativeContextWorkspace(restored.workspaceJid);
+    }
+    logger.info(
+      {
+        imJid,
+        defaultWorkspaceJid: restored.workspaceJid,
+        userId: user.id,
+      },
+      'IM group restored to channel account default workspace (bindings page)',
+    );
+    return c.json({ success: true, target_main_jid: restored.workspaceJid });
   }
 
   const targetSessionId =
@@ -3340,6 +3466,12 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
         400,
       );
     }
+    if (!agent.chat_jid.startsWith('web:')) {
+      return c.json(
+        { error: 'Session target must belong to a workspace' },
+        400,
+      );
+    }
     // Check user can access the workspace that owns this session.
     const ownerGroup = getRegisteredGroup(agent.chat_jid);
     if (
@@ -3357,7 +3489,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       return c.json(
         {
           error:
-            'Feishu topic/thread groups can only bind to a workspace, not a single session',
+            'Native thread containers can only bind to a workspace, not a single session',
         },
         400,
       );
@@ -3379,6 +3511,9 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       },
     );
     applyBindingUpdate(imJid, updated);
+    if (imGroup.binding_mode === 'thread_map') {
+      detachThreadMapWorkspaceIfLast(imGroup.target_main_jid, imJid);
+    }
     logger.info(
       { imJid, sessionId, userId: user.id },
       'IM group bound to workspace session (bindings page)',
@@ -3408,6 +3543,9 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   // Bind to workspace main conversation
   if (typeof body.target_main_jid === 'string' && body.target_main_jid.trim()) {
     const targetMainJid = body.target_main_jid.trim();
+    if (!targetMainJid.startsWith('web:')) {
+      return c.json({ error: 'Target must be a workspace' }, 400);
+    }
     const targetGroup = getRegisteredGroup(targetMainJid);
     if (!targetGroup) {
       return c.json({ error: 'Target workspace not found' }, 404);
@@ -3415,7 +3553,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     if (!canModifyGroup(user, { ...targetGroup, jid: targetMainJid })) {
       return c.json({ error: 'Forbidden' }, 403);
     }
-    const { threadCapable, feishuInfo } = await checkThreadCapableBinding(
+    const { threadCapable, chatInfo } = await checkThreadCapableBinding(
       user.id,
       imJid,
       imGroup,
@@ -3432,31 +3570,6 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     if (hasConflict && !force) {
       return c.json({ error: 'IM group is already bound elsewhere' }, 409);
     }
-    if (targetGroup.conversation_source === 'feishu_thread' && !threadCapable) {
-      return c.json(
-        {
-          error:
-            'Topic workspaces only accept Feishu topic/thread group bindings',
-        },
-        400,
-      );
-    }
-
-    if (threadCapable) {
-      const currentThreadMap = findWorkspaceThreadMapConflict(
-        getAllRegisteredGroups(),
-        imJid,
-        targetMainJid,
-        legacyMainJid,
-      );
-      if (currentThreadMap) {
-        return c.json(
-          { error: 'Workspace already has a Feishu topic group binding' },
-          409,
-        );
-      }
-    }
-
     const updated: RegisteredGroup = {
       ...buildWorkspaceMountUpdate(
         imGroup,
@@ -3468,18 +3581,20 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
           ...(ownerImId !== undefined ? { ownerImId } : {}),
         },
       ),
-      feishu_chat_mode: feishuInfo?.chat_mode ?? imGroup.feishu_chat_mode,
+      feishu_chat_mode: chatInfo?.chat_mode ?? imGroup.feishu_chat_mode,
       feishu_group_message_type:
-        feishuInfo?.group_message_type ?? imGroup.feishu_group_message_type,
+        chatInfo?.group_message_type ?? imGroup.feishu_group_message_type,
     };
     applyBindingUpdate(imJid, updated);
-    if (threadCapable) {
-      applyRegisteredGroupUpdate(targetMainJid, {
-        ...targetGroup,
-        conversation_source: 'feishu_thread',
-        conversation_nav_mode: 'vertical_threads',
-      });
+    if (imGroup.binding_mode === 'thread_map') {
+      detachThreadMapWorkspaceIfLast(
+        imGroup.target_main_jid,
+        imJid,
+        targetMainJid,
+        threadCapable ? 'thread_map' : 'single_session',
+      );
     }
+    if (threadCapable) markNativeContextWorkspace(targetMainJid);
     logger.info(
       { imJid, targetMainJid, threadCapable, userId: user.id },
       'IM group bound to workspace (bindings page)',

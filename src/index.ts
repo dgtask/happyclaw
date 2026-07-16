@@ -73,6 +73,7 @@ import {
   deleteMessagesForChatJid,
   storeMessageDirect,
   updateLatestMessageTokenUsage,
+  rebuildMessageTokenUsageFromLedger,
   updateChatName,
   updateTask,
   createAgent,
@@ -96,30 +97,44 @@ import {
   getMessagesPage,
   cleanupOldDailyUsage,
   cleanupOldBillingAuditLog,
-  insertUsageRecord,
   getImContextBinding,
   upsertImContextBinding,
   touchImContextBindingActivity,
   updateAgentContextInfo,
   backfillEmptyAllowlistsForUser,
+  backfillEmptyAllowlistsForChannelAccount,
   getChannelMount,
   migrateAgentProfileAutoCompactWindow,
+  getChannelAccount,
+  listChannelAccountsForUser,
+  listEnabledChannelAccounts,
+  updateChannelAccountAuthStatus,
+  updateChannelAccountStatus,
 } from './db.js';
 import {
   buildSessionMountUpdate,
   buildDetachedWorkspaceUpdate,
-  buildUnmountUpdate,
+  buildNativeThreadWorkspaceUpdate,
   buildWorkspaceMountUpdate,
+  hasRemainingThreadMapMount,
   resolveChannelMountTarget,
+  restoreDefaultChannelMount,
+  upgradeNativeContextChannelMount,
 } from './channel-mount-service.js';
 import { isThreadMapCapableChat } from './im-channel-capabilities.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
+import { migrateLegacyWhatsAppAuthDir } from './whatsapp.js';
 import {
   getChannelType,
   extractChatId,
   type StreamingSession,
 } from './im-channel.js';
+import { parseChannelAddress } from './channel-address.js';
+import {
+  matchesChannelAccountAuthorization,
+  matchesChannelPairTarget,
+} from './channel-admission.js';
 import {
   registerStreamingSession,
   unregisterStreamingSession,
@@ -159,6 +174,24 @@ import { canSendCrossGroupMessage as canSendCrossGroupMessagePure } from './cros
 import { invalidateSessionCache, getWebDeps } from './web-context.js';
 import { resolveEffectiveAgentProfile } from './agent-profile-runtime.js';
 import {
+  loadChannelAccountSecret,
+  saveChannelAccountSecret,
+  type ChannelAccountSecret,
+} from './channel-account-secrets.js';
+import {
+  ensureLegacyDefaultChannelAccount,
+  syncDefaultChannelAccountCredentials,
+} from './channel-account-migration.js';
+import {
+  applyChannelAccountRegistrationFallback,
+  resolveChannelAccountFallbackWorkspace,
+} from './channel-account-routing.js';
+import { testChannelAccountCredentials } from './channel-account-connectivity.js';
+import {
+  buildAgentProfilePrompt,
+  hasAgentProfilePrompts,
+} from './agent-profile-prompts.js';
+import {
   getFeishuProviderConfigWithSource,
   getTelegramProviderConfig,
   getTelegramProviderConfigWithSource,
@@ -174,6 +207,7 @@ import {
   saveUserFeishuConfig,
   saveFeishuOwnerOpenId,
   saveUserTelegramConfig,
+  saveUserWeChatConfig,
   updateAllSessionCredentials,
 } from './runtime-config.js';
 import type {
@@ -195,23 +229,28 @@ import {
 import {
   checkBillingAccessFresh,
   formatBillingAccessDeniedMessage,
-  updateUsage,
-  deductUsageCost,
   checkAndExpireSubscriptions,
   isBillingEnabled,
   getUserConcurrentContainerLimit,
   reconcileMonthlyUsage,
 } from './billing.js';
+import { recordUsageEvent } from './usage-service.js';
 import {
   AgentStatus,
   AgentProfile,
-  FeishuMessageMeta,
+  ChannelMessageMeta,
   MessageCursor,
   NewMessage,
   RegisteredGroup,
   StreamEvent,
   SubAgent,
+  ChannelAccount,
 } from './types.js';
+import {
+  buildNativeThreadRouteJid,
+  resolveNativeThreadContext,
+  type NativeThreadContext,
+} from './channel-native-context.js';
 import { logger } from './logger.js';
 import { resolveTaskOwner } from './task-utils.js';
 import { checkOwnerActive } from './owner-gate.js';
@@ -1014,7 +1053,6 @@ const RELATIVE_IMAGE_EXTENSIONS = new Set([
   '.bmp',
   '.svg',
 ]);
-const FEISHU_THREAD_TITLE_MAX_LEN = 48;
 
 /**
  * Resolve the IM JID that send_image / send_file / other media MCP tools
@@ -1042,8 +1080,12 @@ function resolveImRoute(opts: {
   return isHome ? (imFromGroup ?? imFromJid) : (imFromJid ?? imFromGroup);
 }
 
-function detachThreadMapWorkspace(targetMainJid?: string): void {
+function detachThreadMapWorkspace(
+  targetMainJid?: string,
+  excludingImJid?: string,
+): void {
   if (!targetMainJid) return;
+  if (hasRemainingThreadMapMount(targetMainJid, excludingImJid)) return;
   const workspaceJid = resolveWorkspaceJid(targetMainJid);
   if (!workspaceJid) return;
   const workspace =
@@ -1055,23 +1097,54 @@ function detachThreadMapWorkspace(targetMainJid?: string): void {
   registeredGroups[workspaceJid] = updatedWorkspace;
 }
 
-/** Unbind an IM group from its conversation agent or main conversation, syncing DB + in-memory cache + failure counters. */
-function unbindImGroup(jid: string, reason: string): void {
+function markThreadMapWorkspace(targetMainJid?: string): void {
+  if (!targetMainJid) return;
+  const workspaceJid = resolveWorkspaceJid(targetMainJid);
+  if (!workspaceJid) return;
+  const workspace =
+    registeredGroups[workspaceJid] ?? getRegisteredGroup(workspaceJid);
+  if (!workspace) return;
+  const updatedWorkspace = buildNativeThreadWorkspaceUpdate(workspace);
+  if (
+    updatedWorkspace.conversation_source === workspace.conversation_source &&
+    updatedWorkspace.conversation_nav_mode === workspace.conversation_nav_mode
+  ) {
+    return;
+  }
+  setRegisteredGroup(workspaceJid, updatedWorkspace);
+  registeredGroups[workspaceJid] = updatedWorkspace;
+}
+
+/** Restore an authorized chat to its channel account's default workspace. */
+function unbindImGroup(jid: string, reason: string): boolean {
   const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
-  if (!group?.target_agent_id && !group?.target_main_jid) return;
+  if (!group) return false;
   const agentId = group.target_agent_id;
   const targetMainJid = group.target_main_jid;
   const wasThreadMap = group.binding_mode === 'thread_map';
-  const updated = {
-    ...buildUnmountUpdate(group),
-    reply_policy: 'source_only' as const,
-  };
-  setRegisteredGroup(jid, updated);
-  registeredGroups[jid] = updated;
-  if (wasThreadMap) detachThreadMapWorkspace(targetMainJid);
+  const restored = restoreDefaultChannelMount(jid, group, group.created_by);
+  if (restored.status !== 'resolved') {
+    logger.warn({ jid, reason: restored.reason }, `${reason}: restore failed`);
+    return false;
+  }
+  registeredGroups[jid] = restored.updated;
+  if (restored.routingMode === 'thread_map') {
+    markThreadMapWorkspace(restored.workspaceJid);
+  }
+  if (
+    wasThreadMap &&
+    (restored.routingMode !== 'thread_map' ||
+      resolveWorkspaceJid(targetMainJid || '') !== restored.workspaceJid)
+  ) {
+    detachThreadMapWorkspace(targetMainJid, jid);
+  }
   imSendFailCounts.delete(jid);
   imHealthCheckFailCounts.delete(jid);
-  logger.info({ jid, agentId, targetMainJid }, reason);
+  logger.info(
+    { jid, agentId, targetMainJid, restoredWorkspace: restored.workspaceJid },
+    reason,
+  );
+  return true;
 }
 
 /**
@@ -1085,11 +1158,13 @@ function unbindImGroup(jid: string, reason: string): void {
 export function removeImGroupRecord(jid: string, reason: string): void {
   const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
   if (!group) return;
-  if (group.binding_mode === 'thread_map') {
-    detachThreadMapWorkspace(group.target_main_jid);
-  }
+  const detachedThreadTarget =
+    group.binding_mode === 'thread_map' ? group.target_main_jid : undefined;
   deleteImGroupRecord(jid);
   delete registeredGroups[jid];
+  if (detachedThreadTarget) {
+    detachThreadMapWorkspace(detachedThreadTarget, jid);
+  }
   imSendFailCounts.delete(jid);
   imHealthCheckFailCounts.delete(jid);
   logger.info(
@@ -1228,8 +1303,8 @@ function toContainerAgentProfile(
     name: profile.name,
     version: profile.version,
     identityHash: profile.identity_hash,
-    identityPrompt: profile.identity_prompt,
-    includeClaudePreset: profile.include_claude_preset,
+    identityPrompt: buildAgentProfilePrompt(profile),
+    includeClaudePreset: profile.prompt_mode === 'append',
     runtimePolicy: profile.runtime_policy,
   };
 }
@@ -1247,8 +1322,8 @@ function hasSessionAgentProfileMismatch(
     !current.agent_profile_id && !current.identity_hash;
   if (
     hasLegacyUntrackedIdentity &&
-    profile.identity_prompt.trim() === '' &&
-    profile.include_claude_preset
+    !hasAgentProfilePrompts(profile) &&
+    profile.prompt_mode === 'append'
   ) {
     return false;
   }
@@ -1313,7 +1388,9 @@ function writeUsageRecords(opts: {
   groupFolder: string;
   messageId?: string;
   agentId?: string;
+  source?: string;
   usage: {
+    eventId?: string;
     inputTokens: number;
     outputTokens: number;
     cacheReadInputTokens: number;
@@ -1333,43 +1410,16 @@ function writeUsageRecords(opts: {
     >;
   };
 }): void {
-  const { userId, groupFolder, messageId, agentId, usage } = opts;
-  if (usage.modelUsage) {
-    const models = Object.entries(usage.modelUsage);
-    for (const [model, mu] of models) {
-      insertUsageRecord({
-        userId,
-        groupFolder,
-        agentId,
-        messageId,
-        model,
-        inputTokens: mu.inputTokens,
-        outputTokens: mu.outputTokens,
-        cacheReadInputTokens: mu.cacheReadInputTokens || 0,
-        cacheCreationInputTokens: mu.cacheCreationInputTokens || 0,
-        costUSD: mu.costUSD,
-        durationMs: usage.durationMs,
-        numTurns: usage.numTurns,
-        source: 'agent',
-      });
-    }
-  } else {
-    insertUsageRecord({
-      userId,
-      groupFolder,
-      agentId,
-      messageId,
-      model: 'unknown',
-      inputTokens: usage.inputTokens,
-      outputTokens: usage.outputTokens,
-      cacheReadInputTokens: usage.cacheReadInputTokens,
-      cacheCreationInputTokens: usage.cacheCreationInputTokens,
-      costUSD: usage.costUSD,
-      durationMs: usage.durationMs,
-      numTurns: usage.numTurns,
-      source: 'agent',
-    });
-  }
+  const { userId, groupFolder, messageId, agentId, source, usage } = opts;
+  recordUsageEvent({
+    userId,
+    groupFolder,
+    agentId,
+    messageId,
+    eventId: usage.eventId,
+    source: source || (agentId ? 'custom-agent' : 'main-agent'),
+    usage,
+  });
 }
 
 /**
@@ -2065,10 +2115,10 @@ function handleWhereCommand(chatJid: string): string {
 function handleUnbindCommand(chatJid: string): string {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '当前 IM 未绑定工作区';
-  if (!group.target_agent_id && !group.target_main_jid)
-    return '当前聊天没有额外绑定，已在默认工作区。';
-  unbindImGroup(chatJid, 'IM slash command unbind');
-  return '已解绑，后续消息将回到该聊天自己的默认工作区。';
+  if (!unbindImGroup(chatJid, 'IM slash command restore default')) {
+    return '无法恢复 Bot 默认工作区，已保留当前绑定。请检查渠道账号的默认工作区设置。';
+  }
+  return '已恢复 Bot 默认工作区。';
 }
 
 function handleBindCommand(chatJid: string, rawSpec: string): string {
@@ -2111,6 +2161,9 @@ function handleBindCommand(chatJid: string, rawSpec: string): string {
       );
   setRegisteredGroup(chatJid, updated);
   registeredGroups[chatJid] = updated;
+  if (updated.binding_mode === 'thread_map') {
+    markThreadMapWorkspace(updated.target_main_jid);
+  }
   imSendFailCounts.delete(chatJid);
   imHealthCheckFailCounts.delete(chatJid);
   return `已切换到 ${resolved.display}\n🔁 回复策略: source_only`;
@@ -2157,13 +2210,7 @@ async function handleNewCommand(
     updated = buildWorkspaceMountUpdate(group, newJid, 'thread_map', {
       replyPolicy: 'source_only',
     });
-    const topicWorkspace = {
-      ...newGroup,
-      conversation_source: 'feishu_thread' as const,
-      conversation_nav_mode: 'vertical_threads' as const,
-    };
-    setRegisteredGroup(newJid, topicWorkspace);
-    registeredGroups[newJid] = topicWorkspace;
+    markThreadMapWorkspace(newJid);
     targetLabel = '工作区';
   } else {
     const created = createAutoImConversationAgent({
@@ -3146,14 +3193,39 @@ async function syncGroupMetadata(force = false): Promise<void> {
     }
   }
 
-  // Sync groups via any connected user's Feishu instance
+  // Every Feishu bot has its own visible group set. Sync all connected
+  // account-scoped sockets; stopping after the first/default bot leaves stale
+  // metadata for every secondary account.
   const connectedUserIds = imManager.getConnectedUserIds();
   for (const uid of connectedUserIds) {
-    if (imManager.isFeishuConnected(uid)) {
-      await imManager.syncFeishuGroups(uid);
-      break; // Only need one sync
+    for (const accountId of imManager.getConnectedChannelAccountIds(
+      uid,
+      'feishu',
+    )) {
+      try {
+        await imManager.syncFeishuGroups(uid, accountId);
+      } catch (error) {
+        logger.warn(
+          { error, uid, accountId },
+          'Feishu account group sync failed; continuing',
+        );
+      }
     }
   }
+}
+
+let feishuSyncInterval: ReturnType<typeof setInterval> | null = null;
+
+function ensureFeishuSyncScheduler(): void {
+  if (feishuSyncInterval) return;
+  syncGroupMetadata().catch((err) =>
+    logger.error({ err }, 'Initial Feishu group sync failed'),
+  );
+  feishuSyncInterval = setInterval(() => {
+    syncGroupMetadata().catch((err) =>
+      logger.error({ err }, 'Periodic group sync failed'),
+    );
+  }, GROUP_SYNC_INTERVAL_MS);
 }
 
 /**
@@ -4131,20 +4203,30 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             // Persist token usage to the latest agent message + usage_records
             if (se.eventType === 'usage' && se.usage) {
               try {
-                updateLatestMessageTokenUsage(
-                  chatJid,
-                  JSON.stringify(se.usage),
-                  lastReplyMsgId,
-                  se.usage.costUSD,
-                );
-
-                // Write to usage_records + usage_daily_summary
                 writeUsageRecords({
-                  userId: effectiveGroup.created_by || 'system',
+                  userId:
+                    effectiveGroup.created_by ||
+                    registeredGroups[chatJid]?.created_by ||
+                    'system',
                   groupFolder: effectiveGroup.folder,
                   messageId: lastReplyMsgId,
+                  source: chatJid.split(':', 1)[0] || 'unknown',
                   usage: se.usage,
                 });
+                if (lastReplyMsgId) {
+                  rebuildMessageTokenUsageFromLedger(
+                    chatJid,
+                    effectiveGroup.folder,
+                    lastReplyMsgId,
+                  );
+                } else {
+                  updateLatestMessageTokenUsage(
+                    chatJid,
+                    JSON.stringify(se.usage),
+                    undefined,
+                    se.usage.costUSD,
+                  );
+                }
 
                 logger.debug(
                   {
@@ -4156,40 +4238,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   'Token usage persisted',
                 );
 
-                // Update billing monthly usage
-                const ownerGroup = registeredGroups[chatJid];
-                if (ownerGroup?.created_by && se.usage.costUSD) {
-                  try {
-                    const effective = updateUsage(
-                      ownerGroup.created_by,
-                      se.usage.costUSD,
-                      se.usage.inputTokens || 0,
-                      se.usage.outputTokens || 0,
+                // recordUsageEvent updates analytics, token quotas and balance
+                // for both paid and zero-cost runs. Only the realtime UI push
+                // remains here.
+                const ownerId =
+                  effectiveGroup.created_by ||
+                  registeredGroups[chatJid]?.created_by;
+                if (ownerId) {
+                  const owner = getUserById(ownerId);
+                  if (owner && owner.role !== 'admin') {
+                    const freshAccess = checkBillingAccessFresh(
+                      ownerId,
+                      owner.role,
                     );
-                    deductUsageCost(
-                      ownerGroup.created_by,
-                      se.usage.costUSD,
-                      lastReplyMsgId || chatJid,
-                      effective,
-                    );
-                    // Broadcast real-time billing update to the user
-                    const owner = getUserById(ownerGroup.created_by);
-                    if (owner && owner.role !== 'admin') {
-                      const freshAccess = checkBillingAccessFresh(
-                        ownerGroup.created_by,
-                        owner.role,
-                      );
-                      if (freshAccess.usage) {
-                        broadcastBillingUpdate(ownerGroup.created_by, {
-                          ...freshAccess,
-                        });
-                      }
+                    if (freshAccess.usage) {
+                      broadcastBillingUpdate(ownerId, { ...freshAccess });
                     }
-                  } catch (billingErr) {
-                    logger.warn(
-                      { err: billingErr, chatJid },
-                      'Failed to update billing usage',
-                    );
                   }
                 }
               } catch (err) {
@@ -7971,13 +8035,6 @@ async function processAgentConversation(
         output.streamEvent.usage
       ) {
         try {
-          updateLatestMessageTokenUsage(
-            virtualChatJid,
-            JSON.stringify(output.streamEvent.usage),
-            lastAgentReplyMsgId,
-          );
-
-          // Write to usage_records + usage_daily_summary
           // Sub-Agent 的 effectiveGroup 可能没有 created_by，从父群组继承
           writeUsageRecords({
             userId:
@@ -7987,8 +8044,23 @@ async function processAgentConversation(
             groupFolder: effectiveGroup.folder,
             agentId,
             messageId: lastAgentReplyMsgId,
+            source: chatJid.split(':', 1)[0] || 'unknown',
             usage: output.streamEvent.usage,
           });
+          if (lastAgentReplyMsgId) {
+            rebuildMessageTokenUsageFromLedger(
+              virtualChatJid,
+              effectiveGroup.folder,
+              lastAgentReplyMsgId,
+            );
+          } else {
+            updateLatestMessageTokenUsage(
+              virtualChatJid,
+              JSON.stringify(output.streamEvent.usage),
+              undefined,
+              output.streamEvent.usage.costUSD,
+            );
+          }
         } catch (err) {
           logger.warn(
             { err, chatJid, agentId },
@@ -9741,10 +9813,45 @@ function buildFeishuBotAddedHandler(
   };
 }
 
-function buildIsChatAuthorized(userId: string): (jid: string) => boolean {
+function buildIsChatAuthorized(
+  userId: string,
+  expectedAccountId?: string,
+  allowLegacyUnscoped = false,
+): (jid: string) => boolean {
   return (jid) => {
-    const group = registeredGroups[jid];
-    return !!group && group.created_by === userId;
+    const parsed = parseChannelAddress(jid);
+    const scopedAccountId = parsed?.channelAccountId;
+    const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
+    if (!group) return false;
+
+    if (expectedAccountId) {
+      const account = getChannelAccount(expectedAccountId);
+      return matchesChannelAccountAuthorization({
+        scopedAccountId,
+        groupOwnerUserId: group.created_by,
+        groupAccountId: group.channel_account_id,
+        userId,
+        expectedAccountId,
+        expectedAccountOwnerUserId: account?.owner_user_id,
+        expectedAccountIsLegacyDefault: account?.is_legacy_default,
+        allowLegacyUnscoped,
+      });
+    }
+
+    // Compatibility-only direct connectors never accept an account-scoped JID.
+    // If a historical row already names an account, it must be this user's
+    // projected legacy default rather than an arbitrary first-class bot.
+    const account = group.channel_account_id
+      ? getChannelAccount(group.channel_account_id)
+      : undefined;
+    return matchesChannelAccountAuthorization({
+      scopedAccountId,
+      groupOwnerUserId: group.created_by,
+      groupAccountId: group.channel_account_id,
+      userId,
+      expectedAccountOwnerUserId: account?.owner_user_id,
+      expectedAccountIsLegacyDefault: account?.is_legacy_default,
+    });
   };
 }
 
@@ -9769,55 +9876,79 @@ function resolveWorkspaceJid(targetMainJid: string): string | null {
     : null;
 }
 
-function buildFeishuThreadRouteJid(
-  chatJid: string,
-  threadId: string,
-  rootMessageId: string,
-): string {
-  return `feishu:${extractChatId(chatJid)}#thread:${threadId}#root:${rootMessageId}`;
-}
-
-function summarizeFeishuThreadTitle(text?: string): string {
-  const firstLine = (text || '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find(Boolean);
-  const normalized = (firstLine || '飞书话题').replace(/\s+/g, ' ').trim();
-  if (normalized.length <= FEISHU_THREAD_TITLE_MAX_LEN) return normalized;
-  return `${normalized.slice(0, FEISHU_THREAD_TITLE_MAX_LEN - 1)}…`;
-}
-
 function buildOnPairAttempt(
   userId: string,
+  accountId?: string,
+  defaultWorkspaceJid?: string,
+  allowLegacyUnscopedCode = false,
 ): (jid: string, chatName: string, code: string) => Promise<boolean> {
   return async (jid, chatName, code) => {
     const result = verifyPairingCode(code);
     if (!result) return false;
     if (result.userId !== userId) return false;
+    if (result.accountId) {
+      if (result.accountId !== accountId) return false;
+    } else if (accountId && !allowLegacyUnscopedCode) {
+      return false;
+    }
+    const parsed = parseChannelAddress(jid);
+    if (accountId) {
+      const account = getChannelAccount(accountId);
+      if (!account || account.owner_user_id !== userId) return false;
+    }
+    const existingGroup = registeredGroups[jid] ?? getRegisteredGroup(jid);
+    if (
+      !matchesChannelPairTarget({
+        scopedAccountId: parsed?.channelAccountId,
+        existingGroupAccountId: existingGroup?.channel_account_id,
+        expectedAccountId: accountId,
+        allowLegacyUnscoped: allowLegacyUnscopedCode,
+      })
+    ) {
+      return false;
+    }
     const pairingUserHome = getUserHomeGroup(result.userId);
     if (!pairingUserHome) return false;
     buildOnNewChat(result.userId, pairingUserHome.folder)(jid, chatName);
+    const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
+    if (group) {
+      const fallbackWorkspaceJid = defaultWorkspaceJid ?? pairingUserHome.jid;
+      const updated = accountId
+        ? applyChannelAccountRegistrationFallback(
+            group,
+            accountId,
+            fallbackWorkspaceJid,
+          )
+        : {
+            ...group,
+            ...(group.target_main_jid || group.target_agent_id
+              ? {}
+              : { target_main_jid: fallbackWorkspaceJid }),
+          };
+      setRegisteredGroup(jid, updated);
+      registeredGroups[jid] = updated;
+    }
     return true;
   };
 }
 
 /**
- * Resolve or create a conversation agent for a Feishu thread.
+ * Resolve or create a conversation session for a provider-native thread.
  * Creates the agent + binding on first message; updates activity on subsequent messages.
  * Side effects: DB writes, WS broadcasts, directory creation.
  */
-function resolveOrCreateThreadAgent(
+function resolveOrCreateNativeThreadAgent(
   chatJid: string,
   workspaceJid: string,
   workspace: RegisteredGroup,
   group: RegisteredGroup,
-  messageMeta: FeishuMessageMeta & { threadId: string },
+  nativeContext: NativeThreadContext,
 ): { effectiveJid: string; agentId: string; sourceJid: string } {
   const now = new Date().toISOString();
-  const threadId = messageMeta.threadId;
-  const rootMessageId = messageMeta.rootId || threadId;
-  const routeJid = buildFeishuThreadRouteJid(chatJid, threadId, rootMessageId);
-  const nextTitle = summarizeFeishuThreadTitle(messageMeta.text);
+  const threadId = nativeContext.contextId;
+  const rootMessageId = nativeContext.rootMessageId;
+  const routeJid = buildNativeThreadRouteJid(chatJid, threadId, rootMessageId);
+  const nextTitle = nativeContext.title;
   let binding = getImContextBinding(chatJid, 'thread', threadId);
   let agent =
     binding?.agent_id != null ? getAgent(binding.agent_id) : undefined;
@@ -9839,10 +9970,10 @@ function resolveOrCreateThreadAgent(
       result_summary: null,
       last_im_jid: routeJid,
       spawned_from_jid: null,
-      source_kind: 'feishu_thread',
+      source_kind: 'native_thread',
       thread_id: threadId,
       root_message_id: rootMessageId,
-      title_source: 'feishu_root',
+      title_source: 'native_root',
       last_active_at: now,
     };
     createAgent(newAgent);
@@ -9907,6 +10038,58 @@ function resolveOrCreateThreadAgent(
   };
 }
 
+function ensureNativeContextChannelMount(
+  chatJid: string,
+  group: RegisteredGroup,
+): RegisteredGroup | null {
+  const detectedGroup: RegisteredGroup = {
+    ...group,
+    native_context_type: 'thread',
+  };
+  const upgrade = upgradeNativeContextChannelMount(chatJid, detectedGroup);
+  if (upgrade.status === 'conflict') {
+    // Persist capability detection for diagnostics/UI while retaining the
+    // prior binding. Returning null is the fail-closed routing signal.
+    setRegisteredGroup(chatJid, detectedGroup);
+    registeredGroups[chatJid] = detectedGroup;
+    logger.error(
+      {
+        chatJid,
+        reason: upgrade.reason,
+        conflictingJid:
+          'conflictingJid' in upgrade ? upgrade.conflictingJid : undefined,
+      },
+      'Native-context channel mount upgrade rejected; dropping message',
+    );
+    return null;
+  }
+
+  let updated = upgrade.updated;
+  if (
+    (upgrade.status === 'unchanged' &&
+      group.native_context_type !== 'thread') ||
+    updated.native_context_type !== 'thread'
+  ) {
+    updated = { ...updated, native_context_type: 'thread' };
+    setRegisteredGroup(chatJid, updated);
+  }
+  registeredGroups[chatJid] = updated;
+  markThreadMapWorkspace(updated.target_main_jid);
+  return updated;
+}
+
+function buildOnNativeContextDetected(): (
+  chatJid: string,
+  contextType: 'thread',
+) => boolean {
+  return (chatJid, contextType) => {
+    if (contextType !== 'thread') return false;
+    const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+    if (!group) return false;
+    return ensureNativeContextChannelMount(chatJid, group) !== null;
+  };
+}
+
 /**
  * Build callback that resolves an IM chatJid to a bound target JID.
  * Supports both conversation agent binding (target_agent_id) and
@@ -9915,17 +10098,30 @@ function resolveOrCreateThreadAgent(
  */
 function buildResolveEffectiveChatJid(): (
   chatJid: string,
-  messageMeta?: FeishuMessageMeta,
+  messageMeta?: ChannelMessageMeta,
 ) => {
   effectiveJid: string;
   agentId: string | null;
   sourceJid?: string;
 } | null {
   return (chatJid: string, messageMeta) => {
-    const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+    let group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
     if (!group) {
       logger.debug({ chatJid }, 'resolveEffectiveChatJid: group not found');
       return null;
+    }
+
+    const nativeThread = resolveNativeThreadContext(messageMeta);
+    const nativeThreadDetected =
+      !!nativeThread &&
+      (messageMeta?.nativeContextType === 'thread' ||
+        (getChannelType(chatJid) === 'telegram' && !!messageMeta?.threadId) ||
+        (getChannelType(chatJid) === 'feishu' &&
+          group.feishu_chat_mode === 'topic'));
+    if (nativeThreadDetected) {
+      const upgraded = ensureNativeContextChannelMount(chatJid, group);
+      if (!upgraded) return null;
+      group = upgraded;
     }
 
     const mount = getChannelMount(chatJid);
@@ -9960,21 +10156,13 @@ function buildResolveEffectiveChatJid(): (
         };
       }
 
-      if (
-        mount.routing_mode === 'thread_map' &&
-        getChannelType(chatJid) === 'feishu' &&
-        messageMeta &&
-        (messageMeta?.threadId || messageMeta?.rootId || messageMeta?.messageId)
-      ) {
-        const threadContextId =
-          messageMeta.threadId || messageMeta.rootId || messageMeta.messageId;
-        if (!threadContextId) return null;
-        return resolveOrCreateThreadAgent(
+      if (mount.routing_mode === 'thread_map' && nativeThread) {
+        return resolveOrCreateNativeThreadAgent(
           chatJid,
           mountedTarget.workspaceJid,
           mountedTarget.workspace,
           group,
-          { ...messageMeta, threadId: threadContextId },
+          nativeThread,
         );
       }
 
@@ -10001,13 +10189,8 @@ function buildResolveEffectiveChatJid(): (
     if (
       group.binding_mode === 'thread_map' &&
       group.target_main_jid &&
-      getChannelType(chatJid) === 'feishu' &&
-      messageMeta &&
-      (messageMeta?.threadId || messageMeta?.rootId || messageMeta?.messageId)
+      nativeThread
     ) {
-      const threadContextId =
-        messageMeta.threadId || messageMeta.rootId || messageMeta.messageId;
-      if (!threadContextId) return null;
       const workspaceJid = resolveWorkspaceJid(group.target_main_jid);
       if (!workspaceJid) {
         logger.warn(
@@ -10020,12 +10203,12 @@ function buildResolveEffectiveChatJid(): (
         registeredGroups[workspaceJid] ?? getRegisteredGroup(workspaceJid);
       if (!workspace) return null;
 
-      return resolveOrCreateThreadAgent(
+      return resolveOrCreateNativeThreadAgent(
         chatJid,
         workspaceJid,
         workspace,
         group,
-        { ...messageMeta, threadId: threadContextId },
+        nativeThread,
       );
     }
 
@@ -10249,209 +10432,514 @@ function handleCardInterrupt(chatJid: string): void {
   }
 }
 
-/**
- * Connect IM channels for a specific user via imManager.
- * Reads the user's IM config and connects if enabled.
- */
-async function connectUserIMChannels(
-  userId: string,
-  homeFolder: string,
-  feishuConfig?: FeishuConnectConfig | null,
-  telegramConfig?: TelegramConnectConfig | null,
-  qqConfig?: QQConnectConfig | null,
-  wechatConfig?: WeChatConnectConfig | null,
-  dingtalkConfig?: DingTalkConnectConfig | null,
-  discordConfig?: DiscordConnectConfig | null,
-  whatsappConfig?: WhatsAppConnectConfig | null,
-  ignoreMessagesBefore?: number,
-): Promise<{
-  feishu: boolean;
-  telegram: boolean;
-  qq: boolean;
-  wechat: boolean;
-  dingtalk: boolean;
-  discord: boolean;
-  whatsapp: boolean;
-}> {
-  // Per-user mutable ref for Feishu owner open_id auto-detection via P2P messages
-  const feishuOwnerRef = {
-    value: feishuConfig
-      ? (getUserFeishuConfig(userId)?.ownerOpenId ?? undefined)
+function resolveChannelAccountWorkspace(account: ChannelAccount): {
+  jid: string;
+  folder: string;
+} | null {
+  return resolveChannelAccountFallbackWorkspace(account, {
+    getGroup: getRegisteredGroup,
+    getHome: getUserHomeGroup,
+  });
+}
+
+async function disconnectChannelAccountById(accountId: string): Promise<void> {
+  const account = getChannelAccount(accountId);
+  if (!account) return;
+  await imManager.disconnectUserChannelAccount(
+    account.owner_user_id,
+    account.provider,
+    account.id,
+  );
+  updateChannelAccountStatus(account.id, 'disconnected');
+}
+
+async function reloadChannelAccountById(accountId: string): Promise<boolean> {
+  const account = getChannelAccount(accountId);
+  if (!account) return false;
+  await imManager.disconnectUserChannelAccount(
+    account.owner_user_id,
+    account.provider,
+    account.id,
+  );
+  if (!account.enabled) {
+    updateChannelAccountStatus(account.id, 'disconnected');
+    return false;
+  }
+  const secret = loadChannelAccountSecret(account.secret_ref);
+  const workspace = resolveChannelAccountWorkspace(account);
+  if (!secret || !workspace) {
+    updateChannelAccountStatus(
+      account.id,
+      'error',
+      !secret ? 'Credentials are missing' : 'Default workspace is missing',
+    );
+    return false;
+  }
+
+  updateChannelAccountStatus(account.id, 'connecting');
+  const baseOnNewChat = buildOnNewChat(
+    account.owner_user_id,
+    workspace.folder,
+    account.provider === 'feishu'
+      ? () => secret.ownerOpenId || undefined
       : undefined,
-  };
-  const getFeishuOwnerOpenId = () => feishuOwnerRef.value;
-  const onFeishuP2pSender = (senderOpenId: string) =>
-    learnFeishuOwner(userId, senderOpenId, feishuOwnerRef);
-
-  // Feishu-specific closure: writes the Feishu open_id into owner_im_id when
-  // registering new chats. The non-Feishu variant omits getOwnerOpenId so that
-  // telegram / qq / wechat / dingtalk / discord / whatsapp groups don't get
-  // contaminated with a Feishu open_id that will never match their senders.
-  const feishuOnNewChat = buildOnNewChat(
-    userId,
-    homeFolder,
-    getFeishuOwnerOpenId,
   );
-  const onNewChat = buildOnNewChat(userId, homeFolder);
-  const resolveGroupFolder = (chatJid: string): string | undefined => {
-    return resolveEffectiveFolder(chatJid);
+  const onNewChat = (jid: string, name: string) => {
+    baseOnNewChat(jid, name);
+    const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
+    if (!group) return;
+    const updated = applyChannelAccountRegistrationFallback(
+      group,
+      account.id,
+      workspace.jid,
+    );
+    setRegisteredGroup(jid, updated);
+    registeredGroups[jid] = updated;
   };
-  const resolveEffectiveChatJid = buildResolveEffectiveChatJid();
-  const onAgentMessage = buildOnAgentMessage();
-  // Feishu-specific: writes Feishu open_id as owner_im_id + locks allowlist.
-  // Non-Feishu variant omits getOwnerOpenId so dingtalk/discord/whatsapp groups
-  // don't get a Feishu open_id baked in as their owner (which would never match
-  // their own senderImId namespaces).
-  const feishuOnBotAddedToGroup = buildFeishuBotAddedHandler(
-    userId,
-    homeFolder,
-    getFeishuOwnerOpenId,
-  );
-  const onBotAddedToGroup = buildFeishuBotAddedHandler(userId, homeFolder);
-  const onBotRemovedFromGroup = buildOnBotRemovedFromGroup();
+  const common = {
+    accountId: account.id,
+    scopeIncomingJids: !account.is_legacy_default,
+    ignoreMessagesBefore: Date.now(),
+    onCommand: handleCommand,
+    resolveGroupFolder: (jid: string) => resolveEffectiveFolder(jid),
+    resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
+    onAgentMessage: buildOnAgentMessage(),
+    onNativeContextDetected: buildOnNativeContextDetected(),
+    onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
+  };
 
-  // 各渠道互相独立，并发连接避免启动时延 N×M 累加
-  const feishuTask =
-    feishuConfig &&
-    feishuConfig.enabled !== false &&
-    feishuConfig.appId &&
-    feishuConfig.appSecret
-      ? imManager.connectUserFeishu(userId, feishuConfig, feishuOnNewChat, {
-          ignoreMessagesBefore,
-          onCommand: handleCommand,
-          resolveGroupFolder,
-          resolveEffectiveChatJid,
-          onAgentMessage,
-          onBotAddedToGroup: feishuOnBotAddedToGroup,
-          onBotRemovedFromGroup,
+  try {
+    let connected = false;
+    if (account.provider === 'feishu') {
+      connected = await imManager.connectUserFeishu(
+        account.owner_user_id,
+        {
+          appId: secret.appId || '',
+          appSecret: secret.appSecret || '',
+          enabled: true,
+        },
+        onNewChat,
+        {
+          ...common,
+          onBotAddedToGroup: onNewChat,
           shouldProcessGroupMessage,
           isGroupOwnerMessage,
           isSenderAllowedInGroup,
           onCardInterrupt: handleCardInterrupt,
-          onP2pSender: onFeishuP2pSender,
-        })
-      : Promise.resolve(false);
-
-  const telegramTask =
-    telegramConfig &&
-    telegramConfig.enabled !== false &&
-    telegramConfig.botToken
-      ? imManager.connectUserTelegram(
-          userId,
-          telegramConfig,
-          onNewChat,
-          buildIsChatAuthorized(userId),
-          buildOnPairAttempt(userId),
-          {
-            onCommand: handleCommand,
-            ignoreMessagesBefore,
-            resolveGroupFolder,
-            resolveEffectiveChatJid,
-            onAgentMessage,
-            onBotAddedToGroup: buildTelegramBotAddedHandler(userId, homeFolder),
-            onBotRemovedFromGroup,
+          onP2pSender: (senderOpenId: string) => {
+            // First valid DM claims this bot. Never let a later arbitrary DM
+            // replace the account owner.
+            if (!senderOpenId || secret.ownerOpenId) return;
+            secret.ownerOpenId = senderOpenId;
+            saveChannelAccountSecret(account.secret_ref, secret);
+            if (account.is_legacy_default) {
+              saveFeishuOwnerOpenId(account.owner_user_id, senderOpenId);
+            }
+            for (const jid of backfillEmptyAllowlistsForChannelAccount(
+              account.owner_user_id,
+              account.id,
+              senderOpenId,
+            )) {
+              const fresh = getRegisteredGroup(jid);
+              if (fresh) registeredGroups[jid] = fresh;
+            }
           },
-        )
-      : Promise.resolve(false);
-
-  const qqTask =
-    qqConfig &&
-    qqConfig.enabled !== false &&
-    qqConfig.appId &&
-    qqConfig.appSecret
-      ? imManager.connectUserQQ(
-          userId,
-          qqConfig,
-          onNewChat,
-          buildIsChatAuthorized(userId),
-          buildOnPairAttempt(userId),
-          {
-            onCommand: handleCommand,
-            resolveGroupFolder,
-            resolveEffectiveChatJid,
-            onAgentMessage,
+        },
+      );
+    } else if (account.provider === 'telegram') {
+      connected = await imManager.connectUserTelegram(
+        account.owner_user_id,
+        {
+          botToken: secret.botToken || '',
+          proxyUrl: secret.proxyUrl,
+          enabled: true,
+        },
+        onNewChat,
+        buildIsChatAuthorized(
+          account.owner_user_id,
+          account.id,
+          account.is_legacy_default,
+        ),
+        buildOnPairAttempt(
+          account.owner_user_id,
+          account.id,
+          workspace.jid,
+          account.is_legacy_default,
+        ),
+        { ...common, onBotAddedToGroup: onNewChat },
+      );
+    } else if (account.provider === 'qq') {
+      connected = await imManager.connectUserQQ(
+        account.owner_user_id,
+        { appId: secret.appId || '', appSecret: secret.appSecret || '' },
+        onNewChat,
+        buildIsChatAuthorized(
+          account.owner_user_id,
+          account.id,
+          account.is_legacy_default,
+        ),
+        buildOnPairAttempt(
+          account.owner_user_id,
+          account.id,
+          workspace.jid,
+          account.is_legacy_default,
+        ),
+        common,
+      );
+    } else if (account.provider === 'wechat') {
+      const bypassProxy = secret.bypassProxy !== 'false';
+      const proxyConflict = listEnabledChannelAccounts().find((candidate) => {
+        if (candidate.provider !== 'wechat' || candidate.id === account.id)
+          return false;
+        const other = loadChannelAccountSecret(candidate.secret_ref);
+        return (other?.bypassProxy !== 'false') !== bypassProxy;
+      });
+      if (proxyConflict) {
+        throw new Error(
+          'Enabled WeChat accounts must use the same proxy strategy in one HappyClaw process',
+        );
+      }
+      updateWeChatNoProxy(bypassProxy);
+      connected = await imManager.connectUserWeChat(
+        account.owner_user_id,
+        {
+          botToken: secret.botToken || '',
+          ilinkBotId: secret.ilinkBotId || '',
+          baseUrl: secret.baseUrl,
+          cdnBaseUrl: secret.cdnBaseUrl,
+          getUpdatesBuf: secret.getUpdatesBuf,
+        },
+        onNewChat,
+        {
+          ...common,
+          // A durable cursor is a replay boundary. Do not discard replayed
+          // messages after a crash merely because they predate this process.
+          ignoreMessagesBefore: secret.getUpdatesBuf
+            ? undefined
+            : common.ignoreMessagesBefore,
+          isChatAuthorized: buildIsChatAuthorized(
+            account.owner_user_id,
+            account.id,
+            account.is_legacy_default,
+          ),
+          onPairAttempt: buildOnPairAttempt(
+            account.owner_user_id,
+            account.id,
+            workspace.jid,
+            account.is_legacy_default,
+          ),
+          onConnectionStateChange: (state) => {
+            if (state.status === 'connected') {
+              updateChannelAccountAuthStatus(account.id, 'authorized');
+              updateChannelAccountStatus(account.id, 'connected');
+            } else if (state.status === 'expired') {
+              updateChannelAccountAuthStatus(
+                account.id,
+                'revoked',
+                state.error,
+              );
+              updateChannelAccountStatus(
+                account.id,
+                'disconnected',
+                state.error,
+              );
+            } else {
+              // A normal transport stop preserves reusable authorization.
+              updateChannelAccountStatus(
+                account.id,
+                'disconnected',
+                state.error,
+              );
+            }
           },
-        )
-      : Promise.resolve(false);
-
-  const wechatTask =
-    wechatConfig &&
-    wechatConfig.enabled !== false &&
-    wechatConfig.botToken &&
-    wechatConfig.ilinkBotId
-      ? imManager.connectUserWeChat(userId, wechatConfig, onNewChat, {
-          ignoreMessagesBefore,
-          onCommand: handleCommand,
-          resolveGroupFolder,
-          resolveEffectiveChatJid,
-          onAgentMessage,
-        })
-      : Promise.resolve(false);
-
-  const dingtalkTask =
-    dingtalkConfig &&
-    dingtalkConfig.enabled !== false &&
-    dingtalkConfig.clientId &&
-    dingtalkConfig.clientSecret
-      ? imManager.connectUserDingTalk(userId, dingtalkConfig, onNewChat, {
-          ignoreMessagesBefore,
-          onCommand: handleCommand,
-          resolveGroupFolder,
-          resolveEffectiveChatJid,
-          onAgentMessage,
-          onBotAddedToGroup,
-          onBotRemovedFromGroup,
+          onUpdatesBuf: (cursor: string) => {
+            if (!cursor || secret.getUpdatesBuf === cursor) return;
+            const latestSecret =
+              loadChannelAccountSecret(account.secret_ref) ?? secret;
+            if (latestSecret.getUpdatesBuf === cursor) {
+              secret.getUpdatesBuf = cursor;
+              return;
+            }
+            secret.getUpdatesBuf = cursor;
+            saveChannelAccountSecret(account.secret_ref, {
+              ...latestSecret,
+              getUpdatesBuf: cursor,
+            });
+            if (account.is_legacy_default) {
+              const legacy = getUserWeChatConfig(account.owner_user_id);
+              if (legacy && legacy.getUpdatesBuf !== cursor) {
+                saveUserWeChatConfig(account.owner_user_id, {
+                  ...legacy,
+                  getUpdatesBuf: cursor,
+                });
+              }
+            }
+          },
+        },
+      );
+    } else if (account.provider === 'dingtalk') {
+      connected = await imManager.connectUserDingTalk(
+        account.owner_user_id,
+        {
+          clientId: secret.clientId || '',
+          clientSecret: secret.clientSecret || '',
+          streamingMode: secret.streamingMode === 'text' ? 'text' : 'card',
+        },
+        onNewChat,
+        {
+          ...common,
+          isChatAuthorized: buildIsChatAuthorized(
+            account.owner_user_id,
+            account.id,
+            account.is_legacy_default,
+          ),
+          onPairAttempt: buildOnPairAttempt(
+            account.owner_user_id,
+            account.id,
+            workspace.jid,
+            account.is_legacy_default,
+          ),
+          onBotAddedToGroup: onNewChat,
           shouldProcessGroupMessage,
           isGroupOwnerMessage,
           resolveRegisteredGroup: getRegisteredGroup,
-        })
-      : Promise.resolve(false);
-
-  const discordTask =
-    discordConfig && discordConfig.enabled !== false && discordConfig.botToken
-      ? imManager.connectUserDiscord(userId, discordConfig, onNewChat, {
-          ignoreMessagesBefore,
-          onCommand: handleCommand,
-          resolveGroupFolder,
-          resolveEffectiveChatJid,
-          onAgentMessage,
-          onBotAddedToGroup,
-          onBotRemovedFromGroup,
+        },
+      );
+    } else if (account.provider === 'discord') {
+      connected = await imManager.connectUserDiscord(
+        account.owner_user_id,
+        {
+          botToken: secret.botToken || '',
+          streamingMode: secret.streamingMode === 'edit' ? 'edit' : 'off',
+        },
+        onNewChat,
+        {
+          ...common,
+          isChatAuthorized: buildIsChatAuthorized(
+            account.owner_user_id,
+            account.id,
+            account.is_legacy_default,
+          ),
+          onPairAttempt: buildOnPairAttempt(
+            account.owner_user_id,
+            account.id,
+            workspace.jid,
+            account.is_legacy_default,
+          ),
+          onBotAddedToGroup: onNewChat,
           shouldProcessGroupMessage,
           isGroupOwnerMessage,
-        })
-      : Promise.resolve(false);
-
-  const whatsappTask =
-    whatsappConfig && whatsappConfig.enabled !== false
-      ? imManager.connectUserWhatsApp(userId, whatsappConfig, onNewChat, {
-          ignoreMessagesBefore,
-          onCommand: handleCommand,
-          resolveGroupFolder,
-          resolveEffectiveChatJid,
-          onAgentMessage,
-          onBotAddedToGroup,
-          onBotRemovedFromGroup,
+        },
+      );
+    } else {
+      if (account.is_legacy_default) {
+        migrateLegacyWhatsAppAuthDir(
+          DATA_DIR,
+          account.owner_user_id,
+          secret.accountId,
+          account.id,
+        );
+      }
+      connected = await imManager.connectUserWhatsApp(
+        account.owner_user_id,
+        {
+          accountId: account.id,
+          phoneNumber: secret.phoneNumber,
+          enabled: true,
+        },
+        onNewChat,
+        {
+          ...common,
+          isChatAuthorized: buildIsChatAuthorized(
+            account.owner_user_id,
+            account.id,
+            account.is_legacy_default,
+          ),
+          onPairAttempt: buildOnPairAttempt(
+            account.owner_user_id,
+            account.id,
+            workspace.jid,
+            account.is_legacy_default,
+          ),
+          onBotAddedToGroup: onNewChat,
           shouldProcessGroupMessage,
           isGroupOwnerMessage,
-          onConnectionUpdate: (uid, state) => {
-            broadcastWhatsAppStatus(uid, state);
+          onConnectionUpdate: (uid, connectedAccountId, state) => {
+            if (state.status === 'connected') {
+              updateChannelAccountAuthStatus(account.id, 'authorized');
+              updateChannelAccountStatus(account.id, 'connected');
+            } else if (state.status === 'qr' || state.status === 'connecting') {
+              updateChannelAccountAuthStatus(account.id, 'awaiting_scan');
+              updateChannelAccountStatus(account.id, 'connecting');
+            } else if (state.status === 'logged_out') {
+              updateChannelAccountAuthStatus(
+                account.id,
+                'revoked',
+                state.error,
+              );
+              updateChannelAccountStatus(
+                account.id,
+                'disconnected',
+                state.error,
+              );
+            } else {
+              updateChannelAccountStatus(
+                account.id,
+                'disconnected',
+                state.error,
+              );
+            }
+            broadcastWhatsAppStatus(uid, connectedAccountId, state);
+          },
+        },
+      );
+    }
+    if (account.provider === 'whatsapp') {
+      // Baileys returns after the socket is created, before QR authorization
+      // and before connection.update('open'). The callback above is the only
+      // source allowed to publish transport=connected.
+      if (!connected) {
+        updateChannelAccountStatus(account.id, 'error', 'Connection failed');
+      }
+    } else {
+      updateChannelAccountStatus(
+        account.id,
+        connected ? 'connected' : 'error',
+        connected ? null : 'Connection failed',
+      );
+      if (connected && account.provider === 'feishu') {
+        ensureFeishuSyncScheduler();
+      }
+    }
+    return connected;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    updateChannelAccountStatus(account.id, 'error', message.slice(0, 1000));
+    logger.warn(
+      { error, accountId: account.id, provider: account.provider },
+      'Channel account connection failed',
+    );
+    return false;
+  }
+}
+
+function syncLegacyConfigToDefaultChannelAccount(
+  userId: string,
+  channel:
+    | 'feishu'
+    | 'telegram'
+    | 'qq'
+    | 'wechat'
+    | 'dingtalk'
+    | 'discord'
+    | 'whatsapp',
+): ChannelAccount | null {
+  if (channel === 'feishu') {
+    const value = getUserFeishuConfig(userId);
+    return value
+      ? syncDefaultChannelAccountCredentials({
+          ownerUserId: userId,
+          provider: channel,
+          name: '默认飞书',
+          enabled: value.enabled !== false,
+          secret: {
+            appId: value.appId,
+            appSecret: value.appSecret,
+            ownerOpenId: value.ownerOpenId,
           },
         })
-      : Promise.resolve(false);
-
-  const [feishu, telegram, qq, wechat, dingtalk, discord, whatsapp] =
-    await Promise.all([
-      feishuTask,
-      telegramTask,
-      qqTask,
-      wechatTask,
-      dingtalkTask,
-      discordTask,
-      whatsappTask,
-    ]);
-
-  return { feishu, telegram, qq, wechat, dingtalk, discord, whatsapp };
+      : null;
+  }
+  if (channel === 'telegram') {
+    const value = getUserTelegramConfig(userId);
+    return value
+      ? syncDefaultChannelAccountCredentials({
+          ownerUserId: userId,
+          provider: channel,
+          name: '默认 Telegram',
+          enabled: value.enabled !== false,
+          secret: {
+            botToken: value.botToken,
+            proxyUrl: value.proxyUrl || getTelegramProviderConfig().proxyUrl,
+          },
+        })
+      : null;
+  }
+  if (channel === 'qq') {
+    const value = getUserQQConfig(userId);
+    return value
+      ? syncDefaultChannelAccountCredentials({
+          ownerUserId: userId,
+          provider: channel,
+          name: '默认 QQ',
+          enabled: value.enabled !== false,
+          secret: { appId: value.appId, appSecret: value.appSecret },
+        })
+      : null;
+  }
+  if (channel === 'wechat') {
+    const value = getUserWeChatConfig(userId);
+    return value
+      ? syncDefaultChannelAccountCredentials({
+          ownerUserId: userId,
+          provider: channel,
+          name: '默认微信',
+          enabled: value.enabled !== false,
+          secret: {
+            botToken: value.botToken,
+            ilinkBotId: value.ilinkBotId,
+            baseUrl: value.baseUrl,
+            cdnBaseUrl: value.cdnBaseUrl,
+            getUpdatesBuf: value.getUpdatesBuf,
+            bypassProxy: String(value.bypassProxy ?? true),
+          },
+        })
+      : null;
+  }
+  if (channel === 'dingtalk') {
+    const value = getUserDingTalkConfig(userId);
+    return value
+      ? syncDefaultChannelAccountCredentials({
+          ownerUserId: userId,
+          provider: channel,
+          name: '默认钉钉',
+          enabled: value.enabled !== false,
+          secret: {
+            clientId: value.clientId,
+            clientSecret: value.clientSecret,
+            streamingMode: value.streamingMode,
+          },
+        })
+      : null;
+  }
+  if (channel === 'discord') {
+    const value = getUserDiscordConfig(userId);
+    return value
+      ? syncDefaultChannelAccountCredentials({
+          ownerUserId: userId,
+          provider: channel,
+          name: '默认 Discord',
+          enabled: value.enabled !== false,
+          secret: {
+            botToken: value.botToken,
+            streamingMode: value.streamingMode,
+          },
+        })
+      : null;
+  }
+  const value = getUserWhatsAppConfig(userId);
+  return value
+    ? syncDefaultChannelAccountCredentials({
+        ownerUserId: userId,
+        provider: channel,
+        name: '默认 WhatsApp',
+        enabled: value.enabled !== false,
+        secret: {
+          accountId: value.accountId,
+          phoneNumber: value.phoneNumber,
+        },
+      })
+    : null;
 }
 
 function movePathWithFallback(src: string, dst: string): void {
@@ -10702,8 +11190,6 @@ async function main(): Promise<void> {
 
   // --- Channel reload helpers (hot-reload on config save) ---
 
-  let feishuSyncInterval: ReturnType<typeof setInterval> | null = null;
-
   // Graceful shutdown handlers
   let shutdownInProgress = false;
   const shutdown = async (signal: string) => {
@@ -10806,66 +11292,29 @@ async function main(): Promise<void> {
       return false;
     }
 
-    // Disconnect existing admin Feishu connection
-    await imManager.disconnectUserFeishu(adminUser.id);
-    if (feishuSyncInterval) {
-      clearInterval(feishuSyncInterval);
-      feishuSyncInterval = null;
+    const defaultAccount = syncDefaultChannelAccountCredentials({
+      ownerUserId: adminUser.id,
+      provider: 'feishu',
+      name: '默认飞书',
+      enabled: config.enabled !== false,
+      secret: { appId: config.appId, appSecret: config.appSecret },
+    });
+    if (!defaultAccount.enabled) {
+      await disconnectChannelAccountById(defaultAccount.id);
+      return false;
     }
-
-    if (config.enabled !== false && config.appId && config.appSecret) {
-      const homeGroup = getUserHomeGroup(adminUser.id);
-      if (!homeGroup) return false;
-      const homeFolder = homeGroup.folder;
-      const adminOwnerRef = {
-        value: getUserFeishuConfig(adminUser.id)?.ownerOpenId ?? undefined,
-      };
-      const getAdminOwnerOpenId = () => adminOwnerRef.value;
-      const onAdminP2pSender = (senderOpenId: string) =>
-        learnFeishuOwner(adminUser.id, senderOpenId, adminOwnerRef);
-      const onNewChat = buildOnNewChat(
-        adminUser.id,
-        homeFolder,
-        getAdminOwnerOpenId,
+    const connected = await reloadChannelAccountById(defaultAccount.id);
+    if (connected && !feishuSyncInterval) {
+      syncGroupMetadata().catch((err) =>
+        logger.error({ err }, 'Group sync after Feishu reconnect failed'),
       );
-      const connected = await imManager.connectUserFeishu(
-        adminUser.id,
-        config,
-        onNewChat,
-        {
-          ignoreMessagesBefore: Date.now(),
-          onCommand: handleCommand,
-          resolveGroupFolder: (chatJid: string) =>
-            resolveEffectiveFolder(chatJid),
-          resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
-          onAgentMessage: buildOnAgentMessage(),
-          onBotAddedToGroup: buildFeishuBotAddedHandler(
-            adminUser.id,
-            homeFolder,
-            getAdminOwnerOpenId,
-          ),
-          onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
-          shouldProcessGroupMessage,
-          isGroupOwnerMessage,
-          isSenderAllowedInGroup,
-          onCardInterrupt: handleCardInterrupt,
-          onP2pSender: onAdminP2pSender,
-        },
-      );
-      if (connected) {
+      feishuSyncInterval = setInterval(() => {
         syncGroupMetadata().catch((err) =>
-          logger.error({ err }, 'Group sync after Feishu reconnect failed'),
+          logger.error({ err }, 'Periodic group sync failed'),
         );
-        feishuSyncInterval = setInterval(() => {
-          syncGroupMetadata().catch((err) =>
-            logger.error({ err }, 'Periodic group sync failed'),
-          );
-        }, GROUP_SYNC_INTERVAL_MS);
-      }
-      return connected;
+      }, GROUP_SYNC_INTERVAL_MS);
     }
-    logger.info('Feishu channel disabled via hot-reload');
-    return false;
+    return connected;
   };
 
   const reloadTelegramConnection = async (config: {
@@ -10886,36 +11335,18 @@ async function main(): Promise<void> {
       return false;
     }
 
-    await imManager.disconnectUserTelegram(adminUser.id);
-
-    if (config.enabled !== false && config.botToken) {
-      const homeGroup = getUserHomeGroup(adminUser.id);
-      if (!homeGroup) return false;
-      const homeFolder = homeGroup.folder;
-      const onNewChat = buildOnNewChat(adminUser.id, homeFolder);
-      const connected = await imManager.connectUserTelegram(
-        adminUser.id,
-        config,
-        onNewChat,
-        buildIsChatAuthorized(adminUser.id),
-        buildOnPairAttempt(adminUser.id),
-        {
-          onCommand: handleCommand,
-          ignoreMessagesBefore: Date.now(),
-          resolveGroupFolder: (chatJid) => resolveEffectiveFolder(chatJid),
-          resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
-          onAgentMessage: buildOnAgentMessage(),
-          onBotAddedToGroup: buildTelegramBotAddedHandler(
-            adminUser.id,
-            homeFolder,
-          ),
-          onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
-        },
-      );
-      return connected;
+    const defaultAccount = syncDefaultChannelAccountCredentials({
+      ownerUserId: adminUser.id,
+      provider: 'telegram',
+      name: '默认 Telegram',
+      enabled: config.enabled !== false,
+      secret: { botToken: config.botToken, proxyUrl: config.proxyUrl },
+    });
+    if (!defaultAccount.enabled) {
+      await disconnectChannelAccountById(defaultAccount.id);
+      return false;
     }
-    logger.info('Telegram channel disabled via hot-reload');
-    return false;
+    return reloadChannelAccountById(defaultAccount.id);
   };
 
   // Reload a per-user IM channel (hot-reload on user-im config save)
@@ -10941,6 +11372,20 @@ async function main(): Promise<void> {
     const homeFolder = homeGroup.folder;
     const ignoreMessagesBefore = Date.now();
     const onNewChat = buildOnNewChat(userId, homeFolder);
+
+    // Old per-provider config routes are a compatibility facade over the
+    // default first-class account. Never start a second legacy connector.
+    const projectedAccount = syncLegacyConfigToDefaultChannelAccount(
+      userId,
+      channel,
+    );
+    if (projectedAccount) {
+      if (!projectedAccount.enabled) {
+        await disconnectChannelAccountById(projectedAccount.id);
+        return false;
+      }
+      return reloadChannelAccountById(projectedAccount.id);
+    }
 
     if (channel === 'feishu') {
       await imManager.disconnectUserFeishu(userId);
@@ -11013,6 +11458,7 @@ async function main(): Promise<void> {
               resolveEffectiveFolder(chatJid),
             resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
             onAgentMessage: buildOnAgentMessage(),
+            onNativeContextDetected: buildOnNativeContextDetected(),
             onBotAddedToGroup: buildTelegramBotAddedHandler(userId, homeFolder),
             onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
           },
@@ -11067,6 +11513,8 @@ async function main(): Promise<void> {
           config,
           onNewChat,
           {
+            isChatAuthorized: buildIsChatAuthorized(userId),
+            onPairAttempt: buildOnPairAttempt(userId),
             ignoreMessagesBefore,
             onCommand: handleCommand,
             resolveGroupFolder: (chatJid: string) =>
@@ -11097,6 +11545,8 @@ async function main(): Promise<void> {
           config,
           onNewChat,
           {
+            isChatAuthorized: buildIsChatAuthorized(userId),
+            onPairAttempt: buildOnPairAttempt(userId),
             ignoreMessagesBefore,
             onCommand: handleCommand,
             resolveGroupFolder: (chatJid: string) =>
@@ -11137,12 +11587,25 @@ async function main(): Promise<void> {
           },
           onNewChat,
           {
-            ignoreMessagesBefore: Date.now(),
+            isChatAuthorized: buildIsChatAuthorized(userId),
+            onPairAttempt: buildOnPairAttempt(userId),
+            // With a durable cursor, replay is intentional recovery and must
+            // not be filtered by a new-process timestamp.
+            ignoreMessagesBefore: config.getUpdatesBuf ? undefined : Date.now(),
             onCommand: handleCommand,
             resolveGroupFolder: (chatJid: string) =>
               resolveEffectiveFolder(chatJid),
             resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
             onAgentMessage: buildOnAgentMessage(),
+            onUpdatesBuf: (cursor: string) => {
+              if (!cursor) return;
+              const latest = getUserWeChatConfig(userId);
+              if (!latest || latest.getUpdatesBuf === cursor) return;
+              saveUserWeChatConfig(userId, {
+                ...latest,
+                getUpdatesBuf: cursor,
+              });
+            },
           },
         );
         logger.info(
@@ -11167,6 +11630,8 @@ async function main(): Promise<void> {
           },
           onNewChat,
           {
+            isChatAuthorized: buildIsChatAuthorized(userId),
+            onPairAttempt: buildOnPairAttempt(userId),
             ignoreMessagesBefore: Date.now(),
             onCommand: handleCommand,
             resolveGroupFolder: (chatJid: string) =>
@@ -11177,8 +11642,8 @@ async function main(): Promise<void> {
             onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
             shouldProcessGroupMessage,
             isGroupOwnerMessage,
-            onConnectionUpdate: (uid, state) => {
-              broadcastWhatsAppStatus(uid, state);
+            onConnectionUpdate: (uid, accountId, state) => {
+              broadcastWhatsAppStatus(uid, accountId, state);
             },
           },
         );
@@ -11222,7 +11687,30 @@ async function main(): Promise<void> {
     await Promise.allSettled(
       channels.map((channel) => reloadUserIMConfig(userId, channel)),
     );
-    logger.info({ userId }, 'Reconnected user IM channels after re-enable');
+    // reloadUserIMConfig projects and reconnects only the legacy-compatible
+    // default for each provider. A user may own additional first-class Bot
+    // accounts; reconnect those as well after the projection is complete.
+    const additionalAccounts = listChannelAccountsForUser(userId).filter(
+      (account) => account.enabled && !account.is_legacy_default,
+    );
+    const accountResults = await Promise.allSettled(
+      additionalAccounts.map((account) => reloadChannelAccountById(account.id)),
+    );
+    const failedAccountIds = accountResults.flatMap((result, index) =>
+      result.status === 'rejected' || result.value === false
+        ? [additionalAccounts[index].id]
+        : [],
+    );
+    if (failedAccountIds.length > 0) {
+      logger.warn(
+        { userId, failedAccountIds },
+        'Some first-class IM channel accounts failed to reconnect after user re-enable',
+      );
+    }
+    logger.info(
+      { userId, additionalAccounts: additionalAccounts.length },
+      'Reconnected user IM channels after re-enable',
+    );
   };
 
   // Start Web server early so frontend auth/API isn't blocked by Feishu readiness.
@@ -11250,6 +11738,19 @@ async function main(): Promise<void> {
     reloadTelegramConnection,
     reloadUserIMConfig,
     reconnectUserIMChannels,
+    reloadChannelAccount: reloadChannelAccountById,
+    disconnectChannelAccount: disconnectChannelAccountById,
+    testChannelAccount: testChannelAccountCredentials,
+    isChannelAccountConnected: (accountId: string) => {
+      const account = getChannelAccount(accountId);
+      return account
+        ? imManager.isChannelAccountConnected(
+            account.owner_user_id,
+            account.provider,
+            account.id,
+          )
+        : false;
+    },
     isFeishuConnected: () => imManager.isAnyFeishuConnected(),
     isTelegramConnected: () => imManager.isAnyTelegramConnected(),
     isUserFeishuConnected: (userId: string) =>
@@ -11265,13 +11766,14 @@ async function main(): Promise<void> {
       imManager.isDiscordConnected(userId),
     isUserWhatsAppConnected: (userId: string) =>
       imManager.isWhatsAppConnected(userId),
-    getUserWhatsAppState: (userId: string) =>
-      imManager.getUserWhatsAppState(userId),
+    getUserWhatsAppState: (userId: string, accountId?: string) =>
+      imManager.getUserWhatsAppState(userId, accountId),
     logoutUserWhatsApp: (userId: string, accountId?: string) =>
       imManager.logoutUserWhatsApp(userId, accountId),
     processAgentConversation,
     getFeishuChatInfo: (userId: string, chatId: string) =>
       imManager.getFeishuChatInfo(userId, chatId),
+    getChannelChatInfo: (jid: string) => imManager.getChatInfo(jid),
     clearImFailCounts: (jid: string) => {
       imHealthCheckFailCounts.delete(jid);
     },
@@ -11640,11 +12142,8 @@ async function main(): Promise<void> {
 
   let anyFeishuConnected = false;
 
-  // Connect each user's IM channels concurrently — startup latency was
-  // previously O(N_users) because the await was inside the for-loop. The
-  // per-user `connectUserIMChannels` already parallelizes within a user, so
-  // wrapping the outer loop in Promise.allSettled drops total cold-start to
-  // ~max(per-user latency).
+  // Project each user's legacy singleton configs concurrently. Connections are
+  // opened exactly once by the first-class account pass below.
   await Promise.allSettled(
     allActiveUsers.map(async (user) => {
       const homeGroup = getUserHomeGroup(user.id);
@@ -11753,63 +12252,118 @@ async function main(): Promise<void> {
         };
       }
 
-      if (
-        !effectiveFeishu &&
-        !effectiveTelegram &&
-        !effectiveQQ &&
-        !effectiveWeChat &&
-        !effectiveDingTalk &&
-        !effectiveDiscord &&
-        !effectiveWhatsApp
-      )
-        return;
-
       try {
-        const result = await connectUserIMChannels(
-          user.id,
-          homeGroup.folder,
-          effectiveFeishu,
-          effectiveTelegram,
-          effectiveQQ,
-          effectiveWeChat,
-          effectiveDingTalk,
-          effectiveDiscord,
-          effectiveWhatsApp,
-          Date.now(),
-        );
-        if (result.feishu) anyFeishuConnected = true;
-        logger.info(
-          {
-            userId: user.id,
-            feishu: result.feishu,
-            telegram: result.telegram,
-            qq: result.qq,
-            wechat: result.wechat,
-            dingtalk: result.dingtalk,
-            discord: result.discord,
-            whatsapp: result.whatsapp,
-          },
-          'User IM channels connected',
-        );
+        if (effectiveFeishu) {
+          ensureLegacyDefaultChannelAccount({
+            ownerUserId: user.id,
+            provider: 'feishu',
+            name: '默认飞书',
+            enabled: effectiveFeishu.enabled !== false,
+            secret: {
+              appId: effectiveFeishu.appId,
+              appSecret: effectiveFeishu.appSecret,
+              ownerOpenId: userFeishu?.ownerOpenId,
+            },
+          });
+        }
+        if (effectiveTelegram) {
+          ensureLegacyDefaultChannelAccount({
+            ownerUserId: user.id,
+            provider: 'telegram',
+            name: '默认 Telegram',
+            enabled: effectiveTelegram.enabled !== false,
+            secret: {
+              botToken: effectiveTelegram.botToken,
+              proxyUrl: effectiveTelegram.proxyUrl,
+            },
+          });
+        }
+        if (effectiveQQ) {
+          ensureLegacyDefaultChannelAccount({
+            ownerUserId: user.id,
+            provider: 'qq',
+            name: '默认 QQ',
+            enabled: effectiveQQ.enabled !== false,
+            secret: {
+              appId: effectiveQQ.appId,
+              appSecret: effectiveQQ.appSecret,
+            },
+          });
+        }
+        if (effectiveWeChat) {
+          ensureLegacyDefaultChannelAccount({
+            ownerUserId: user.id,
+            provider: 'wechat',
+            name: '默认微信',
+            enabled: effectiveWeChat.enabled !== false,
+            secret: {
+              botToken: effectiveWeChat.botToken,
+              ilinkBotId: effectiveWeChat.ilinkBotId,
+              baseUrl: effectiveWeChat.baseUrl,
+              cdnBaseUrl: effectiveWeChat.cdnBaseUrl,
+              getUpdatesBuf: effectiveWeChat.getUpdatesBuf,
+              bypassProxy: String(userWeChat?.bypassProxy ?? true),
+            },
+          });
+        }
+        if (effectiveDingTalk) {
+          ensureLegacyDefaultChannelAccount({
+            ownerUserId: user.id,
+            provider: 'dingtalk',
+            name: '默认钉钉',
+            enabled: effectiveDingTalk.enabled !== false,
+            secret: {
+              clientId: effectiveDingTalk.clientId,
+              clientSecret: effectiveDingTalk.clientSecret,
+            },
+          });
+        }
+        if (effectiveDiscord) {
+          ensureLegacyDefaultChannelAccount({
+            ownerUserId: user.id,
+            provider: 'discord',
+            name: '默认 Discord',
+            enabled: effectiveDiscord.enabled !== false,
+            secret: {
+              botToken: effectiveDiscord.botToken,
+              streamingMode: effectiveDiscord.streamingMode,
+            },
+          });
+        }
+        if (effectiveWhatsApp) {
+          ensureLegacyDefaultChannelAccount({
+            ownerUserId: user.id,
+            provider: 'whatsapp',
+            name: '默认 WhatsApp',
+            enabled: effectiveWhatsApp.enabled !== false,
+            secret: {
+              accountId: effectiveWhatsApp.accountId,
+              phoneNumber: effectiveWhatsApp.phoneNumber,
+            },
+          });
+        }
       } catch (err) {
         logger.error(
           { userId: user.id, err },
-          'Failed to connect user IM channels',
+          'Failed to migrate legacy IM config into channel accounts',
         );
       }
     }),
   );
 
+  // Single startup path: after legacy singleton configs are projected, only
+  // first-class accounts connect. This prevents the same credentials from
+  // running once as `provider` and again as `provider\0accountId`.
+  await Promise.allSettled(
+    listEnabledChannelAccounts().map((account) =>
+      reloadChannelAccountById(account.id),
+    ),
+  );
+  anyFeishuConnected = imManager.isAnyFeishuConnected();
+
   // Start Feishu group sync if any connection is active
   if (anyFeishuConnected) {
-    syncGroupMetadata().catch((err) =>
-      logger.error({ err }, 'Initial group sync failed'),
-    );
-    feishuSyncInterval = setInterval(() => {
-      syncGroupMetadata().catch((err) =>
-        logger.error({ err }, 'Periodic group sync failed'),
-      );
-    }, GROUP_SYNC_INTERVAL_MS);
+    ensureFeishuSyncScheduler();
   } else if (
     globalFeishuConfig.config.enabled !== false &&
     globalFeishuConfig.source !== 'none'
@@ -11871,10 +12425,16 @@ async function checkImBindingsHealth(): Promise<void> {
         registeredGroups[group.target_main_jid] ??
         getRegisteredGroup(group.target_main_jid);
       if (!targetGroup) {
-        unbindImGroup(
+        const restored = unbindImGroup(
           jid,
           `Orphaned main conversation binding: target ${group.target_main_jid} no longer exists`,
         );
+        if (!restored) {
+          logger.warn(
+            { jid, targetMainJid: group.target_main_jid },
+            'Health check kept orphaned main binding because default restore was unavailable',
+          );
+        }
         continue;
       }
     }
@@ -11915,10 +12475,16 @@ async function checkImBindingsHealth(): Promise<void> {
             }
           }
         }
-        unbindImGroup(
+        const restored = unbindImGroup(
           jid,
           `Orphaned agent binding: agent ${group.target_agent_id} no longer exists`,
         );
+        if (!restored) {
+          logger.warn(
+            { jid, agentId: group.target_agent_id },
+            'Health check kept orphaned session binding because default restore was unavailable',
+          );
+        }
         continue;
       }
     }

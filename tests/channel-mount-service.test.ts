@@ -2,19 +2,27 @@ import { describe, expect, test } from 'vitest';
 
 import {
   buildDetachedWorkspaceUpdate,
+  buildNativeThreadWorkspaceUpdate,
+  buildRestoreDefaultChannelMountUpdate,
   buildSessionMountUpdate,
   buildWorkspaceMountUpdate,
-  findWorkspaceThreadMapConflict,
+  hasRemainingThreadMapMount,
   hasSessionMountConflict,
   hasWorkspaceMountConflict,
   matchesWorkspaceMount,
   resolveChannelMountTarget,
+  isNativeContextContainer,
 } from '../src/channel-mount-service.js';
 import {
   IM_CHANNEL_CAPABILITIES,
   isThreadMapCapableChat,
 } from '../src/im-channel-capabilities.js';
-import type { RegisteredGroup, SubAgent } from '../src/types.js';
+import type {
+  ChannelAccount,
+  ChannelProvider,
+  RegisteredGroup,
+  SubAgent,
+} from '../src/types.js';
 
 function makeWorkspace(name: string, folder: string): RegisteredGroup {
   return {
@@ -39,6 +47,34 @@ function makeSession(id: string, chatJid: string): SubAgent {
     result_summary: null,
     last_im_jid: null,
     spawned_from_jid: null,
+  };
+}
+
+function makeAccount(
+  id: string,
+  provider: ChannelProvider,
+  defaultWorkspaceJid: string | null,
+  legacy = false,
+): ChannelAccount {
+  return {
+    id,
+    owner_user_id: 'owner-a',
+    provider,
+    name: id,
+    secret_ref: `secret:${id}`,
+    enabled: true,
+    is_default: true,
+    is_legacy_default: legacy,
+    auth_mode: 'bot_token',
+    auth_status: 'authorized',
+    transport_status: 'connected',
+    status: 'connected',
+    default_agent_profile_id: null,
+    default_workspace_jid: defaultWorkspaceJid,
+    last_error: null,
+    connected_at: null,
+    created_at: '2026-07-09T00:00:00.000Z',
+    updated_at: '2026-07-09T00:00:00.000Z',
   };
 }
 
@@ -127,16 +163,30 @@ describe('resolveChannelMountTarget', () => {
 });
 
 describe('channel binding product contract', () => {
-  test('only Feishu exposes workspace binding capability', () => {
-    expect(IM_CHANNEL_CAPABILITIES.feishu.can_bind_workspace).toBe(true);
+  test('every channel exposes workspace binding capability', () => {
     expect(
-      Object.values(IM_CHANNEL_CAPABILITIES)
-        .filter((capability) => capability.channel_type !== 'feishu')
-        .every((capability) => !capability.can_bind_workspace),
+      Object.values(IM_CHANNEL_CAPABILITIES).every(
+        (capability) => capability.can_bind_workspace,
+      ),
     ).toBe(true);
   });
 
-  test('only Feishu topic or thread chats qualify for workspace binding', () => {
+  test('only transports with a real inbound gate advertise activation modes', () => {
+    expect(IM_CHANNEL_CAPABILITIES.telegram.supports_activation_modes).toBe(
+      false,
+    );
+    expect(IM_CHANNEL_CAPABILITIES.qq.supports_activation_modes).toBe(false);
+    expect(IM_CHANNEL_CAPABILITIES.wechat.supports_activation_modes).toBe(
+      false,
+    );
+    for (const provider of ['feishu', 'dingtalk', 'discord', 'whatsapp']) {
+      expect(IM_CHANNEL_CAPABILITIES[provider].supports_activation_modes).toBe(
+        true,
+      );
+    }
+  });
+
+  test('Feishu topics and Telegram Forums qualify for native thread mapping', () => {
     expect(
       isThreadMapCapableChat({ channel_type: 'feishu', chat_mode: 'topic' }),
     ).toBe(true);
@@ -151,8 +201,152 @@ describe('channel binding product contract', () => {
       isThreadMapCapableChat({ channel_type: 'feishu', chat_mode: 'group' }),
     ).toBe(false);
     expect(
-      isThreadMapCapableChat({ channel_type: 'telegram', chat_mode: 'topic' }),
+      isThreadMapCapableChat({
+        channel_type: 'telegram',
+        native_context_type: 'thread',
+      }),
+    ).toBe(true);
+    expect(
+      isNativeContextContainer('telegram:group-1', {
+        ...makeWorkspace('Forum', 'forum'),
+        native_context_type: 'thread',
+      }),
+    ).toBe(true);
+    expect(
+      isThreadMapCapableChat({
+        channel_type: 'qq',
+        native_context_type: 'thread',
+      }),
     ).toBe(false);
+  });
+
+  test('restores to account default atomically and preserves channel policy', () => {
+    const account = makeAccount('telegram-a', 'telegram', 'web:workspace-a');
+    const workspace = {
+      ...makeWorkspace('Workspace A', 'workspace-a'),
+      created_by: 'owner-a',
+    };
+    const source: RegisteredGroup = {
+      ...makeWorkspace('Forum', 'forum'),
+      created_by: 'owner-a',
+      channel_account_id: account.id,
+      target_agent_id: 'session-old',
+      activation_mode: 'owner_mentioned',
+      owner_im_id: 'owner-im',
+      sender_allowlist: ['sender-a'],
+      reply_policy: 'mirror',
+      native_context_type: 'thread',
+    };
+    const restored = buildRestoreDefaultChannelMountUpdate(
+      'telegram:chat#account:telegram-a',
+      source,
+      'owner-a',
+      {
+        getAccount: (id) => (id === account.id ? account : undefined),
+        getDefaultAccount: () => undefined,
+        getGroup: (jid) => (jid === 'web:workspace-a' ? workspace : undefined),
+        getHome: () => undefined,
+      },
+    );
+
+    expect(restored).toMatchObject({
+      status: 'resolved',
+      workspaceJid: 'web:workspace-a',
+      routingMode: 'thread_map',
+      updated: {
+        target_main_jid: 'web:workspace-a',
+        target_agent_id: undefined,
+        binding_mode: 'thread_map',
+        activation_mode: 'owner_mentioned',
+        owner_im_id: 'owner-im',
+        sender_allowlist: ['sender-a'],
+        reply_policy: 'source_only',
+      },
+    });
+  });
+
+  test('falls back from an invalid account default to the owner home workspace', () => {
+    const account = makeAccount('qq-a', 'qq', 'web:deleted');
+    const home = {
+      ...makeWorkspace('Home', 'home-a'),
+      jid: 'web:home-a',
+      created_by: 'owner-a',
+      is_home: true,
+    };
+    const restored = buildRestoreDefaultChannelMountUpdate(
+      'qq:c2c:user#account:qq-a',
+      {
+        ...makeWorkspace('QQ', 'qq'),
+        created_by: 'owner-a',
+      },
+      'owner-a',
+      {
+        getAccount: () => account,
+        getDefaultAccount: () => undefined,
+        getGroup: () => undefined,
+        getHome: () => home,
+      },
+    );
+    expect(restored).toMatchObject({
+      status: 'resolved',
+      workspaceJid: 'web:home-a',
+      routingMode: 'single_session',
+      updated: {
+        target_main_jid: 'web:home-a',
+        channel_account_id: account.id,
+      },
+    });
+  });
+
+  test('returns unavailable without clearing the current mount', () => {
+    const source: RegisteredGroup = {
+      ...makeWorkspace('Legacy', 'legacy'),
+      created_by: 'owner-a',
+      target_agent_id: 'keep-this-session',
+    };
+    const restored = buildRestoreDefaultChannelMountUpdate(
+      'whatsapp:user@s.whatsapp.net',
+      source,
+      'owner-a',
+      {
+        getAccount: () => undefined,
+        getDefaultAccount: () => undefined,
+        getLegacyAccount: () => undefined,
+        getGroup: () => undefined,
+        getHome: () => undefined,
+      },
+    );
+    expect(restored).toEqual({
+      status: 'unavailable',
+      reason: 'missing_default_workspace',
+    });
+    expect(source.target_agent_id).toBe('keep-this-session');
+  });
+
+  test('rejects an account id owned by another user', () => {
+    const foreign = {
+      ...makeAccount('telegram-foreign', 'telegram', 'web:foreign'),
+      owner_user_id: 'owner-b',
+    };
+    const restored = buildRestoreDefaultChannelMountUpdate(
+      'telegram:chat#account:telegram-foreign',
+      {
+        ...makeWorkspace('Foreign chat', 'foreign-chat'),
+        created_by: 'owner-a',
+        channel_account_id: foreign.id,
+      },
+      'owner-a',
+      {
+        getAccount: () => foreign,
+        getDefaultAccount: () => undefined,
+        getGroup: () => undefined,
+        getHome: () => undefined,
+      },
+    );
+    expect(restored).toEqual({
+      status: 'unavailable',
+      reason: 'account_mismatch',
+    });
   });
 
   test('workspace and session targets remain mutually exclusive', () => {
@@ -173,7 +367,7 @@ describe('channel binding product contract', () => {
     expect(workspaceBound.target_main_jid).toBe('web:workspace-a');
   });
 
-  test('centralizes conflict and legacy workspace matching semantics', () => {
+  test('centralizes target conflict and legacy workspace matching semantics', () => {
     const sessionBound = {
       ...makeWorkspace('Channel', 'channel-a'),
       target_agent_id: 'session-a',
@@ -200,14 +394,62 @@ describe('channel binding product contract', () => {
         'web:workspace-folder',
       ),
     ).toBe(false);
+  });
+
+  test('keeps native navigation until the final thread-map source leaves', () => {
+    const workspace: RegisteredGroup = {
+      ...makeWorkspace('Workspace', 'workspace-folder'),
+      conversation_source: 'native_thread',
+      conversation_nav_mode: 'vertical_threads',
+    };
+    const groups: Record<string, RegisteredGroup> = {
+      'web:workspace-uuid': workspace,
+      'feishu:topic-a': {
+        ...makeWorkspace('Topic A', 'source-a'),
+        target_main_jid: 'web:workspace-folder',
+        binding_mode: 'thread_map',
+      },
+      'telegram:forum-b': {
+        ...makeWorkspace('Forum B', 'source-b'),
+        target_main_jid: 'web:workspace-uuid',
+        binding_mode: 'thread_map',
+      },
+    };
+    const deps = {
+      getAllGroups: () => groups,
+      getGroup: (jid: string) => groups[jid],
+      getJidsByFolder: (folder: string) =>
+        Object.entries(groups)
+          .filter(([, group]) => group.folder === folder)
+          .map(([jid]) => jid),
+    };
+
+    delete groups['feishu:topic-a'];
     expect(
-      findWorkspaceThreadMapConflict(
-        { 'feishu:topic': workspaceBound },
-        'feishu:other',
-        'web:workspace-uuid',
+      hasRemainingThreadMapMount(
         'web:workspace-folder',
-      )?.[0],
-    ).toBe('feishu:topic');
+        'feishu:topic-a',
+        deps,
+      ),
+    ).toBe(true);
+    expect(groups['web:workspace-uuid']).toMatchObject({
+      conversation_source: 'native_thread',
+      conversation_nav_mode: 'vertical_threads',
+    });
+
+    delete groups['telegram:forum-b'];
+    expect(
+      hasRemainingThreadMapMount(
+        'web:workspace-uuid',
+        'telegram:forum-b',
+        deps,
+      ),
+    ).toBe(false);
+    groups['web:workspace-uuid'] = buildDetachedWorkspaceUpdate(workspace);
+    expect(groups['web:workspace-uuid']).toMatchObject({
+      conversation_source: 'manual',
+      conversation_nav_mode: 'horizontal',
+    });
   });
 
   test('detaching a topic workspace preserves its data and only resets navigation', () => {
@@ -222,6 +464,23 @@ describe('channel binding product contract', () => {
       ...workspace,
       conversation_source: 'manual',
       conversation_nav_mode: 'horizontal',
+    });
+  });
+
+  test('marking a native thread workspace enables vertical navigation and preserves legacy Feishu source', () => {
+    const manual = makeWorkspace('Workspace A', 'workspace-a');
+    expect(buildNativeThreadWorkspaceUpdate(manual)).toMatchObject({
+      conversation_source: 'native_thread',
+      conversation_nav_mode: 'vertical_threads',
+    });
+
+    const legacyFeishu: RegisteredGroup = {
+      ...manual,
+      conversation_source: 'feishu_thread',
+    };
+    expect(buildNativeThreadWorkspaceUpdate(legacyFeishu)).toMatchObject({
+      conversation_source: 'feishu_thread',
+      conversation_nav_mode: 'vertical_threads',
     });
   });
 });

@@ -8,22 +8,27 @@ import {
   useAgentProfilesStore,
   type AgentPromptChatMessage,
 } from '../../stores/agent-profiles';
+import {
+  AGENT_PROMPT_SECTIONS,
+  type AgentPromptParts,
+  type AgentPromptSection,
+} from '../../utils/agent-prompts';
 
 interface PromptAssistantMessage extends AgentPromptChatMessage {
   id: number;
-  proposedPrompt?: string;
+  proposedPrompts?: AgentPromptParts;
 }
 
 interface LatestProposal {
-  prompt: string;
-  basePrompt: string;
+  prompts: AgentPromptParts;
 }
 
 interface AgentPromptAssistantProps {
   profileId: string;
   agentName: string;
-  currentPrompt: string;
-  onApply: (prompt: string) => void;
+  currentPrompts: AgentPromptParts;
+  activeSection: AgentPromptSection;
+  onApply: (prompts: AgentPromptParts) => void;
 }
 
 const QUICK_REQUESTS = [
@@ -44,7 +49,8 @@ function getErrorMessage(err: unknown): string {
 export function AgentPromptAssistant({
   profileId,
   agentName,
-  currentPrompt,
+  currentPrompts,
+  activeSection,
   onApply,
 }: AgentPromptAssistantProps) {
   const refineProfilePrompt = useAgentProfilesStore(
@@ -79,10 +85,7 @@ export function AgentPromptAssistant({
     if (!message || sending) return;
 
     const requestProfileId = profileId;
-    const basePrompt =
-      latestProposal && currentPrompt === latestProposal.basePrompt
-        ? latestProposal.prompt
-        : currentPrompt;
+    const basePrompts = latestProposal?.prompts ?? currentPrompts;
     const history = messages.slice(-12).map(({ role, content }) => ({
       role,
       content,
@@ -97,8 +100,9 @@ export function AgentPromptAssistant({
 
     try {
       const refinement = await refineProfilePrompt(requestProfileId, {
+        section: activeSection,
         message,
-        current_prompt: basePrompt,
+        current_prompts: basePrompts,
         history,
       });
       if (activeProfileId.current !== requestProfileId) return;
@@ -109,12 +113,21 @@ export function AgentPromptAssistant({
           id: nextMessageId.current++,
           role: 'assistant',
           content: refinement.reply,
-          proposedPrompt: refinement.identity_prompt,
+          proposedPrompts: {
+            identity_prompt: refinement.identity_prompt,
+            soul_prompt: refinement.soul_prompt,
+            agents_prompt: refinement.agents_prompt,
+            tools_prompt: refinement.tools_prompt,
+          },
         },
       ]);
       setLatestProposal({
-        prompt: refinement.identity_prompt,
-        basePrompt: currentPrompt,
+        prompts: {
+          identity_prompt: refinement.identity_prompt,
+          soul_prompt: refinement.soul_prompt,
+          agents_prompt: refinement.agents_prompt,
+          tools_prompt: refinement.tools_prompt,
+        },
       });
     } catch (err) {
       if (activeProfileId.current !== requestProfileId) return;
@@ -125,10 +138,14 @@ export function AgentPromptAssistant({
     }
   };
 
-  const handleApply = (prompt: string) => {
-    onApply(prompt);
-    toast.success('候选提示词已应用，请保存 Agent');
+  const handleApply = (prompts: AgentPromptParts) => {
+    onApply(prompts);
+    toast.success('候选四段提示词已应用，请保存 Agent');
   };
+
+  const activeLabel = AGENT_PROMPT_SECTIONS.find(
+    (item) => item.key === activeSection,
+  )?.title;
 
   return (
     <section className="overflow-hidden rounded-xl border border-border bg-card">
@@ -143,7 +160,7 @@ export function AgentPromptAssistant({
             </h2>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
               直接描述你想增加、删减或改变的行为，AI
-              会生成一份可预览的完整提示词。
+              会生成四段候选提示词。当前重点调整：{activeLabel}。
             </p>
           </div>
         </div>
@@ -196,36 +213,46 @@ export function AgentPromptAssistant({
                 <div className="rounded-xl rounded-tl-sm border border-border bg-background px-3.5 py-3 text-sm leading-6 text-foreground shadow-sm">
                   {message.content}
                 </div>
-                {message.proposedPrompt && (
+                {message.proposedPrompts && (
                   <div className="rounded-xl border border-brand-200 bg-brand-50/60 p-3 dark:border-brand-700/50 dark:bg-brand-700/10">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="flex items-center gap-2 text-xs font-medium text-foreground">
                         <Wand2 className="h-3.5 w-3.5 text-primary" />
-                        已生成完整候选提示词
+                        已生成四段候选提示词
                       </div>
                       <Button
                         type="button"
                         size="sm"
                         variant={
-                          currentPrompt === message.proposedPrompt
+                          JSON.stringify(currentPrompts) ===
+                          JSON.stringify(message.proposedPrompts)
                             ? 'secondary'
                             : 'outline'
                         }
-                        disabled={currentPrompt === message.proposedPrompt}
-                        onClick={() => handleApply(message.proposedPrompt!)}
+                        disabled={
+                          JSON.stringify(currentPrompts) ===
+                          JSON.stringify(message.proposedPrompts)
+                        }
+                        onClick={() => handleApply(message.proposedPrompts!)}
                       >
-                        {currentPrompt === message.proposedPrompt ? (
+                        {JSON.stringify(currentPrompts) ===
+                        JSON.stringify(message.proposedPrompts) ? (
                           <Check className="h-3.5 w-3.5" />
                         ) : (
                           <Wand2 className="h-3.5 w-3.5" />
                         )}
-                        {currentPrompt === message.proposedPrompt
+                        {JSON.stringify(currentPrompts) ===
+                        JSON.stringify(message.proposedPrompts)
                           ? '已应用'
                           : '应用到提示词'}
                       </Button>
                     </div>
                     <p className="mt-2 max-h-[66px] overflow-hidden whitespace-pre-wrap text-xs leading-[22px] text-muted-foreground">
-                      {message.proposedPrompt}
+                      {message.proposedPrompts[
+                        AGENT_PROMPT_SECTIONS.find(
+                          (item) => item.key === activeSection,
+                        )?.field ?? 'identity_prompt'
+                      ] || '该段保持为空。'}
                     </p>
                   </div>
                 )}

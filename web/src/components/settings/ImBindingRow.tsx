@@ -3,13 +3,13 @@ import {
   MessageSquare,
   Users,
   ArrowRightLeft,
-  Unlink,
+  RotateCcw,
   AlertTriangle,
   Trash2,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import type { AvailableImGroup } from '../../types';
-import { ChannelBadge } from './channel-meta';
+import { ChannelAccountBadge, ChannelBadge } from './channel-meta';
 import { ACTIVATION_MODE_OPTIONS } from '../../constants/im';
 import { getImChannelCapabilities } from '../../constants/im-capabilities';
 
@@ -94,6 +94,10 @@ export function ImBindingRow({
           <div className="flex items-center gap-2">
             <span className="text-sm font-medium truncate">{group.name}</span>
             <ChannelBadge channelType={group.channel_type} />
+            <ChannelAccountBadge
+              accountId={group.channel_account_id}
+              accountName={group.channel_account_name}
+            />
           </div>
           <div className="flex items-center gap-2 mt-0.5 text-xs text-muted-foreground">
             {group.member_count != null && (
@@ -170,13 +174,15 @@ export function ImBindingRow({
             variant="ghost"
             onClick={() => onUnbind(group)}
             disabled={isActioning}
-            className="text-muted-foreground hover:text-error"
+            className="text-muted-foreground hover:text-foreground"
+            title="恢复账号默认工作区"
           >
             {isActioning ? (
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
             ) : (
-              <Unlink className="w-3.5 h-3.5" />
+              <RotateCcw className="w-3.5 h-3.5" />
             )}
+            <span className="sr-only">恢复账号默认工作区</span>
           </Button>
         )}
         <Button

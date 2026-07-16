@@ -24,6 +24,31 @@ export function readMcpServersFile(filePath: string): McpServerMap {
 }
 
 /**
+ * Resolve every native user-level MCP source from the configured Claude
+ * directory. Never consult process HOME: externalClaudeDir is the single
+ * authority for both the .claude directory and its sibling .claude.json.
+ */
+export function getHostClaudeMcpSourcePaths(
+  externalClaudeDir: string,
+): string[] {
+  return [
+    path.join(externalClaudeDir, 'settings.json'),
+    path.join(path.dirname(externalClaudeDir), '.claude.json'),
+  ];
+}
+
+export function loadHostClaudeMcpServers(
+  externalClaudeDir: string,
+): McpServerMap {
+  const [settingsPath, globalPath] =
+    getHostClaudeMcpSourcePaths(externalClaudeDir);
+  return {
+    ...readMcpServersFile(settingsPath),
+    ...readMcpServersFile(globalPath),
+  };
+}
+
+/**
  * Claude-native MCP is project/host context, not a HappyClaw-managed user MCP
  * grant.  Materialize it explicitly so strict Agent MCP filtering cannot hide
  * it (and cannot accidentally re-enable unselected HappyClaw user servers).
@@ -34,20 +59,9 @@ export function loadClaudeContextMcpServers(options: {
   externalClaudeDir?: string;
   includeHostClaudeContext?: boolean;
 }): McpServerMap {
-  const hostSettings =
+  const hostServers =
     options.includeHostClaudeContext && options.externalClaudeDir
-      ? readMcpServersFile(
-          path.join(options.externalClaudeDir, 'settings.json'),
-        )
-      : {};
-  // Claude Code persists user-scoped `claude mcp add --scope user` entries in
-  // ~/.claude.json, next to ~/.claude/.  Include that source only for the
-  // administrator-authorized host context; container-only users never see it.
-  const hostGlobalConfig =
-    options.includeHostClaudeContext && options.externalClaudeDir
-      ? readMcpServersFile(
-          path.join(path.dirname(options.externalClaudeDir), '.claude.json'),
-        )
+      ? loadHostClaudeMcpServers(options.externalClaudeDir)
       : {};
   const projectFile = readMcpServersFile(
     path.join(options.workspaceDir, '.mcp.json'),
@@ -59,8 +73,7 @@ export function loadClaudeContextMcpServers(options: {
     path.join(options.workspaceDir, '.claude', 'settings.local.json'),
   );
   return {
-    ...hostSettings,
-    ...hostGlobalConfig,
+    ...hostServers,
     ...projectFile,
     ...projectSettings,
     ...projectLocalSettings,

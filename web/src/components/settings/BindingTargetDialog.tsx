@@ -22,7 +22,7 @@ interface BindingTargetDialogProps {
   imGroupName: string;
   targets: BindingTarget[];
   targetsLoading: boolean;
-  targetType: 'workspace' | 'session';
+  targetType: 'workspace' | 'session' | 'both';
   canUnbind: boolean;
   onSelect: (target: BindingTarget) => void;
   onRestoreDefault: () => void;
@@ -98,8 +98,12 @@ export function BindingTargetDialog({
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle className="text-base truncate">
-            {targetType === 'workspace' ? '选择工作区' : '选择会话'} —{' '}
-            {imGroupName}
+            {targetType === 'workspace'
+              ? '选择工作区'
+              : targetType === 'session'
+                ? '选择会话'
+                : '选择工作区或会话'}{' '}
+            — {imGroupName}
           </DialogTitle>
         </DialogHeader>
 
@@ -110,7 +114,9 @@ export function BindingTargetDialog({
             placeholder={
               targetType === 'workspace'
                 ? '搜索工作区...'
-                : '搜索工作区或会话...'
+                : targetType === 'session'
+                  ? '搜索会话...'
+                  : '搜索工作区或会话...'
             }
             debounce={150}
           />
@@ -128,7 +134,9 @@ export function BindingTargetDialog({
             <div className="text-center py-8 text-muted-foreground text-sm">
               {targetType === 'workspace'
                 ? '暂无可绑定的工作区。请先创建工作区。'
-                : '暂无可绑定的会话。请先在工作区内创建会话。'}
+                : targetType === 'session'
+                  ? '暂无可绑定的会话。请先在工作区内创建会话。'
+                  : '暂无可绑定的工作区或会话。'}
             </div>
           )}
 
@@ -170,9 +178,7 @@ export function BindingTargetDialog({
                             <span className="flex-1 text-sm truncate">
                               {target.type === 'session'
                                 ? target.sessionName || '会话'
-                                : targetType === 'session'
-                                  ? '主会话'
-                                  : '绑定到此工作区'}
+                                : '绑定到此工作区'}
                             </span>
                             {isSelecting && (
                               <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" />
@@ -197,7 +203,7 @@ export function BindingTargetDialog({
               className="text-muted-foreground hover:text-foreground w-full"
             >
               <RotateCcw className="w-3.5 h-3.5 mr-1.5" />
-              解除当前绑定
+              恢复账号默认工作区
             </Button>
           </div>
         )}

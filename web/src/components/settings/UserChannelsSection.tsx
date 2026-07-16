@@ -6,14 +6,8 @@ import { toast } from 'sonner';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useAuthStore } from '../../stores/auth';
 import { BindingsSection } from './BindingsSection';
-import { DingTalkChannelCard } from './DingTalkChannelCard';
-import { DiscordChannelCard } from './DiscordChannelCard';
-import { FeishuChannelCard } from './FeishuChannelCard';
-import { QQChannelCard } from './QQChannelCard';
+import { ChannelAccountsManager } from './ChannelAccountsManager';
 import { SettingsCard as Section } from './SettingsCard';
-import { TelegramChannelCard } from './TelegramChannelCard';
-import { WeChatChannelCard } from './WeChatChannelCard';
-import { WhatsAppChannelCard } from './WhatsAppChannelCard';
 import { getErrorMessage } from './types';
 
 export function UserChannelsSection() {
@@ -114,16 +108,7 @@ export function UserChannelsSection() {
           </p>
         </Section>
 
-        <div className="rounded-lg bg-muted px-4 py-3 text-sm text-muted-foreground">
-          接入你的 IM 账号或 Bot；接入后再到“已接入会话”绑定工作区或会话。
-        </div>
-        <FeishuChannelCard />
-        <TelegramChannelCard />
-        <QQChannelCard />
-        <WeChatChannelCard />
-        <DingTalkChannelCard />
-        <DiscordChannelCard />
-        <WhatsAppChannelCard />
+        <ChannelAccountsManager />
       </TabsContent>
 
       <TabsContent value="bindings" className="-mx-4 -my-4 lg:-mx-8 lg:-my-8">

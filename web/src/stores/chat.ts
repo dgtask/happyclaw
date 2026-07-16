@@ -3401,7 +3401,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         const nextStreaming = { ...s.streaming };
 
         // 清除后端不可见的 JID 的 waiting/streaming（进程已死）
-        // （pm2 restart 后 queue 为空，所有 JID 都不在集合中）。
+        // （主服务重启后 queue 为空，所有 JID 都不在集合中）。
         for (const jid of Object.keys(nextWaiting)) {
           if (!knownJids.has(jid)) {
             delete nextWaiting[jid];

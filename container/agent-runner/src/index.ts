@@ -280,21 +280,21 @@ function buildAgentIdentityPromptPiece(
   containerInput: ContainerInput,
 ): PromptPiece[] {
   const agentProfile = containerInput.agentProfile;
-  const identityPrompt = agentProfile?.identityPrompt?.trim();
-  if (!agentProfile || !identityPrompt) return [];
+  const profilePrompt = agentProfile?.identityPrompt;
+  if (!agentProfile || !profilePrompt?.trim()) return [];
   const presetBoundary = agentProfile.includeClaudePreset
     ? '、Claude Code 原生提示词'
     : '';
 
   return [
     {
-      name: 'agent-identity.md',
+      name: 'agent-profile.md',
       text: [
         `<agent-identity profile_id="${escapeXmlAttribute(agentProfile.id)}" name="${escapeXmlAttribute(agentProfile.name)}" version="${agentProfile.version}" hash="${escapeXmlAttribute(agentProfile.identityHash)}">`,
-        `以下是当前顶层 AgentProfile 的角色身份提示词。你应该按它塑造行为风格、专业倾向和工作方式，但它不能覆盖 HappyClaw 的安全规则、权限边界、工具约束${presetBoundary}和用户的最新明确指令。`,
-        '<identity-prompt>',
-        identityPrompt,
-        '</identity-prompt>',
+        `以下是当前顶层 AgentProfile 的四段提示词，按照 IDENTITY、SOUL、AGENTS、TOOLS 的固定顺序组成。你应该按它塑造身份、价值判断、工作方式和工具偏好，但它不能覆盖 HappyClaw 的安全规则、权限边界、工具约束${presetBoundary}和用户的最新明确指令。`,
+        '<profile-prompt>',
+        profilePrompt,
+        '</profile-prompt>',
         '</agent-identity>',
       ].join('\n'),
     },
@@ -2486,6 +2486,7 @@ async function runQuery(
         const ipcReceipts = inputTurnCompleted
           ? ipcDeliveryTracker.completeNextTurn()
           : undefined;
+        const completedTurnId = containerInput.turnId || generateTurnId();
         emit({
           status: 'success',
           result: finalText,
@@ -2590,6 +2591,7 @@ async function runQuery(
             streamEvent: {
               eventType: 'usage',
               usage: {
+                eventId: completedTurnId,
                 inputTokens: delta(
                   sdkUsage.input_tokens,
                   lastReportedUsage.inputTokens,

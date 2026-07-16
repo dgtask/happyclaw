@@ -1,5 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { useLocation, useSearchParams } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  useBeforeUnload,
+  useBlocker,
+  useLocation,
+  useSearchParams,
+  type BlockerFunction,
+} from 'react-router-dom';
 import {
   ArrowRight,
   Bot,
@@ -34,6 +40,8 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { AgentPromptAssistant } from '../components/agents/AgentPromptAssistant';
+import { AgentPromptEditor } from '../components/agents/AgentPromptEditor';
+import { AgentPromptVersionHistory } from '../components/agents/AgentPromptVersionHistory';
 import { EffectiveCapabilitiesPreview } from '../components/agents/EffectiveCapabilitiesPreview';
 import { AgentGovernanceSection } from '../components/agents/AgentGovernanceSection';
 import { PolicyResourcePicker } from '../components/agents/PolicyResourcePicker';
@@ -45,11 +53,22 @@ import { useAuthStore } from '../stores/auth';
 import { useSkillsStore } from '../stores/skills';
 import { useMcpServersStore } from '../stores/mcp-servers';
 import {
+  buildMcpPolicyOptions,
+  normalizeMcpPolicyReferences,
+} from '../utils/mcp-servers';
+import {
   getAgentContextSource,
+  type AgentProfilePromptMode,
   type AgentContextSource,
   type AgentProfileRuntimePolicy,
 } from '../types';
 import { getCustomAgentProfiles } from '../utils/agent-product';
+import {
+  buildAgentPromptPatch,
+  type AgentPromptParts,
+  type AgentPromptSection,
+} from '../utils/agent-prompts';
+import { createUnsavedNavigationGuard } from '../utils/unsaved-navigation';
 
 const DEFAULT_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
   context: {
@@ -94,6 +113,15 @@ function normalizeRuntimePolicy(
   };
 }
 
+function SummaryItem({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg bg-muted/50 p-3">
+      <dt className="text-[11px] font-medium text-muted-foreground">{label}</dt>
+      <dd className="mt-1 text-sm font-medium text-foreground">{value}</dd>
+    </div>
+  );
+}
+
 function sameRuntimePolicy(
   a?: Partial<AgentProfileRuntimePolicy> | null,
   b?: Partial<AgentProfileRuntimePolicy> | null,
@@ -107,6 +135,25 @@ function sameRuntimePolicy(
 export function AgentProfilesPage() {
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
+  const navigationGuardRef = useRef(createUnsavedNavigationGuard());
+  const setAllowedSearchParams = useCallback(
+    (
+      next: URLSearchParams | Record<string, string>,
+      options: { replace?: boolean } = {},
+    ) => {
+      const normalized =
+        next instanceof URLSearchParams ? next : new URLSearchParams(next);
+      const serialized = normalized.toString();
+      const token = navigationGuardRef.current.allowNext({
+        pathname: location.pathname,
+        search: serialized ? `?${serialized}` : '',
+        hash: '',
+      });
+      setSearchParams(next, options);
+      queueMicrotask(() => navigationGuardRef.current.cancelAllowance(token));
+    },
+    [location.pathname, setSearchParams],
+  );
   const requestedProfileId = searchParams.get('agent');
   const {
     profiles,
@@ -114,6 +161,8 @@ export function AgentProfilesPage() {
     profilesError,
     loadProfiles,
     loadProfileGovernance,
+    loadPromptVersions,
+    restorePromptVersion,
     governanceByProfile,
     governanceLoading,
     governanceErrors,
@@ -130,7 +179,13 @@ export function AgentProfilesPage() {
   const [draftMode, setDraftMode] = useState(false);
   const [name, setName] = useState('');
   const [identityPrompt, setIdentityPrompt] = useState('');
-  const [includeClaudePreset, setIncludeClaudePreset] = useState(true);
+  const [soulPrompt, setSoulPrompt] = useState('');
+  const [agentsPrompt, setAgentsPrompt] = useState('');
+  const [toolsPrompt, setToolsPrompt] = useState('');
+  const [promptMode, setPromptMode] =
+    useState<AgentProfilePromptMode>('append');
+  const [assistantSection, setAssistantSection] =
+    useState<AgentPromptSection>('identity');
   const [avatarEmoji, setAvatarEmoji] = useState<string | null>(null);
   const [avatarColor, setAvatarColor] = useState<string | null>(null);
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
@@ -161,6 +216,22 @@ export function AgentProfilesPage() {
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [deleteTargetId, setDeleteTargetId] = useState('');
   const [createPanelOpen, setCreatePanelOpen] = useState(false);
+  const [draftStep, setDraftStep] = useState(1);
+  const currentPrompts = useMemo<AgentPromptParts>(
+    () => ({
+      identity_prompt: identityPrompt,
+      soul_prompt: soulPrompt,
+      agents_prompt: agentsPrompt,
+      tools_prompt: toolsPrompt,
+    }),
+    [agentsPrompt, identityPrompt, soulPrompt, toolsPrompt],
+  );
+  const setCurrentPrompts = (next: AgentPromptParts) => {
+    setIdentityPrompt(next.identity_prompt);
+    setSoulPrompt(next.soul_prompt);
+    setAgentsPrompt(next.agents_prompt);
+    setToolsPrompt(next.tools_prompt);
+  };
   const isAdmin = useAuthStore((state) => state.user?.role === 'admin');
   const mainAppearance = useAuthStore((state) => state.appearance);
 
@@ -203,14 +274,14 @@ export function AgentProfilesPage() {
       customProfiles.some((profile) => profile.id === selectedId)
     ) {
       if (requestedProfileId && requestedProfileId !== selectedId) {
-        setSearchParams({ agent: selectedId }, { replace: true });
+        setAllowedSearchParams({ agent: selectedId }, { replace: true });
       }
       return;
     }
     const fallbackId = customProfiles[0]?.id ?? null;
     setSelectedId(fallbackId);
     if (requestedProfileId) {
-      setSearchParams(fallbackId ? { agent: fallbackId } : {}, {
+      setAllowedSearchParams(fallbackId ? { agent: fallbackId } : {}, {
         replace: true,
       });
     }
@@ -219,7 +290,7 @@ export function AgentProfilesPage() {
     draftMode,
     requestedProfileId,
     selectedId,
-    setSearchParams,
+    setAllowedSearchParams,
   ]);
 
   const selected = useMemo(
@@ -244,7 +315,7 @@ export function AgentProfilesPage() {
     setSkillsMode(normalized.skills.mode);
     setSkillIds(normalized.skills.ids);
     setMcpMode(normalized.mcp.mode);
-    setMcpIds(normalized.mcp.ids);
+    setMcpIds(normalizeMcpPolicyReferences(normalized.mcp.ids));
     setToolsMode(normalized.tools.mode);
     setContextSource(getAgentContextSource(normalized));
     const compactWindow = normalized.context?.auto_compact_window ?? 0;
@@ -308,8 +379,13 @@ export function AgentProfilesPage() {
     if (draftMode) return;
     if (!selected) {
       setName('');
-      setIdentityPrompt('');
-      setIncludeClaudePreset(true);
+      setCurrentPrompts({
+        identity_prompt: '',
+        soul_prompt: '',
+        agents_prompt: '',
+        tools_prompt: '',
+      });
+      setPromptMode('append');
       setAvatarEmoji(null);
       setAvatarColor(null);
       setAvatarUrl(null);
@@ -318,8 +394,13 @@ export function AgentProfilesPage() {
       return;
     }
     setName(selected.name);
-    setIdentityPrompt(selected.identity_prompt);
-    setIncludeClaudePreset(selected.include_claude_preset);
+    setCurrentPrompts({
+      identity_prompt: selected.identity_prompt,
+      soul_prompt: selected.soul_prompt,
+      agents_prompt: selected.agents_prompt,
+      tools_prompt: selected.tools_prompt,
+    });
+    setPromptMode(selected.prompt_mode);
     setAvatarEmoji(selected.avatar_emoji);
     setAvatarColor(selected.avatar_color);
     setAvatarUrl(selected.avatar_url);
@@ -338,8 +419,11 @@ export function AgentProfilesPage() {
     !draftMode &&
     !!selected &&
     (name.trim() !== selected.name ||
-      identityPrompt.trim() !== selected.identity_prompt ||
-      includeClaudePreset !== selected.include_claude_preset ||
+      identityPrompt !== selected.identity_prompt ||
+      soulPrompt !== selected.soul_prompt ||
+      agentsPrompt !== selected.agents_prompt ||
+      toolsPrompt !== selected.tools_prompt ||
+      promptMode !== selected.prompt_mode ||
       avatarEmoji !== selected.avatar_emoji ||
       avatarColor !== selected.avatar_color ||
       !sameRuntimePolicy(currentRuntimePolicy, selected.runtime_policy));
@@ -348,65 +432,68 @@ export function AgentProfilesPage() {
     draftMode &&
     (!!name.trim() ||
       !!identityPrompt.trim() ||
-      !includeClaudePreset ||
+      !!soulPrompt.trim() ||
+      !!agentsPrompt.trim() ||
+      !!toolsPrompt.trim() ||
+      promptMode !== 'append' ||
       avatarEmoji !== null ||
       avatarColor !== null ||
       !sameRuntimePolicy(currentRuntimePolicy, DEFAULT_RUNTIME_POLICY));
   const hasUnsavedChanges = dirty || draftDirty;
+  const shouldBlockNavigation = useCallback<BlockerFunction>(
+    ({ currentLocation, nextLocation }) =>
+      navigationGuardRef.current.shouldBlock(
+        hasUnsavedChanges,
+        currentLocation,
+        nextLocation,
+      ),
+    [hasUnsavedChanges],
+  );
+  const navigationBlocker = useBlocker(shouldBlockNavigation);
+
+  useBeforeUnload(
+    useCallback(
+      (event) => {
+        if (!hasUnsavedChanges) return;
+        event.preventDefault();
+        event.returnValue = '';
+      },
+      [hasUnsavedChanges],
+    ),
+  );
+
+  useEffect(() => {
+    if (navigationBlocker.state !== 'blocked') return;
+    if (confirm('当前 Agent 有未保存修改，离开页面会丢失。是否继续？')) {
+      navigationBlocker.proceed();
+    } else {
+      navigationBlocker.reset();
+    }
+  }, [navigationBlocker]);
 
   useEffect(() => {
     if (searchParams.get('create') !== '1') return;
     const next = new URLSearchParams(searchParams);
     next.delete('create');
-    if (
-      hasUnsavedChanges &&
-      !confirm('当前 Agent 有未保存修改，继续会丢失。是否继续？')
-    ) {
-      setSearchParams(next, { replace: true });
-      return;
-    }
     setDraftMode(true);
+    setDraftStep(1);
     setSelectedId(null);
     setName('');
-    setIdentityPrompt('');
-    setIncludeClaudePreset(true);
+    setCurrentPrompts({
+      identity_prompt: '',
+      soul_prompt: '',
+      agents_prompt: '',
+      tools_prompt: '',
+    });
+    setPromptMode('append');
     setAvatarEmoji(null);
     setAvatarColor(null);
     setAvatarUrl(null);
     setAvatarStyleOpen(false);
     applyRuntimePolicyToForm(DEFAULT_RUNTIME_POLICY);
     setCreatePanelOpen(false);
-    setSearchParams(next, { replace: true });
-  }, [hasUnsavedChanges, searchParams, setSearchParams]);
-
-  useEffect(() => {
-    if (!hasUnsavedChanges) return;
-
-    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
-      event.preventDefault();
-      event.returnValue = '';
-    };
-    const handleNavigationClick = (event: MouseEvent) => {
-      if (event.defaultPrevented || event.button !== 0) return;
-      const target = event.target;
-      if (!(target instanceof Element)) return;
-      const anchor = target.closest('a[href]');
-      if (!(anchor instanceof HTMLAnchorElement)) return;
-      if (anchor.target === '_blank' || anchor.href === window.location.href)
-        return;
-      if (!confirm('当前 Agent 有未保存修改，离开页面会丢失。是否继续？')) {
-        event.preventDefault();
-        event.stopPropagation();
-      }
-    };
-
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    document.addEventListener('click', handleNavigationClick, true);
-    return () => {
-      window.removeEventListener('beforeunload', handleBeforeUnload);
-      document.removeEventListener('click', handleNavigationClick, true);
-    };
-  }, [hasUnsavedChanges]);
+    setAllowedSearchParams(next, { replace: true });
+  }, [searchParams, setAllowedSearchParams]);
 
   const getErrorMessage = (err: unknown, fallback: string) => {
     if (err instanceof Error) return err.message;
@@ -438,13 +525,7 @@ export function AgentProfilesPage() {
   }, [skillIds, skills]);
 
   const mcpOptions = useMemo(() => {
-    const available = mcpServers
-      .filter((server) => server.enabled)
-      .map((server) => ({
-        id: server.id,
-        name: server.id,
-        description: server.description,
-      }));
+    const available = buildMcpPolicyOptions(mcpServers);
     const known = new Set(available.map((option) => option.id));
     return [
       ...available,
@@ -463,7 +544,7 @@ export function AgentProfilesPage() {
     if (!confirmDiscardUnsavedChanges()) return;
     setDraftMode(false);
     setSelectedId(profileId);
-    setSearchParams({ agent: profileId }, { replace: true });
+    setAllowedSearchParams({ agent: profileId }, { replace: true });
   };
 
   const handleRefreshProfiles = () => {
@@ -479,10 +560,16 @@ export function AgentProfilesPage() {
     try {
       const draft = await generateProfileDraft(description);
       setDraftMode(true);
+      setDraftStep(1);
       setSelectedId(null);
       setName(draft.name);
-      setIdentityPrompt(draft.identity_prompt);
-      setIncludeClaudePreset(true);
+      setCurrentPrompts({
+        identity_prompt: draft.identity_prompt,
+        soul_prompt: draft.soul_prompt,
+        agents_prompt: draft.agents_prompt,
+        tools_prompt: draft.tools_prompt,
+      });
+      setPromptMode(draft.prompt_mode);
       setAvatarEmoji(null);
       setAvatarColor(null);
       setAvatarUrl(null);
@@ -500,10 +587,16 @@ export function AgentProfilesPage() {
   const handleBlankDraft = () => {
     if (!confirmDiscardUnsavedChanges()) return;
     setDraftMode(true);
+    setDraftStep(1);
     setSelectedId(null);
     setName('');
-    setIdentityPrompt('');
-    setIncludeClaudePreset(true);
+    setCurrentPrompts({
+      identity_prompt: '',
+      soul_prompt: '',
+      agents_prompt: '',
+      tools_prompt: '',
+    });
+    setPromptMode('append');
     setAvatarEmoji(null);
     setAvatarColor(null);
     setAvatarUrl(null);
@@ -526,8 +619,8 @@ export function AgentProfilesPage() {
     try {
       const profile = await createProfile({
         name: trimmed,
-        identity_prompt: identityPrompt.trim(),
-        include_claude_preset: includeClaudePreset,
+        ...currentPrompts,
+        prompt_mode: promptMode,
         avatar_emoji: avatarEmoji,
         avatar_color: avatarColor,
         runtime_policy: currentRuntimePolicy,
@@ -535,7 +628,7 @@ export function AgentProfilesPage() {
       setCreateDescription('');
       setDraftMode(false);
       setSelectedId(profile.id);
-      setSearchParams({ agent: profile.id }, { replace: true });
+      setAllowedSearchParams({ agent: profile.id }, { replace: true });
       toast.success('已创建 Agent');
     } catch (err) {
       toast.error(getErrorMessage(err, '创建失败'));
@@ -550,12 +643,14 @@ export function AgentProfilesPage() {
     try {
       const changes: Parameters<typeof updateProfile>[1] = {};
       if (name.trim() !== selected.name) changes.name = name.trim();
-      if (identityPrompt.trim() !== selected.identity_prompt) {
-        changes.identity_prompt = identityPrompt.trim();
-      }
-      if (includeClaudePreset !== selected.include_claude_preset) {
-        changes.include_claude_preset = includeClaudePreset;
-      }
+      const promptPatch = buildAgentPromptPatch(currentPrompts, promptMode, {
+        identity_prompt: selected.identity_prompt,
+        soul_prompt: selected.soul_prompt,
+        agents_prompt: selected.agents_prompt,
+        tools_prompt: selected.tools_prompt,
+        prompt_mode: selected.prompt_mode,
+      });
+      if (promptPatch) Object.assign(changes, promptPatch);
       if (avatarEmoji !== selected.avatar_emoji) {
         changes.avatar_emoji = avatarEmoji;
       }
@@ -666,7 +761,9 @@ export function AgentProfilesPage() {
       (profile) => profile.id !== selected.id,
     );
     setSelectedId(fallback?.id ?? null);
-    setSearchParams(fallback ? { agent: fallback.id } : {}, { replace: true });
+    setAllowedSearchParams(fallback ? { agent: fallback.id } : {}, {
+      replace: true,
+    });
     toast.success('已删除');
   };
 
@@ -902,9 +999,41 @@ export function AgentProfilesPage() {
                 </div>
               </header>
 
+              {draftMode && (
+                <nav
+                  aria-label="创建 Agent 步骤"
+                  className="overflow-x-auto rounded-xl border bg-card p-2"
+                >
+                  <ol className="flex min-w-[680px] gap-1">
+                    {[
+                      [1, '基本信息'],
+                      [2, '四段提示词'],
+                      [3, 'Claude 来源'],
+                      [4, 'Skills / MCP'],
+                      [5, '确认创建'],
+                    ].map(([step, label]) => (
+                      <li key={step} className="min-w-0 flex-1">
+                        <button
+                          type="button"
+                          onClick={() => setDraftStep(Number(step))}
+                          aria-current={draftStep === step ? 'step' : undefined}
+                          className={`w-full rounded-lg px-3 py-2 text-left text-xs transition-colors ${draftStep === step ? 'bg-primary text-primary-foreground' : Number(step) < draftStep ? 'bg-primary/10 text-foreground' : 'text-muted-foreground hover:bg-muted'}`}
+                        >
+                          <span className="mr-1.5 font-semibold">{step}</span>
+                          {label}
+                        </button>
+                      </li>
+                    ))}
+                  </ol>
+                </nav>
+              )}
+
               <div className="space-y-5">
                 <div className="space-y-5">
-                  <section className="overflow-hidden rounded-xl border border-border bg-card">
+                  <section
+                    hidden={draftMode && draftStep !== 1}
+                    className="overflow-hidden rounded-xl border border-border bg-card"
+                  >
                     <div className="border-b border-border px-5 py-4">
                       <h2 className="text-sm font-semibold text-foreground">
                         身份
@@ -1045,50 +1174,17 @@ export function AgentProfilesPage() {
                           </p>
                         )}
                       </div>
-                      <div>
-                        <label
-                          htmlFor="agent-profile-identity-prompt"
-                          className="mb-2 block text-sm font-medium"
-                        >
-                          身份提示词
-                        </label>
-                        <Textarea
-                          id="agent-profile-identity-prompt"
-                          value={identityPrompt}
-                          onChange={(event) =>
-                            setIdentityPrompt(event.target.value)
-                          }
-                          className="min-h-[180px] resize-y text-sm leading-6"
-                          placeholder="例如：你是一个偏产品架构的工程 Agent，回答时先明确边界，再给可执行方案。"
-                        />
-                      </div>
-                      <div className="flex items-center justify-between gap-3 rounded-lg border bg-muted/20 px-3 py-3">
-                        <div className="min-w-0">
-                          <div className="text-sm font-medium text-foreground">
-                            包含 Claude Code 原生提示词
-                          </div>
-                          <div className="mt-1 text-xs text-muted-foreground">
-                            关闭后该 Agent 运行时只使用 HappyClaw 与 Agent
-                            提示词
-                          </div>
-                        </div>
-                        <Switch
-                          checked={includeClaudePreset}
-                          onCheckedChange={setIncludeClaudePreset}
-                          aria-label="包含 Claude Code 原生提示词"
-                        />
-                      </div>
-                      {isAdmin && (
+                      {isAdmin && !draftMode && (
                         <div className="flex items-start justify-between gap-4 rounded-lg border bg-muted/20 px-3 py-3">
                           <div className="min-w-0">
                             <div className="text-sm font-medium text-foreground">
                               继承宿主机 Claude Code 配置
                             </div>
                             <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                              将 ~/.claude/ 作为这个 Agent
-                              的基础上下文。无论工作区运行在 Docker
-                              还是宿主机，该设置都会生效；HappyClaw 管理的
-                              Skills 与 MCP 仍会作为附加能力生效。
+                              自动继承宿主机 ~/.claude 中的提示词、Rules、全部
+                              Skills 与 MCP，无需再次选择。无论工作区运行在容器
+                              还是宿主机都会生效；下面选择的 HappyClaw Skills 与
+                              MCP 会继续作为附加能力加载。
                             </div>
                           </div>
                           <Switch
@@ -1105,18 +1201,163 @@ export function AgentProfilesPage() {
                     </div>
                   </section>
 
-                  {!draftMode && selected && (
-                    <AgentPromptAssistant
-                      key={selected.id}
-                      profileId={selected.id}
-                      agentName={name.trim() || selected.name}
-                      currentPrompt={identityPrompt}
-                      onApply={setIdentityPrompt}
+                  {draftMode && draftStep === 3 && (
+                    <section className="overflow-hidden rounded-xl border border-border bg-card">
+                      <div className="border-b px-5 py-4">
+                        <h2 className="text-sm font-semibold">
+                          Claude 配置来源
+                        </h2>
+                        <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                          决定 Agent 使用 HappyClaw
+                          托管配置，还是复用管理员宿主机 ~/.claude。
+                        </p>
+                      </div>
+                      <div
+                        className="grid gap-3 p-5 sm:grid-cols-2"
+                        role="radiogroup"
+                        aria-label="Claude 配置来源"
+                      >
+                        <button
+                          type="button"
+                          role="radio"
+                          aria-checked={contextSource === 'managed'}
+                          onClick={() => setContextSource('managed')}
+                          className={`rounded-lg border p-4 text-left ${contextSource === 'managed' ? 'border-primary bg-primary/5' : 'hover:bg-muted'}`}
+                        >
+                          <span className="block text-sm font-medium">
+                            HappyClaw 托管
+                          </span>
+                          <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                            使用系统配置，并叠加本 Agent 选择的 Skills 与 MCP。
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          role="radio"
+                          aria-checked={contextSource === 'host_claude'}
+                          disabled={!isAdmin}
+                          onClick={() => setContextSource('host_claude')}
+                          className={`rounded-lg border p-4 text-left disabled:cursor-not-allowed disabled:opacity-50 ${contextSource === 'host_claude' ? 'border-primary bg-primary/5' : 'hover:bg-muted'}`}
+                        >
+                          <span className="block text-sm font-medium">
+                            继承宿主机 ~/.claude
+                          </span>
+                          <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                            自动继承提示词、Rules、全部 Skills 与 MCP；HappyClaw
+                            能力继续叠加。
+                          </span>
+                        </button>
+                      </div>
+                    </section>
+                  )}
+
+                  <div hidden={draftMode && draftStep !== 2}>
+                    <AgentPromptEditor
+                      value={currentPrompts}
+                      mode={promptMode}
+                      onChange={setCurrentPrompts}
+                      onModeChange={setPromptMode}
+                      onOpenAssistant={
+                        draftMode ? undefined : setAssistantSection
+                      }
                     />
+                  </div>
+
+                  {!draftMode && selected && (
+                    <>
+                      <AgentPromptAssistant
+                        key={selected.id}
+                        profileId={selected.id}
+                        agentName={name.trim() || selected.name}
+                        currentPrompts={currentPrompts}
+                        activeSection={assistantSection}
+                        onApply={setCurrentPrompts}
+                      />
+                      <AgentPromptVersionHistory
+                        profileId={selected.id}
+                        currentVersion={selected.version}
+                        currentPrompts={currentPrompts}
+                        loadVersions={loadPromptVersions}
+                        restoreVersion={restorePromptVersion}
+                        onRestored={(profile) => {
+                          setCurrentPrompts({
+                            identity_prompt: profile.identity_prompt,
+                            soul_prompt: profile.soul_prompt,
+                            agents_prompt: profile.agents_prompt,
+                            tools_prompt: profile.tools_prompt,
+                          });
+                          setPromptMode(profile.prompt_mode);
+                        }}
+                      />
+                    </>
+                  )}
+
+                  {draftMode && draftStep === 5 && (
+                    <section className="overflow-hidden rounded-xl border border-border bg-card">
+                      <div className="border-b px-5 py-4">
+                        <h2 className="text-sm font-semibold">确认创建</h2>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          检查核心设置。创建后仍可随时修改并通过版本历史回退提示词。
+                        </p>
+                      </div>
+                      <dl className="grid gap-4 p-5 sm:grid-cols-2">
+                        <SummaryItem
+                          label="名称"
+                          value={name.trim() || '未填写'}
+                        />
+                        <SummaryItem
+                          label="提示词完成度"
+                          value={`${Object.values(currentPrompts).filter((value) => value.trim()).length}/4 段`}
+                        />
+                        <SummaryItem
+                          label="Claude 默认提示词"
+                          value={
+                            promptMode === 'append' ? '保留并追加' : '完全替换'
+                          }
+                        />
+                        <SummaryItem
+                          label="Claude 配置来源"
+                          value={
+                            contextSource === 'host_claude'
+                              ? '继承宿主机 ~/.claude'
+                              : 'HappyClaw 托管'
+                          }
+                        />
+                        <SummaryItem
+                          label="HappyClaw Skills"
+                          value={
+                            skillsMode === 'inherit'
+                              ? '全部已启用'
+                              : skillsMode === 'disabled'
+                                ? '关闭'
+                                : `所选 ${skillIds.length} 项`
+                          }
+                        />
+                        <SummaryItem
+                          label="HappyClaw MCP"
+                          value={
+                            mcpMode === 'inherit'
+                              ? '全部已启用'
+                              : mcpMode === 'disabled'
+                                ? '关闭'
+                                : `所选 ${mcpIds.length} 项`
+                          }
+                        />
+                      </dl>
+                      {!name.trim() && (
+                        <p
+                          role="alert"
+                          className="mx-5 mb-5 rounded-lg bg-error-bg px-3 py-2 text-xs text-error"
+                        >
+                          请返回“基本信息”填写名称。
+                        </p>
+                      )}
+                    </section>
                   )}
 
                   <section
                     id="agent-capabilities"
+                    hidden={draftMode && draftStep !== 4}
                     className="scroll-mt-6 overflow-hidden rounded-xl border border-border bg-card"
                   >
                     <div className="border-b border-border px-5 py-4">
@@ -1124,10 +1365,9 @@ export function AgentProfilesPage() {
                         能力配置
                       </h2>
                       <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                        这里控制 HappyClaw 附加给 Agent 的用户 Skills、用户 MCP
-                        和工具边界。工作区中的 CLAUDE.md、.claude/skills 与项目
-                        MCP 仍作为项目上下文加载；模型、Provider
-                        与凭据使用系统设置。
+                        这里只控制 HappyClaw 额外附加给 Agent 的 Skills、MCP
+                        与工具边界。继承宿主机配置时，宿主机中的全部 Skills 和
+                        MCP 已自动生效，无需在这里重复选择。
                       </p>
                     </div>
                     <div className="space-y-5 px-5 py-5">
@@ -1169,8 +1409,9 @@ export function AgentProfilesPage() {
                             />
                           )}
                           <p className="text-[11px] leading-5 text-muted-foreground">
-                            选择这个 Agent 可以使用的用户 Skills；Skill
-                            的最终动作仍受下方能力边界约束。
+                            这里只选择 HappyClaw 用户附加 Skills；系统内置
+                            Skills 始终生效。继承 ~/.claude 时，宿主机 Skills
+                            也已全部自动生效，不受这里影响。
                           </p>
                         </div>
 
@@ -1189,13 +1430,13 @@ export function AgentProfilesPage() {
                             </SelectTrigger>
                             <SelectContent>
                               <SelectItem value="inherit">
-                                使用全部 HappyClaw 用户 MCP
+                                使用全部 HappyClaw MCP
                               </SelectItem>
                               <SelectItem value="custom">
-                                只允许所选 HappyClaw 用户 MCP
+                                只允许所选 HappyClaw MCP
                               </SelectItem>
                               <SelectItem value="disabled">
-                                关闭 HappyClaw 用户 MCP
+                                关闭 HappyClaw MCP
                               </SelectItem>
                             </SelectContent>
                           </Select>
@@ -1207,14 +1448,13 @@ export function AgentProfilesPage() {
                               onChange={setMcpIds}
                               loading={mcpLoading}
                               error={mcpError}
-                              emptyText="没有已启用的用户 MCP"
+                              emptyText="没有已启用的 HappyClaw MCP"
                             />
                           )}
                           <p className="text-[11px] leading-5 text-muted-foreground">
-                            只控制 HappyClaw 附加的用户 MCP；项目 MCP
-                            与管理员授权的宿主机 MCP 仍作为 Claude
-                            上下文加载。“只读”或“严格只读”能力边界会统一关闭外部
-                            MCP。
+                            只控制 HappyClaw 额外附加的 MCP；继承宿主机
+                            ~/.claude 时，宿主机全部 MCP 已自动生效。“只读”或
+                            “严格只读”能力边界仍会统一关闭外部 MCP。
                           </p>
                         </div>
                       </div>
@@ -1336,7 +1576,8 @@ export function AgentProfilesPage() {
                               不增加 Agent 级限制
                             </SelectItem>
                             <SelectItem value="readonly">
-                              只读（禁写、Bash、子 Agent、用户 MCP 与插件）
+                              只读（禁写、Bash、子 Agent、全部外部 MCP
+                              与用户插件）
                             </SelectItem>
                             <SelectItem value="restricted">
                               严格只读（在只读基础上禁用 WebSearch / WebFetch）
@@ -1391,23 +1632,44 @@ export function AgentProfilesPage() {
                   </div>
                   {draftMode ? (
                     <>
-                      <Button
-                        onClick={handleCreate}
-                        disabled={
-                          creating || !name.trim() || !!autoCompactError
-                        }
-                      >
-                        {creating ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                        ) : (
-                          <Plus className="h-4 w-4" />
-                        )}
-                        创建 Agent
-                      </Button>
                       <Button variant="outline" onClick={handleDiscardDraft}>
                         <X className="h-4 w-4" />
                         放弃草稿
                       </Button>
+                      {draftStep > 1 && (
+                        <Button
+                          variant="outline"
+                          onClick={() =>
+                            setDraftStep((step) => Math.max(1, step - 1))
+                          }
+                        >
+                          上一步
+                        </Button>
+                      )}
+                      {draftStep < 5 ? (
+                        <Button
+                          onClick={() =>
+                            setDraftStep((step) => Math.min(5, step + 1))
+                          }
+                        >
+                          下一步
+                          <ArrowRight className="h-4 w-4" />
+                        </Button>
+                      ) : (
+                        <Button
+                          onClick={handleCreate}
+                          disabled={
+                            creating || !name.trim() || !!autoCompactError
+                          }
+                        >
+                          {creating ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Plus className="h-4 w-4" />
+                          )}
+                          创建 Agent
+                        </Button>
+                      )}
                     </>
                   ) : (
                     <>

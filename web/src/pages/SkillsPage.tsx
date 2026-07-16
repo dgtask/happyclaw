@@ -29,6 +29,9 @@ export function SkillsPage() {
   const [searchQuery, setSearchQuery] = useState('');
   const [showInstallDialog, setShowInstallDialog] = useState(false);
   const [deletingAll, setDeletingAll] = useState(false);
+  const [sourceFilter, setSourceFilter] = useState<
+    'all' | 'user' | 'project' | 'external'
+  >('all');
 
   useEffect(() => {
     loadSkills();
@@ -38,11 +41,12 @@ export function SkillsPage() {
     const q = searchQuery.toLowerCase();
     return skills.filter(
       (s) =>
-        !q ||
-        s.name.toLowerCase().includes(q) ||
-        s.description.toLowerCase().includes(q),
+        (sourceFilter === 'all' || s.source === sourceFilter) &&
+        (!q ||
+          s.name.toLowerCase().includes(q) ||
+          s.description.toLowerCase().includes(q)),
     );
-  }, [skills, searchQuery]);
+  }, [skills, searchQuery, sourceFilter]);
 
   const userSkills = filtered.filter((s) => s.source === 'user');
   const externalSkills = filtered.filter((s) => s.source === 'external');
@@ -61,7 +65,7 @@ export function SkillsPage() {
         <div className="bg-background border-b border-border px-6 py-4">
           <PageHeader
             title="Skills"
-            subtitle={`用户级 ${userSkills.length}${externalSkills.length > 0 ? ` · 宿主机 ${externalSkills.length}` : ''} · 项目级 ${projectSkills.length} · 启用 ${enabledCount}`}
+            subtitle={`我的 ${skills.filter((item) => item.source === 'user').length} · HappyClaw 内置 ${skills.filter((item) => item.source === 'project').length} · 宿主机 ${skills.filter((item) => item.source === 'external').length} · 启用 ${enabledCount}`}
             actions={
               <div className="flex items-center gap-3">
                 <Button
@@ -85,9 +89,10 @@ export function SkillsPage() {
         </div>
 
         <div className="mx-6 mt-4 rounded-lg bg-muted px-4 py-3 text-xs leading-5 text-muted-foreground">
-          用户级 Skills 可由你安装和管理；项目级 Skills 由 HappyClaw
-          提供；宿主机 Skills 仅管理员可见且只读。启用后仍需由对应 Agent
-          的能力策略决定是否可以使用。
+          “我的 Skills”可安装和管理；HappyClaw 内置与宿主机 Skills 只读。 Agent
+          继承宿主机 ~/.claude 时，宿主机全部 Skills 自动生效；Agent
+          能力策略只控制 HappyClaw 额外附加的
+          Skills。不同来源的同名项会并列显示。
         </div>
 
         {/* Content */}
@@ -100,6 +105,28 @@ export function SkillsPage() {
                 onChange={setSearchQuery}
                 placeholder="搜索技能名称或描述"
               />
+              <div
+                className="mt-3 flex gap-1 overflow-x-auto"
+                aria-label="Skill 来源筛选"
+              >
+                {(
+                  [
+                    ['all', '全部'],
+                    ['user', '我的'],
+                    ['project', 'HappyClaw 内置'],
+                    ['external', '宿主机'],
+                  ] as const
+                ).map(([value, label]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    onClick={() => setSourceFilter(value)}
+                    className={`shrink-0 rounded-full px-3 py-1.5 text-xs transition-colors ${sourceFilter === value ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
             </div>
 
             <div className="space-y-6">
@@ -122,7 +149,7 @@ export function SkillsPage() {
                     <div>
                       <div className="flex items-center justify-between mb-3">
                         <h2 className="text-sm font-semibold text-muted-foreground">
-                          用户级技能 ({userSkills.length})
+                          我的 Skills ({userSkills.length})
                         </h2>
                         <button
                           className="text-xs text-muted-foreground hover:text-error flex items-center gap-1 cursor-pointer"
@@ -152,10 +179,10 @@ export function SkillsPage() {
                       <div className="space-y-2">
                         {userSkills.map((skill) => (
                           <SkillCard
-                            key={skill.id}
+                            key={skill.sourceKey}
                             skill={skill}
-                            selected={selectedId === skill.id}
-                            onSelect={() => setSelectedId(skill.id)}
+                            selected={selectedId === skill.sourceKey}
+                            onSelect={() => setSelectedId(skill.sourceKey)}
                           />
                         ))}
                       </div>
@@ -165,15 +192,15 @@ export function SkillsPage() {
                   {externalSkills.length > 0 && (
                     <div>
                       <h2 className="text-sm font-semibold text-muted-foreground mb-3">
-                        宿主机技能 ({externalSkills.length})
+                        宿主机 Skills ({externalSkills.length})
                       </h2>
                       <div className="space-y-2">
                         {externalSkills.map((skill) => (
                           <SkillCard
-                            key={skill.id}
+                            key={skill.sourceKey}
                             skill={skill}
-                            selected={selectedId === skill.id}
-                            onSelect={() => setSelectedId(skill.id)}
+                            selected={selectedId === skill.sourceKey}
+                            onSelect={() => setSelectedId(skill.sourceKey)}
                           />
                         ))}
                       </div>
@@ -183,15 +210,15 @@ export function SkillsPage() {
                   {projectSkills.length > 0 && (
                     <div>
                       <h2 className="text-sm font-semibold text-muted-foreground mb-3">
-                        项目级技能 ({projectSkills.length})
+                        HappyClaw 内置 ({projectSkills.length})
                       </h2>
                       <div className="space-y-2">
                         {projectSkills.map((skill) => (
                           <SkillCard
-                            key={skill.id}
+                            key={skill.sourceKey}
                             skill={skill}
-                            selected={selectedId === skill.id}
-                            onSelect={() => setSelectedId(skill.id)}
+                            selected={selectedId === skill.sourceKey}
+                            onSelect={() => setSelectedId(skill.sourceKey)}
                           />
                         ))}
                       </div>

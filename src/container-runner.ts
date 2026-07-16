@@ -37,12 +37,17 @@ import {
 import { providerPool } from './provider-pool.js';
 import {
   deleteSession,
+  getUserById,
   getSessionProviderId,
   setSessionProviderId,
 } from './db.js';
 import { isApiError } from './agent-output-parser.js';
 import type { ClaudeProviderConfig } from './runtime-config.js';
-import { loadUserMcpServers } from './mcp-utils.js';
+import {
+  loadManagedMcpLayers,
+  resolveManagedMcpPolicy,
+  type ManagedMcpLayers,
+} from './mcp-utils.js';
 import {
   loadClaudeContextMcpServers,
   mergeMcpServerLayers,
@@ -333,6 +338,19 @@ interface ResolvedProvider {
 
 type RunnerAgentProfile = NonNullable<ContainerInput['agentProfile']>;
 
+function ownerCanUseAdminOnlySystemMcp(
+  ownerId: string | null | undefined,
+): boolean {
+  if (!ownerId) return false;
+  try {
+    const owner = getUserById(ownerId);
+    return owner?.role === 'admin' && owner.status === 'active';
+  } catch {
+    // Database initialization/test harness failures must never widen access.
+    return false;
+  }
+}
+
 function sanitizeRuntimePolicyPathSegment(value: string): string {
   return (
     value
@@ -436,34 +454,25 @@ function resolveAgentProfileUserSkillsPolicy(
 }
 
 function resolveAgentProfileMcpPolicy(
-  allServers: Record<string, Record<string, unknown>>,
+  layers: ManagedMcpLayers,
   agentProfile?: RunnerAgentProfile,
 ): {
   servers: Record<string, Record<string, unknown>>;
   replaceMcpServers: boolean;
 } {
   const policy = agentProfile?.runtimePolicy?.mcp;
-  if (!policy || policy.mode === 'inherit') {
-    return { servers: allServers, replaceMcpServers: false };
-  }
-  if (policy.mode === 'disabled') {
-    return { servers: {}, replaceMcpServers: true };
-  }
-
-  const missingIds = policy.ids.filter(
-    (id) => !Object.prototype.hasOwnProperty.call(allServers, id),
+  const resolved = resolveManagedMcpPolicy(
+    layers,
+    policy ?? { mode: 'inherit', ids: [] },
   );
-  if (missingIds.length > 0) {
+  if (resolved.missing.length > 0) {
     throw new Error(
-      `AgentProfile ${agentProfile?.id ?? 'unknown'} requires unavailable MCP server(s): ${missingIds.join(', ')}`,
+      `AgentProfile ${agentProfile?.id ?? 'unknown'} requires unavailable MCP server(s): ${resolved.missing.join(', ')}`,
     );
   }
-  const allowed = new Set(policy.ids);
   return {
-    servers: Object.fromEntries(
-      Object.entries(allServers).filter(([name]) => allowed.has(name)),
-    ),
-    replaceMcpServers: true,
+    servers: resolved.servers,
+    replaceMcpServers: policy?.mode !== 'inherit',
   };
 }
 
@@ -850,8 +859,12 @@ export function buildVolumeMounts(
     userSkillsDirOverride: userSkillsPolicy.userSkillsDirOverride,
   });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  const mcpServers = ownerId ? loadUserMcpServers(ownerId) : {};
-  const mcpPolicy = resolveAgentProfileMcpPolicy(mcpServers, agentProfile);
+  const mcpLayers = ownerId
+    ? loadManagedMcpLayers(ownerId, {
+        allowAdminOnlySystemMcp: ownerCanUseAdminOnlySystemMcp(ownerId),
+      })
+    : { system: {}, user: {}, restrictedSystemIds: [] };
+  const mcpPolicy = resolveAgentProfileMcpPolicy(mcpLayers, agentProfile);
   const contextMcpServers = loadClaudeContextMcpServers({
     workspaceDir: groupDir,
     externalClaudeDir: getEffectiveExternalDir(),
@@ -1305,25 +1318,36 @@ export async function runContainerAgent(
         plugins: group.created_by
           ? loadUserPlugins(group.created_by, { runtime: 'docker' })
           : [],
-        contextAudit: buildClaudeContextPlan({
-          executionMode: 'container',
-          group,
-          ownerHomeFolder,
-          externalClaudeDir: getEffectiveExternalDir(),
-          projectRoot: process.cwd(),
-          dataDir: DATA_DIR,
-          groupSessionsDir: sessionAgentId
-            ? path.join(
-                DATA_DIR,
-                'sessions',
-                group.folder,
-                'agents',
-                sessionAgentId,
-                '.claude',
-              )
-            : path.join(DATA_DIR, 'sessions', group.folder, '.claude'),
-          mountUserSkills: shouldMountUserSkills,
-        }).audit,
+        contextAudit: (() => {
+          const skillsPolicy = resolveAgentProfileUserSkillsPolicy(
+            group.created_by,
+            input.agentProfile,
+          );
+          return buildClaudeContextPlan({
+            executionMode: 'container',
+            group,
+            ownerHomeFolder,
+            externalClaudeDir: getEffectiveExternalDir(),
+            projectRoot: process.cwd(),
+            dataDir: DATA_DIR,
+            groupSessionsDir: sessionAgentId
+              ? path.join(
+                  DATA_DIR,
+                  'sessions',
+                  group.folder,
+                  'agents',
+                  sessionAgentId,
+                  '.claude',
+                )
+              : path.join(DATA_DIR, 'sessions', group.folder, '.claude'),
+            includeHostClaudeContext: shouldIncludeHostClaudeContext(
+              input.agentProfile,
+            ),
+            mountUserSkills:
+              shouldMountUserSkills && skillsPolicy.mountUserSkills,
+            userSkillsDirOverride: skillsPolicy.userSkillsDirOverride,
+          }).audit;
+        })(),
       };
       container.stdin.write(JSON.stringify(dockerInput));
       container.stdin.end();
@@ -1738,8 +1762,12 @@ export async function runHostAgent(
   // Load user's global MCP servers (same logic as Docker mode).
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   const hostMcpServers = group.created_by
-    ? loadUserMcpServers(group.created_by)
-    : {};
+    ? loadManagedMcpLayers(group.created_by, {
+        allowAdminOnlySystemMcp: ownerCanUseAdminOnlySystemMcp(
+          group.created_by,
+        ),
+      })
+    : { system: {}, user: {}, restrictedSystemIds: [] };
   const hostMcpPolicy = resolveAgentProfileMcpPolicy(
     hostMcpServers,
     input.agentProfile,
@@ -1797,7 +1825,7 @@ export async function runHostAgent(
 
   // Strip macOS launch-context vars that must not be inherited by child
   // processes. When happyclaw is started by a background process manager
-  // (pm2 / launchd / ssh / cron) outside a normal login session, XPC_FLAGS=0x2
+  // (launchd / ssh / cron) outside a normal login session, XPC_FLAGS=0x2
   // leaks into the environment. The bundled bun/CFNetwork-based claude CLI then
   // can't reach mDNSResponder/securityd through XPC, so DNS resolution and the
   // system CA store fail and every model request dies with FailedToOpenSocket.
@@ -2107,7 +2135,7 @@ export async function runHostAgent(
 
       // 7. 启动进程
       // Resolve absolute node path: bare 'node' fails with ENOENT under
-      // PM2 / launchd / GUI launchers where PATH lacks nvm/fnm dirs.
+      // Process managers / launchd / GUI launchers where PATH lacks nvm/fnm dirs.
       const hostNodeBinary = resolveHostNodeBinary(hostEnv);
       const proc = spawn(hostNodeBinary, [agentRunnerDist], {
         stdio: ['pipe', 'pipe', 'pipe'],

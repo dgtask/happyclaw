@@ -7,7 +7,12 @@ import { useAgentProfilesStore } from '../../stores/agent-profiles';
 import { useMcpServersStore } from '../../stores/mcp-servers';
 import { useSkillsStore } from '../../stores/skills';
 import type { AgentProfileRuntimePolicy } from '../../types';
+import {
+  buildMcpPolicyOptions,
+  normalizeMcpPolicyReferences,
+} from '../../utils/mcp-servers';
 import { PolicyResourcePicker } from '../agents/PolicyResourcePicker';
+import { EffectiveCapabilitiesPreview } from '../agents/EffectiveCapabilitiesPreview';
 import { Button } from '@/components/ui/button';
 import {
   Select,
@@ -24,6 +29,12 @@ export function MainAgentCapabilitiesSection() {
   const profiles = useAgentProfilesStore((state) => state.profiles);
   const profilesLoading = useAgentProfilesStore((state) => state.loading);
   const loadProfiles = useAgentProfilesStore((state) => state.loadProfiles);
+  const governance = useAgentProfilesStore((state) =>
+    profileKey(state.profiles, state.governanceByProfile),
+  );
+  const loadProfileGovernance = useAgentProfilesStore(
+    (state) => state.loadProfileGovernance,
+  );
   const skills = useSkillsStore((state) => state.skills);
   const skillsLoading = useSkillsStore((state) => state.loading);
   const skillsError = useSkillsStore((state) => state.error);
@@ -50,9 +61,14 @@ export function MainAgentCapabilitiesSection() {
     setSkillsMode(profile.runtime_policy.skills.mode);
     setSkillIds(profile.runtime_policy.skills.ids);
     setMcpMode(profile.runtime_policy.mcp.mode);
-    setMcpIds(profile.runtime_policy.mcp.ids);
+    setMcpIds(normalizeMcpPolicyReferences(profile.runtime_policy.mcp.ids));
     setToolsMode(profile.runtime_policy.tools.mode);
   }, [profile?.id, profile?.updated_at]);
+
+  useEffect(() => {
+    if (!profile?.id) return;
+    void loadProfileGovernance(profile.id).catch(() => undefined);
+  }, [loadProfileGovernance, profile?.id]);
 
   const skillOptions = useMemo(() => {
     const available = skills
@@ -72,13 +88,7 @@ export function MainAgentCapabilitiesSection() {
   }, [skillIds, skills]);
 
   const mcpOptions = useMemo(() => {
-    const available = mcpServers
-      .filter((server) => server.enabled)
-      .map((server) => ({
-        id: server.id,
-        name: server.id,
-        description: server.description,
-      }));
+    const available = buildMcpPolicyOptions(mcpServers);
     const known = new Set(available.map((item) => item.id));
     return [
       ...available,
@@ -95,8 +105,23 @@ export function MainAgentCapabilitiesSection() {
         JSON.stringify(profile.runtime_policy.skills.ids) ||
       mcpMode !== profile.runtime_policy.mcp.mode ||
       JSON.stringify(mcpIds) !==
-        JSON.stringify(profile.runtime_policy.mcp.ids) ||
+        JSON.stringify(
+          normalizeMcpPolicyReferences(profile.runtime_policy.mcp.ids),
+        ) ||
       toolsMode !== profile.runtime_policy.tools.mode);
+
+  const currentRuntimePolicy = useMemo<AgentProfileRuntimePolicy | null>(
+    () =>
+      profile
+        ? {
+            ...profile.runtime_policy,
+            skills: { mode: skillsMode, ids: skillIds },
+            mcp: { mode: mcpMode, ids: mcpIds },
+            tools: { mode: toolsMode },
+          }
+        : null,
+    [mcpIds, mcpMode, profile, skillIds, skillsMode, toolsMode],
+  );
 
   const save = async () => {
     if (!profile || !dirty) return;
@@ -139,19 +164,20 @@ export function MainAgentCapabilitiesSection() {
       <div>
         <h3 className="text-sm font-semibold text-foreground">系统附加能力</h3>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          控制 HappyClaw 为主 Agent 附加的用户 Skills、用户 MCP
-          和工具边界。工作区中的 CLAUDE.md、.claude/skills 与项目 MCP
-          仍按项目上下文加载。
+          控制 HappyClaw 为主 Agent 额外附加的用户 Skills、MCP 与工具边界。系统
+          内置 Skills 始终生效且不进入选择器。若主 Agent 继承宿主机
+          ~/.claude，宿主机提示词、Rules、全部 Skills 和 MCP
+          已自动生效，不受这里的选择影响。
         </p>
       </div>
 
       <div className="grid gap-5 lg:grid-cols-2">
         <CapabilityPicker
-          label="用户 Skills"
+          label="HappyClaw 用户 Skills"
           value={skillsMode}
           onValueChange={setSkillsMode}
           customLabel="只允许所选 Skills"
-          disabledLabel="关闭用户 Skills"
+          disabledLabel="关闭用户附加 Skills"
         >
           {skillsMode === 'custom' && (
             <PolicyResourcePicker
@@ -167,11 +193,11 @@ export function MainAgentCapabilitiesSection() {
         </CapabilityPicker>
 
         <CapabilityPicker
-          label="用户 MCP"
+          label="HappyClaw MCP"
           value={mcpMode}
           onValueChange={setMcpMode}
           customLabel="只允许所选 MCP"
-          disabledLabel="关闭用户 MCP"
+          disabledLabel="关闭 HappyClaw MCP"
         >
           {mcpMode === 'custom' && (
             <PolicyResourcePicker
@@ -181,7 +207,7 @@ export function MainAgentCapabilitiesSection() {
               onChange={setMcpIds}
               loading={mcpLoading}
               error={mcpError}
-              emptyText="没有已启用的用户 MCP"
+              emptyText="没有已启用的 HappyClaw MCP"
             />
           )}
         </CapabilityPicker>
@@ -201,7 +227,7 @@ export function MainAgentCapabilitiesSection() {
           <SelectContent>
             <SelectItem value="inherit">完整能力</SelectItem>
             <SelectItem value="readonly">
-              只读（禁写、Bash、子 Agent、用户 MCP 与插件）
+              只读（禁写、Bash、子 Agent、全部外部 MCP 与用户插件）
             </SelectItem>
             <SelectItem value="restricted">
               严格只读（额外关闭 WebSearch / WebFetch）
@@ -220,8 +246,25 @@ export function MainAgentCapabilitiesSection() {
           保存附加能力
         </Button>
       </div>
+      {currentRuntimePolicy && (
+        <EffectiveCapabilitiesPreview
+          profileId={profile.id}
+          runtimePolicy={currentRuntimePolicy}
+          workspaces={governance?.workspaces ?? []}
+        />
+      )}
     </section>
   );
+}
+
+function profileKey(
+  profiles: ReturnType<typeof useAgentProfilesStore.getState>['profiles'],
+  governanceByProfile: ReturnType<
+    typeof useAgentProfilesStore.getState
+  >['governanceByProfile'],
+) {
+  const profile = profiles.find((item) => item.is_default);
+  return profile ? governanceByProfile[profile.id] : undefined;
 }
 
 function CapabilityPicker({

@@ -7,6 +7,9 @@ import { STORE_DIR, GROUPS_DIR } from './config.js';
 import { logger } from './logger.js';
 import {
   AgentProfile,
+  AgentProfilePromptMode,
+  AgentProfilePrompts,
+  AgentProfilePromptVersion,
   AgentProfileRuntimePolicy,
   AgentKind,
   AgentStatus,
@@ -21,6 +24,8 @@ import {
   BillingAuditLog,
   BillingPlan,
   ChannelMount,
+  ChannelAccount,
+  ChannelProvider,
   DailyUsage,
   ExecutionMode,
   InviteCode,
@@ -48,9 +53,20 @@ import {
   PermissionTemplateKey,
 } from './types.js';
 import { getDefaultPermissions, normalizePermissions } from './permissions.js';
+import { channelConversationJid } from './channel-address.js';
 import { getChannelFromJid } from './channel-prefixes.js';
+import {
+  includeClaudePresetForMode,
+  normalizeAgentProfilePrompts,
+  promptModeFromLegacyPreset,
+} from './agent-profile-prompts.js';
 
 let db: InstanceType<typeof Database>;
+const CURRENT_SCHEMA_VERSION = 51;
+
+export function isDatabaseInitialized(): boolean {
+  return Boolean(db?.open);
+}
 
 // Prepared statement cache — lazy-initialized on first use after initDatabase()
 let _stmts: {
@@ -84,10 +100,11 @@ function stmts() {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       insertUsageInsert: db.prepare(
-        `INSERT INTO usage_records (id, user_id, group_folder, agent_id, message_id, model,
+        `INSERT INTO usage_records (id, event_id, user_id, group_folder, agent_id, message_id, model,
           input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
-          cost_usd, duration_ms, num_turns, source, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          cost_usd, provider_estimated_cost_usd, billed_cost_usd,
+          duration_ms, num_turns, source, usage_date, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       insertUsageUpsert: db.prepare(
         `INSERT INTO usage_daily_summary (user_id, model, date,
@@ -240,7 +257,7 @@ function tableExists(tableName: string): boolean {
   return !!row;
 }
 
-function cleanupKnownForeignKeyOrphans(): void {
+function reportKnownForeignKeyOrphans(): void {
   if (!tableExists('users')) return;
   const specs: Array<{
     childTable: string;
@@ -280,24 +297,107 @@ function cleanupKnownForeignKeyOrphans(): void {
     }
     const result = db
       .prepare(
-        `DELETE FROM ${spec.childTable}
+        `SELECT COUNT(*) AS count FROM ${spec.childTable}
          WHERE ${spec.childColumn} IS NOT NULL
            AND NOT EXISTS (
              SELECT 1 FROM ${spec.parentTable}
              WHERE ${spec.parentTable}.${spec.parentColumn} = ${spec.childTable}.${spec.childColumn}
            )`,
       )
-      .run();
-    if (result.changes > 0) {
+      .get() as { count: number };
+    if (result.count > 0) {
       logger.warn(
         {
           table: spec.childTable,
           parentTable: spec.parentTable,
-          rows: result.changes,
+          rows: result.count,
         },
-        'Cleaned orphaned rows before enabling foreign-key enforcement',
+        'Preserving orphaned rows for operator review before foreign-key enforcement',
       );
     }
+  }
+}
+
+function sqliteStringLiteral(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+/**
+ * Create a self-contained, consistent snapshot before upgrading an existing
+ * database. VACUUM INTO reads through SQLite's transaction layer, so committed
+ * WAL pages are included. This function intentionally runs before any schema
+ * or data-reconciliation write; a backup failure aborts startup.
+ */
+function createPreMigrationBackup(dbPath: string, schemaVersion: number): void {
+  const configuredDir = process.env.HAPPYCLAW_MIGRATION_BACKUP_DIR;
+  const backupDir = configuredDir
+    ? path.resolve(configuredDir)
+    : path.join(path.dirname(dbPath), 'migration-backups');
+  const timestamp = new Date().toISOString().replaceAll(/[:.]/g, '-');
+  const backupPath = path.join(
+    backupDir,
+    `messages-v${schemaVersion}-to-v${CURRENT_SCHEMA_VERSION}-${timestamp}-${process.pid}.db`,
+  );
+
+  let probe: InstanceType<typeof Database> | undefined;
+  try {
+    fs.mkdirSync(backupDir, { recursive: true });
+    db.exec(`VACUUM INTO ${sqliteStringLiteral(backupPath)}`);
+    probe = new Database(backupPath);
+    const result = probe.pragma('quick_check', { simple: true });
+    if (result !== 'ok') {
+      throw new Error(`quick_check returned ${String(result)}`);
+    }
+    probe.close();
+    probe = undefined;
+    fs.chmodSync(backupPath, 0o600);
+    logger.info(
+      {
+        backupPath,
+        fromVersion: schemaVersion,
+        toVersion: CURRENT_SCHEMA_VERSION,
+      },
+      'Created pre-migration SQLite backup',
+    );
+  } catch (error) {
+    try {
+      probe?.close();
+    } catch {
+      // Preserve the original backup/validation error.
+    }
+    for (const candidate of [
+      backupPath,
+      `${backupPath}-wal`,
+      `${backupPath}-shm`,
+    ]) {
+      try {
+        fs.rmSync(candidate, { force: true });
+      } catch {
+        // Cleanup must not hide the backup failure that blocks migration.
+      }
+    }
+    throw new Error(
+      `Refusing database migration v${schemaVersion}→v${CURRENT_SCHEMA_VERSION}: pre-migration backup failed`,
+      { cause: error },
+    );
+  }
+}
+
+function enforcePreMigrationBackup(dbPath: string): void {
+  const rawVersion = getRouterStateInternal('schema_version');
+  if (rawVersion === undefined) return;
+
+  const schemaVersion = Number(rawVersion);
+  if (!Number.isInteger(schemaVersion) || schemaVersion < 0) {
+    throw new Error(`Invalid database schema version: ${rawVersion}`);
+  }
+  if (schemaVersion > CURRENT_SCHEMA_VERSION) {
+    throw new Error(
+      `Database schema v${schemaVersion} is newer than supported v${CURRENT_SCHEMA_VERSION}; refusing downgrade`,
+    );
+  }
+  if (schemaVersion >= 39 && schemaVersion < CURRENT_SCHEMA_VERSION) {
+    createPreMigrationBackup(dbPath, schemaVersion);
   }
 }
 
@@ -307,10 +407,18 @@ export function initDatabase(): void {
 
   db = new Database(dbPath);
 
-  // Enable WAL mode for better concurrency and performance
-  db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA busy_timeout = 5000');
-  cleanupKnownForeignKeyOrphans();
+  try {
+    enforcePreMigrationBackup(dbPath);
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+
+  // Enable WAL mode for better concurrency and performance only after the
+  // upgrade backup gate has completed without mutating the source schema.
+  db.exec('PRAGMA journal_mode = WAL');
+  reportKnownForeignKeyOrphans();
   // Enable foreign-key enforcement. SQLite defaults to OFF for backward
   // compatibility, so all FK declarations on existing schemas are silent
   // no-ops without this PRAGMA. We log existing orphans (if any) but only
@@ -424,6 +532,31 @@ export function initDatabase(): void {
       created_by TEXT,
       is_home INTEGER DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS channel_accounts (
+      id TEXT PRIMARY KEY,
+      owner_user_id TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      name TEXT NOT NULL,
+      secret_ref TEXT NOT NULL UNIQUE,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      is_default INTEGER NOT NULL DEFAULT 0,
+      is_legacy_default INTEGER NOT NULL DEFAULT 0,
+      auth_mode TEXT NOT NULL DEFAULT 'credentials',
+      auth_status TEXT NOT NULL DEFAULT 'draft',
+      transport_status TEXT NOT NULL DEFAULT 'disconnected',
+      status TEXT NOT NULL DEFAULT 'disconnected',
+      default_agent_profile_id TEXT,
+      default_workspace_jid TEXT,
+      last_error TEXT,
+      connected_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(owner_user_id, provider, name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_channel_accounts_owner_provider
+      ON channel_accounts(owner_user_id, provider, updated_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_accounts_one_default
+      ON channel_accounts(owner_user_id, provider) WHERE is_default = 1;
     CREATE TABLE IF NOT EXISTS im_context_bindings (
       source_jid TEXT NOT NULL,
       context_type TEXT NOT NULL,
@@ -617,6 +750,10 @@ export function initDatabase(): void {
       owner_user_id TEXT NOT NULL,
       name TEXT NOT NULL,
       identity_prompt TEXT NOT NULL DEFAULT '',
+      soul_prompt TEXT NOT NULL DEFAULT '',
+      agents_prompt TEXT NOT NULL DEFAULT '',
+      tools_prompt TEXT NOT NULL DEFAULT '',
+      prompt_mode TEXT NOT NULL DEFAULT 'append',
       include_claude_preset INTEGER NOT NULL DEFAULT 1,
       avatar_emoji TEXT,
       avatar_color TEXT,
@@ -634,6 +771,25 @@ export function initDatabase(): void {
       WHERE is_default = 1 AND status = 'active';
     CREATE INDEX IF NOT EXISTS idx_agent_profiles_owner
       ON agent_profiles(owner_user_id, status);
+
+    CREATE TABLE IF NOT EXISTS agent_profile_prompt_versions (
+      id TEXT PRIMARY KEY,
+      agent_profile_id TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      identity_prompt TEXT NOT NULL DEFAULT '',
+      soul_prompt TEXT NOT NULL DEFAULT '',
+      agents_prompt TEXT NOT NULL DEFAULT '',
+      tools_prompt TEXT NOT NULL DEFAULT '',
+      prompt_mode TEXT NOT NULL DEFAULT 'append',
+      identity_hash TEXT NOT NULL,
+      change_source TEXT NOT NULL DEFAULT 'update',
+      restored_from_version INTEGER,
+      created_at TEXT NOT NULL,
+      UNIQUE(agent_profile_id, version)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_profile_prompt_versions_profile
+      ON agent_profile_prompt_versions(agent_profile_id, version DESC);
 
     CREATE TABLE IF NOT EXISTS workspace_agent_profiles (
       group_folder TEXT PRIMARY KEY,
@@ -785,6 +941,7 @@ export function initDatabase(): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS usage_records (
       id TEXT PRIMARY KEY,
+      event_id TEXT,
       user_id TEXT NOT NULL,
       group_folder TEXT NOT NULL,
       agent_id TEXT,
@@ -795,14 +952,40 @@ export function initDatabase(): void {
       cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
       cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
       cost_usd REAL NOT NULL DEFAULT 0,
+      provider_estimated_cost_usd REAL NOT NULL DEFAULT 0,
+      billed_cost_usd REAL NOT NULL DEFAULT 0,
       duration_ms INTEGER DEFAULT 0,
       num_turns INTEGER DEFAULT 0,
       source TEXT NOT NULL DEFAULT 'agent',
+      usage_date TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_usage_user_date ON usage_records(user_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_usage_group_date ON usage_records(group_folder, created_at);
     CREATE INDEX IF NOT EXISTS idx_usage_model_date ON usage_records(model, created_at);
+    CREATE TABLE IF NOT EXISTS usage_events (
+      event_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      group_folder TEXT NOT NULL,
+      agent_id TEXT,
+      message_id TEXT,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+      provider_estimated_cost_usd REAL NOT NULL DEFAULT 0,
+      billed_cost_usd REAL NOT NULL DEFAULT 0,
+      duration_ms INTEGER NOT NULL DEFAULT 0,
+      num_turns INTEGER NOT NULL DEFAULT 0,
+      source TEXT NOT NULL DEFAULT 'agent',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_usage_events_user_date
+      ON usage_events(user_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_usage_events_group_date
+      ON usage_events(group_folder, created_at);
+    CREATE INDEX IF NOT EXISTS idx_usage_events_agent_date
+      ON usage_events(agent_id, created_at);
 
     CREATE TABLE IF NOT EXISTS usage_daily_summary (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -832,6 +1015,25 @@ export function initDatabase(): void {
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+  `);
+
+  // v51 usage event ledger columns. These must be added before creating the
+  // event/model uniqueness index because existing databases already have the
+  // usage_records table.
+  ensureColumn('usage_records', 'event_id', 'TEXT');
+  ensureColumn(
+    'usage_records',
+    'provider_estimated_cost_usd',
+    'REAL NOT NULL DEFAULT 0',
+  );
+  ensureColumn('usage_records', 'billed_cost_usd', 'REAL NOT NULL DEFAULT 0');
+  ensureColumn('usage_records', 'usage_date', 'TEXT');
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_event_model
+      ON usage_records(event_id, model) WHERE event_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_usage_date ON usage_records(usage_date);
+    CREATE INDEX IF NOT EXISTS idx_usage_user_usage_date
+      ON usage_records(user_id, usage_date);
   `);
 
   // Lightweight migrations for existing DBs
@@ -904,6 +1106,11 @@ export function initDatabase(): void {
     'registered_groups',
     'binding_mode',
     "TEXT DEFAULT 'single_context'",
+  );
+  ensureColumn(
+    'registered_groups',
+    'native_context_type',
+    "TEXT DEFAULT 'none'",
   );
   ensureColumn('registered_groups', 'feishu_chat_mode', 'TEXT');
   ensureColumn('registered_groups', 'feishu_group_message_type', 'TEXT');
@@ -1333,7 +1540,8 @@ export function initDatabase(): void {
           COALESCE(jme.key, 'unknown'),
           COALESCE(json_extract(jme.value, '$.inputTokens'), 0),
           COALESCE(json_extract(jme.value, '$.outputTokens'), 0),
-          0, 0,
+          COALESCE(json_extract(jme.value, '$.cacheReadInputTokens'), 0),
+          COALESCE(json_extract(jme.value, '$.cacheCreationInputTokens'), 0),
           COALESCE(json_extract(jme.value, '$.costUSD'), 0),
           COALESCE(json_extract(m.token_usage, '$.durationMs'), 0),
           COALESCE(json_extract(m.token_usage, '$.numTurns'), 0),
@@ -1460,6 +1668,146 @@ export function initDatabase(): void {
   ensureColumn('agent_profiles', 'avatar_color', 'TEXT');
   ensureColumn('agent_profiles', 'avatar_url', 'TEXT');
 
+  // v47 → v48: split the legacy all-in-one Agent prompt into the four
+  // IDENTITY / SOUL / AGENTS / TOOLS sections. The legacy prompt represented
+  // general operating instructions, so migrate it losslessly into AGENTS.
+  const promptSchemaVersion = Number(
+    getRouterStateInternal('schema_version') ?? '0',
+  );
+  ensureColumn('agent_profiles', 'soul_prompt', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('agent_profiles', 'agents_prompt', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('agent_profiles', 'tools_prompt', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(
+    'agent_profiles',
+    'prompt_mode',
+    "TEXT NOT NULL DEFAULT 'append'",
+  );
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_profile_prompt_versions (
+      id TEXT PRIMARY KEY,
+      agent_profile_id TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      identity_prompt TEXT NOT NULL DEFAULT '',
+      soul_prompt TEXT NOT NULL DEFAULT '',
+      agents_prompt TEXT NOT NULL DEFAULT '',
+      tools_prompt TEXT NOT NULL DEFAULT '',
+      prompt_mode TEXT NOT NULL DEFAULT 'append',
+      identity_hash TEXT NOT NULL,
+      change_source TEXT NOT NULL DEFAULT 'update',
+      restored_from_version INTEGER,
+      created_at TEXT NOT NULL,
+      UNIQUE(agent_profile_id, version)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_profile_prompt_versions_profile
+      ON agent_profile_prompt_versions(agent_profile_id, version DESC);
+  `);
+  if (promptSchemaVersion < 48) {
+    const legacyRows = db
+      .prepare('SELECT * FROM agent_profiles')
+      .all() as Array<Record<string, unknown>>;
+    db.transaction(() => {
+      for (const row of legacyRows) {
+        const legacyPrompt = String(row.identity_prompt ?? '');
+        const includePreset = Number(row.include_claude_preset ?? 1) === 1;
+        const prompts = normalizeAgentProfilePrompts({
+          identity_prompt: '',
+          soul_prompt: String(row.soul_prompt ?? ''),
+          agents_prompt: String(row.agents_prompt ?? '') || legacyPrompt,
+          tools_prompt: String(row.tools_prompt ?? ''),
+          prompt_mode: promptModeFromLegacyPreset(includePreset),
+        });
+        const runtimePolicy = parseAgentProfileRuntimePolicy(
+          row.runtime_policy,
+        );
+        const identityHash = computeAgentProfileIdentityHash(
+          prompts,
+          runtimePolicy,
+          String(row.name ?? ''),
+        );
+        db.prepare(
+          `UPDATE agent_profiles
+           SET identity_prompt = ?, soul_prompt = ?, agents_prompt = ?, tools_prompt = ?,
+               prompt_mode = ?, include_claude_preset = ?, identity_hash = ?
+           WHERE id = ?`,
+        ).run(
+          prompts.identity_prompt,
+          prompts.soul_prompt,
+          prompts.agents_prompt,
+          prompts.tools_prompt,
+          prompts.prompt_mode,
+          includeClaudePresetForMode(prompts.prompt_mode) ? 1 : 0,
+          identityHash,
+          String(row.id),
+        );
+        insertAgentProfilePromptVersionSnapshot({
+          profileId: String(row.id),
+          version: Number(row.version ?? 1),
+          name: String(row.name ?? ''),
+          prompts,
+          identityHash,
+          changeSource: 'migration',
+          createdAt: String(
+            row.updated_at ?? row.created_at ?? new Date().toISOString(),
+          ),
+        });
+      }
+    })();
+  }
+
+  // v48 → v49: first-class channel accounts. Credentials are stored outside
+  // SQLite behind secret_ref; routing projections retain the account ID so
+  // two bots in the same external chat cannot share a JID/mount accidentally.
+  ensureColumn('registered_groups', 'channel_account_id', 'TEXT');
+  ensureColumn('channel_mounts', 'channel_account_id', 'TEXT');
+  ensureColumn('agent_channel_mounts', 'channel_account_id', 'TEXT');
+  ensureColumn(
+    'channel_accounts',
+    'is_legacy_default',
+    'INTEGER NOT NULL DEFAULT 0',
+  );
+  // v49 → v50: model authorization separately from the live transport.
+  // QR protocols may have a socket running while still waiting for a scan;
+  // that must never be published as a connected account.
+  ensureColumn(
+    'channel_accounts',
+    'auth_mode',
+    "TEXT NOT NULL DEFAULT 'credentials'",
+  );
+  ensureColumn(
+    'channel_accounts',
+    'auth_status',
+    "TEXT NOT NULL DEFAULT 'draft'",
+  );
+  ensureColumn(
+    'channel_accounts',
+    'transport_status',
+    "TEXT NOT NULL DEFAULT 'disconnected'",
+  );
+  db.exec(`
+    UPDATE channel_accounts SET auth_mode = CASE
+      WHEN provider IN ('wechat', 'whatsapp') THEN 'qr_session'
+      WHEN provider IN ('telegram', 'discord') THEN 'bot_token'
+      ELSE 'credentials'
+    END
+    WHERE auth_mode IS NULL OR auth_mode = '' OR auth_mode = 'credentials';
+    UPDATE channel_accounts SET auth_status = CASE
+      WHEN status = 'connected' THEN 'authorized'
+      WHEN status = 'error' THEN 'error'
+      ELSE auth_status
+    END;
+    UPDATE channel_accounts SET transport_status = status
+      WHERE transport_status = 'disconnected' AND status != 'disconnected';
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_rg_channel_account
+      ON registered_groups(channel_account_id);
+    CREATE INDEX IF NOT EXISTS idx_channel_mounts_account
+      ON channel_mounts(channel_account_id);
+    CREATE INDEX IF NOT EXISTS idx_agent_channel_mounts_account
+      ON agent_channel_mounts(channel_account_id);
+  `);
+
   // v44 → v45: make the SDK resume-state projection explicit. The former
   // `workspace_sessions` name looked like a product conversation model even
   // though it only mirrored `sessions` provider/SDK metadata.
@@ -1556,10 +1904,59 @@ export function initDatabase(): void {
   backfillAgentProfileDefaultsAndWorkspaceMappings();
   reconcileCanonicalRuntimeProjections();
 
-  const SCHEMA_VERSION = '47';
+  // v50 -> v51: make usage a first-class, idempotent event ledger. Historical
+  // rows predate event IDs, so each row becomes one explicitly marked legacy
+  // event; we do not guess which old model rows belonged to the same run.
+  const v51Check = getRouterStateInternal('schema_version');
+  if (!v51Check || parseInt(v51Check, 10) < 51) {
+    db.transaction(() => {
+      db.exec(`
+        UPDATE usage_records
+        SET provider_estimated_cost_usd = cost_usd
+        WHERE provider_estimated_cost_usd = 0 AND cost_usd != 0;
+
+        UPDATE usage_records
+        SET usage_date = date(created_at, 'localtime')
+        WHERE usage_date IS NULL OR usage_date = '';
+
+        UPDATE usage_records
+        SET user_id = COALESCE((
+          SELECT rg.created_by FROM registered_groups rg
+          WHERE rg.folder = usage_records.group_folder
+            AND rg.created_by IS NOT NULL
+          LIMIT 1
+        ), user_id)
+        WHERE user_id = 'system';
+
+        UPDATE usage_records
+        SET event_id = 'legacy:' || id
+        WHERE event_id IS NULL OR event_id = '';
+
+        INSERT OR IGNORE INTO usage_events (
+          event_id, user_id, group_folder, agent_id, message_id,
+          input_tokens, output_tokens, cache_read_input_tokens,
+          cache_creation_input_tokens, provider_estimated_cost_usd,
+          billed_cost_usd, duration_ms, num_turns, source, created_at
+        )
+        SELECT event_id, user_id, group_folder, agent_id, message_id,
+          input_tokens, output_tokens, cache_read_input_tokens,
+          cache_creation_input_tokens, provider_estimated_cost_usd,
+          billed_cost_usd, duration_ms, num_turns, source, created_at
+        FROM usage_records;
+      `);
+    })();
+  }
+  // Idempotent repair for installations that briefly ran an early v51 build
+  // before usage_date was added to the finalized migration.
+  db.exec(`
+    UPDATE usage_records
+    SET usage_date = date(created_at, 'localtime')
+    WHERE usage_date IS NULL OR usage_date = '';
+  `);
+
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
-  ).run('schema_version', SCHEMA_VERSION);
+  ).run('schema_version', String(CURRENT_SCHEMA_VERSION));
 }
 
 /**
@@ -1835,6 +2232,69 @@ export function updateLatestMessageTokenUsage(
 }
 
 /**
+ * Rebuild a message's cumulative usage snapshot from the immutable event
+ * ledger. This keeps legacy message consumers accurate when one visible reply
+ * receives multiple incremental SDK usage events.
+ */
+export function rebuildMessageTokenUsageFromLedger(
+  chatJid: string,
+  groupFolder: string,
+  messageId: string,
+): void {
+  const total = db
+    .prepare(
+      `SELECT COALESCE(SUM(input_tokens), 0) AS inputTokens,
+        COALESCE(SUM(output_tokens), 0) AS outputTokens,
+        COALESCE(SUM(cache_read_input_tokens), 0) AS cacheReadInputTokens,
+        COALESCE(SUM(cache_creation_input_tokens), 0) AS cacheCreationInputTokens,
+        COALESCE(SUM(provider_estimated_cost_usd), 0) AS costUSD,
+        COALESCE(SUM(duration_ms), 0) AS durationMs,
+        COALESCE(SUM(num_turns), 0) AS numTurns
+       FROM usage_events WHERE group_folder = ? AND message_id = ?`,
+    )
+    .get(groupFolder, messageId) as Record<string, number>;
+  const modelRows = db
+    .prepare(
+      `SELECT model, COALESCE(SUM(input_tokens), 0) AS inputTokens,
+        COALESCE(SUM(output_tokens), 0) AS outputTokens,
+        COALESCE(SUM(cache_read_input_tokens), 0) AS cacheReadInputTokens,
+        COALESCE(SUM(cache_creation_input_tokens), 0) AS cacheCreationInputTokens,
+        COALESCE(SUM(provider_estimated_cost_usd), 0) AS costUSD
+       FROM usage_records WHERE group_folder = ? AND message_id = ?
+       GROUP BY model ORDER BY model`,
+    )
+    .all(groupFolder, messageId) as Array<Record<string, unknown>>;
+  const modelUsage = Object.fromEntries(
+    modelRows.map((row) => [
+      String(row.model),
+      {
+        inputTokens: Number(row.inputTokens) || 0,
+        outputTokens: Number(row.outputTokens) || 0,
+        cacheReadInputTokens: Number(row.cacheReadInputTokens) || 0,
+        cacheCreationInputTokens: Number(row.cacheCreationInputTokens) || 0,
+        costUSD: Number(row.costUSD) || 0,
+      },
+    ]),
+  );
+  const tokenUsage = {
+    inputTokens: Number(total.inputTokens) || 0,
+    outputTokens: Number(total.outputTokens) || 0,
+    cacheReadInputTokens: Number(total.cacheReadInputTokens) || 0,
+    cacheCreationInputTokens: Number(total.cacheCreationInputTokens) || 0,
+    costUSD: Number(total.costUSD) || 0,
+    durationMs: Number(total.durationMs) || 0,
+    numTurns: Number(total.numTurns) || 0,
+    modelUsage,
+  };
+  updateLatestMessageTokenUsage(
+    chatJid,
+    JSON.stringify(tokenUsage),
+    messageId,
+    tokenUsage.costUSD,
+  );
+}
+
+/**
  * Get token usage statistics aggregated by date.
  */
 export function getTokenUsageStats(
@@ -1936,7 +2396,13 @@ export function getTokenUsageStats(
       try {
         const modelUsage = JSON.parse(row.model_usage_json) as Record<
           string,
-          { inputTokens: number; outputTokens: number; costUSD: number }
+          {
+            inputTokens: number;
+            outputTokens: number;
+            cacheReadInputTokens?: number;
+            cacheCreationInputTokens?: number;
+            costUSD: number;
+          }
         >;
         for (const [model, usage] of Object.entries(modelUsage)) {
           addToAggregated(
@@ -1944,8 +2410,8 @@ export function getTokenUsageStats(
             model,
             usage.inputTokens || 0,
             usage.outputTokens || 0,
-            0,
-            0,
+            usage.cacheReadInputTokens || 0,
+            usage.cacheCreationInputTokens || 0,
             usage.costUSD || 0,
           );
         }
@@ -2054,6 +2520,23 @@ function toLocalDateString(date?: Date | string): string {
   return `${year}-${month}-${day}`;
 }
 
+export function getUsageDateWindow(
+  days: number,
+  now: Date = new Date(),
+): { from: string; to: string; days: number; timezone: string } {
+  const normalizedDays = Math.min(Math.max(Math.trunc(days) || 1, 1), 365);
+  const to = new Date(now);
+  const from = new Date(now);
+  from.setHours(12, 0, 0, 0);
+  from.setDate(from.getDate() - (normalizedDays - 1));
+  return {
+    from: toLocalDateString(from),
+    to: toLocalDateString(to),
+    days: normalizedDays,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+  };
+}
+
 /**
  * Insert a usage record and update daily summary.
  */
@@ -2072,38 +2555,204 @@ export function insertUsageRecord(record: {
   numTurns?: number;
   source?: string;
 }): void {
-  const id = crypto.randomUUID();
-  const now = new Date().toISOString();
-  const localDate = toLocalDateString();
+  recordUsageEventBatch({
+    eventId: crypto.randomUUID(),
+    userId: record.userId,
+    groupFolder: record.groupFolder,
+    agentId: record.agentId,
+    messageId: record.messageId,
+    inputTokens: record.inputTokens,
+    outputTokens: record.outputTokens,
+    cacheReadInputTokens: record.cacheReadInputTokens,
+    cacheCreationInputTokens: record.cacheCreationInputTokens,
+    providerEstimatedCostUSD: record.costUSD,
+    billedCostUSD: 0,
+    durationMs: record.durationMs,
+    numTurns: record.numTurns,
+    source: record.source,
+    models: [
+      {
+        model: record.model,
+        inputTokens: record.inputTokens,
+        outputTokens: record.outputTokens,
+        cacheReadInputTokens: record.cacheReadInputTokens,
+        cacheCreationInputTokens: record.cacheCreationInputTokens,
+        providerEstimatedCostUSD: record.costUSD,
+        billedCostUSD: 0,
+      },
+    ],
+    trackBillingUsage: false,
+  });
+}
 
-  db.transaction(() => {
-    stmts().insertUsageInsert.run(
-      id,
-      record.userId,
-      record.groupFolder,
-      record.agentId ?? null,
-      record.messageId ?? null,
-      record.model,
-      record.inputTokens,
-      record.outputTokens,
-      record.cacheReadInputTokens,
-      record.cacheCreationInputTokens,
-      record.costUSD,
-      record.durationMs ?? 0,
-      record.numTurns ?? 0,
-      record.source ?? 'agent',
-      now,
-    );
-    stmts().insertUsageUpsert.run(
-      record.userId,
-      record.model,
-      localDate,
-      record.inputTokens,
-      record.outputTokens,
-      record.cacheReadInputTokens,
-      record.cacheCreationInputTokens,
-      record.costUSD,
-    );
+export interface UsageModelRecordInput {
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  providerEstimatedCostUSD: number;
+  billedCostUSD: number;
+}
+
+export interface UsageEventRecordInput {
+  eventId: string;
+  userId: string;
+  groupFolder: string;
+  agentId?: string | null;
+  messageId?: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  providerEstimatedCostUSD: number;
+  billedCostUSD: number;
+  durationMs?: number;
+  numTurns?: number;
+  source?: string;
+  createdAt?: string;
+  models: UsageModelRecordInput[];
+  /** Update the quota/billing period ledgers in the same transaction. */
+  trackBillingUsage?: boolean;
+  /** Atomically deduct the already-rated billedCostUSD from the user wallet. */
+  chargeBalance?: boolean;
+}
+
+/**
+ * Persist one logical Agent run and all of its per-model calls atomically.
+ * Replaying the same eventId is a no-op, including quota counters.
+ */
+export function recordUsageEventBatch(input: UsageEventRecordInput): {
+  inserted: boolean;
+} {
+  if (!input.eventId.trim()) throw new Error('usage eventId is required');
+  if (!input.userId.trim()) throw new Error('usage userId is required');
+  if (!input.groupFolder.trim())
+    throw new Error('usage groupFolder is required');
+
+  const nonNegative = (value: number) =>
+    Number.isFinite(value) ? Math.max(0, value) : 0;
+  const createdAt = input.createdAt || new Date().toISOString();
+  const localDate = toLocalDateString(createdAt);
+  const source = input.source?.trim() || 'agent';
+  const models = input.models.length
+    ? input.models
+    : [
+        {
+          model: 'unknown',
+          inputTokens: input.inputTokens,
+          outputTokens: input.outputTokens,
+          cacheReadInputTokens: input.cacheReadInputTokens,
+          cacheCreationInputTokens: input.cacheCreationInputTokens,
+          providerEstimatedCostUSD: input.providerEstimatedCostUSD,
+          billedCostUSD: input.billedCostUSD,
+        },
+      ];
+
+  return db.transaction(() => {
+    const eventInsert = db
+      .prepare(
+        `INSERT OR IGNORE INTO usage_events (
+          event_id, user_id, group_folder, agent_id, message_id,
+          input_tokens, output_tokens, cache_read_input_tokens,
+          cache_creation_input_tokens, provider_estimated_cost_usd,
+          billed_cost_usd, duration_ms, num_turns, source, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.eventId,
+        input.userId,
+        input.groupFolder,
+        input.agentId ?? null,
+        input.messageId ?? null,
+        nonNegative(input.inputTokens),
+        nonNegative(input.outputTokens),
+        nonNegative(input.cacheReadInputTokens),
+        nonNegative(input.cacheCreationInputTokens),
+        nonNegative(input.providerEstimatedCostUSD),
+        nonNegative(input.billedCostUSD),
+        nonNegative(input.durationMs ?? 0),
+        nonNegative(input.numTurns ?? 0),
+        source,
+        createdAt,
+      );
+
+    if (eventInsert.changes === 0) return { inserted: false };
+
+    for (const modelUsage of models) {
+      const model = modelUsage.model.trim() || 'unknown';
+      const estimated = nonNegative(modelUsage.providerEstimatedCostUSD);
+      const billed = nonNegative(modelUsage.billedCostUSD);
+      stmts().insertUsageInsert.run(
+        crypto.randomUUID(),
+        input.eventId,
+        input.userId,
+        input.groupFolder,
+        input.agentId ?? null,
+        input.messageId ?? null,
+        model,
+        nonNegative(modelUsage.inputTokens),
+        nonNegative(modelUsage.outputTokens),
+        nonNegative(modelUsage.cacheReadInputTokens),
+        nonNegative(modelUsage.cacheCreationInputTokens),
+        estimated,
+        estimated,
+        billed,
+        nonNegative(input.durationMs ?? 0),
+        nonNegative(input.numTurns ?? 0),
+        source,
+        localDate,
+        createdAt,
+      );
+      stmts().insertUsageUpsert.run(
+        input.userId,
+        model,
+        localDate,
+        nonNegative(modelUsage.inputTokens),
+        nonNegative(modelUsage.outputTokens),
+        nonNegative(modelUsage.cacheReadInputTokens),
+        nonNegative(modelUsage.cacheCreationInputTokens),
+        estimated,
+      );
+    }
+
+    if (input.trackBillingUsage) {
+      const d = new Date(createdAt);
+      const month = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      const billableInput =
+        nonNegative(input.inputTokens) +
+        nonNegative(input.cacheReadInputTokens) +
+        nonNegative(input.cacheCreationInputTokens);
+      incrementUsageBoth(
+        input.userId,
+        month,
+        localDate,
+        billableInput,
+        nonNegative(input.outputTokens),
+        nonNegative(input.billedCostUSD),
+      );
+    }
+
+    if (input.chargeBalance && nonNegative(input.billedCostUSD) > 0) {
+      adjustUserBalance(
+        input.userId,
+        -nonNegative(input.billedCostUSD),
+        'deduction',
+        'AI 调用消费扣费',
+        'usage_event',
+        input.eventId,
+        null,
+        `usage_event_${input.eventId}`,
+        {
+          source: 'usage_charge',
+          operatorType: 'system',
+          notes: `用量事件消费扣费: ${input.eventId}`,
+          allowNegative: true,
+        },
+      );
+    }
+
+    return { inserted: true };
   })();
 }
 
@@ -2125,9 +2774,9 @@ export function getUsageDailyStats(
   cost_usd: number;
   request_count: number;
 }> {
-  const sinceDate = toLocalDateString(new Date(Date.now() - days * 86400000));
-  const conditions: string[] = ['date >= ?'];
-  const params: unknown[] = [sinceDate];
+  const window = getUsageDateWindow(days);
+  const conditions: string[] = ['date >= ?', 'date <= ?'];
+  const params: unknown[] = [window.from, window.to];
 
   if (userId) {
     conditions.push('user_id = ?');
@@ -2183,9 +2832,9 @@ export function getUsageDailySummary(
   totalMessages: number;
   totalActiveDays: number;
 } {
-  const sinceDate = toLocalDateString(new Date(Date.now() - days * 86400000));
-  const conditions: string[] = ['date >= ?'];
-  const params: unknown[] = [sinceDate];
+  const window = getUsageDateWindow(days);
+  const conditions: string[] = ['date >= ?', 'date <= ?'];
+  const params: unknown[] = [window.from, window.to];
 
   if (userId) {
     conditions.push('user_id = ?');
@@ -2243,6 +2892,303 @@ export function getUsageModels(): string[] {
   return rows.map((r) => r.model);
 }
 
+export interface UsageQueryFilters {
+  from: string;
+  to: string;
+  userId?: string;
+  model?: string;
+  agentId?: string;
+  groupFolder?: string;
+  source?: string;
+}
+
+function buildUsageWhere(filters: UsageQueryFilters): {
+  sql: string;
+  params: unknown[];
+} {
+  const conditions = ['r.usage_date >= ?', 'r.usage_date <= ?'];
+  const params: unknown[] = [filters.from, filters.to];
+  const add = (column: string, value?: string) => {
+    if (!value) return;
+    conditions.push(`${column} = ?`);
+    params.push(value);
+  };
+  add('r.user_id', filters.userId);
+  add('r.model', filters.model);
+  if (filters.agentId === '__main__') {
+    conditions.push('r.agent_id IS NULL');
+  } else {
+    add('r.agent_id', filters.agentId);
+  }
+  add('r.group_folder', filters.groupFolder);
+  add('r.source', filters.source);
+  return { sql: conditions.join(' AND '), params };
+}
+
+export interface UsageAttributionItem {
+  key: string;
+  name: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  totalTokens: number;
+  providerEstimatedCostUSD: number;
+  billedCostUSD: number;
+  runCount: number;
+  modelCallCount: number;
+}
+
+export function getUsageAnalytics(filters: UsageQueryFilters): {
+  summary: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    totalTokens: number;
+    providerEstimatedCostUSD: number;
+    billedCostUSD: number;
+    runCount: number;
+    modelCallCount: number;
+    activeDays: number;
+  };
+  breakdown: Array<{
+    date: string;
+    model: string;
+    user_id: string;
+    agent_id: string | null;
+    group_folder: string;
+    source: string;
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_tokens: number;
+    cache_creation_tokens: number;
+    provider_estimated_cost_usd: number;
+    cost_usd: number;
+    billed_cost_usd: number;
+    run_count: number;
+    model_call_count: number;
+  }>;
+  daily: Array<{
+    date: string;
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_tokens: number;
+    cache_creation_tokens: number;
+    provider_estimated_cost_usd: number;
+    cost_usd: number;
+    billed_cost_usd: number;
+    run_count: number;
+    model_call_count: number;
+  }>;
+  attributions: {
+    models: UsageAttributionItem[];
+    agents: UsageAttributionItem[];
+    workspaces: UsageAttributionItem[];
+    sources: UsageAttributionItem[];
+  };
+} {
+  const where = buildUsageWhere(filters);
+  const aggregateSelect = `
+    COALESCE(SUM(r.input_tokens), 0) AS input_tokens,
+    COALESCE(SUM(r.output_tokens), 0) AS output_tokens,
+    COALESCE(SUM(r.cache_read_input_tokens), 0) AS cache_read_tokens,
+    COALESCE(SUM(r.cache_creation_input_tokens), 0) AS cache_creation_tokens,
+    COALESCE(SUM(r.provider_estimated_cost_usd), 0) AS provider_cost,
+    COALESCE(SUM(r.billed_cost_usd), 0) AS billed_cost,
+    COUNT(DISTINCT r.event_id) AS run_count,
+    COUNT(*) AS model_call_count`;
+  const summaryRow = db
+    .prepare(
+      `SELECT ${aggregateSelect},
+        COUNT(DISTINCT r.usage_date) AS active_days
+       FROM usage_records r WHERE ${where.sql}`,
+    )
+    .get(...where.params) as Record<string, number>;
+
+  const breakdown = db
+    .prepare(
+      `SELECT r.usage_date AS date, r.model, r.user_id,
+        r.agent_id, r.group_folder, r.source, ${aggregateSelect}
+       FROM usage_records r WHERE ${where.sql}
+       GROUP BY r.usage_date, r.model, r.user_id,
+         r.agent_id, r.group_folder, r.source
+       ORDER BY date ASC, r.model ASC`,
+    )
+    .all(...where.params)
+    .map((row: any) => ({
+      date: String(row.date),
+      model: String(row.model),
+      user_id: String(row.user_id),
+      agent_id: row.agent_id == null ? null : String(row.agent_id),
+      group_folder: String(row.group_folder),
+      source: String(row.source),
+      input_tokens: Number(row.input_tokens) || 0,
+      output_tokens: Number(row.output_tokens) || 0,
+      cache_read_tokens: Number(row.cache_read_tokens) || 0,
+      cache_creation_tokens: Number(row.cache_creation_tokens) || 0,
+      provider_estimated_cost_usd: Number(row.provider_cost) || 0,
+      cost_usd: Number(row.provider_cost) || 0,
+      billed_cost_usd: Number(row.billed_cost) || 0,
+      run_count: Number(row.run_count) || 0,
+      model_call_count: Number(row.model_call_count) || 0,
+    }));
+
+  const daily = db
+    .prepare(
+      `SELECT r.usage_date AS date, ${aggregateSelect}
+       FROM usage_records r WHERE ${where.sql}
+       GROUP BY r.usage_date
+       ORDER BY date ASC`,
+    )
+    .all(...where.params)
+    .map((row: any) => ({
+      date: String(row.date),
+      input_tokens: Number(row.input_tokens) || 0,
+      output_tokens: Number(row.output_tokens) || 0,
+      cache_read_tokens: Number(row.cache_read_tokens) || 0,
+      cache_creation_tokens: Number(row.cache_creation_tokens) || 0,
+      provider_estimated_cost_usd: Number(row.provider_cost) || 0,
+      cost_usd: Number(row.provider_cost) || 0,
+      billed_cost_usd: Number(row.billed_cost) || 0,
+      run_count: Number(row.run_count) || 0,
+      model_call_count: Number(row.model_call_count) || 0,
+    }));
+
+  const attribution = (
+    column: 'model' | 'agent_id' | 'group_folder' | 'source',
+  ): UsageAttributionItem[] => {
+    const keyExpression =
+      column === 'agent_id'
+        ? `COALESCE(CAST(r.agent_id AS TEXT), '__main__')`
+        : `COALESCE(CAST(r.${column} AS TEXT), 'unassigned')`;
+    const nameExpression =
+      column === 'agent_id'
+        ? `COALESCE(
+            (SELECT a.name FROM agents a WHERE a.id = r.agent_id LIMIT 1),
+            (SELECT ap.name FROM agent_profiles ap WHERE ap.id = r.agent_id LIMIT 1),
+            CAST(r.agent_id AS TEXT), 'HappyClaw')`
+        : column === 'group_folder'
+          ? `COALESCE(
+              (SELECT rg.name FROM registered_groups rg
+               WHERE rg.folder = r.group_folder LIMIT 1),
+              CAST(r.group_folder AS TEXT), 'unassigned')`
+          : `COALESCE(CAST(r.${column} AS TEXT), 'unassigned')`;
+    const rows = db
+      .prepare(
+        `SELECT ${keyExpression} AS key,
+          ${nameExpression} AS name,
+          ${aggregateSelect}
+         FROM usage_records r WHERE ${where.sql}
+         GROUP BY r.${column}
+         ORDER BY provider_cost DESC, key ASC`,
+      )
+      .all(...where.params) as Array<Record<string, unknown>>;
+    return rows.map((row) => {
+      const input = Number(row.input_tokens) || 0;
+      const output = Number(row.output_tokens) || 0;
+      const cacheRead = Number(row.cache_read_tokens) || 0;
+      const cacheCreation = Number(row.cache_creation_tokens) || 0;
+      const key = String(row.key);
+      return {
+        key,
+        name: String(row.name || key),
+        inputTokens: input,
+        outputTokens: output,
+        cacheReadTokens: cacheRead,
+        cacheCreationTokens: cacheCreation,
+        totalTokens: input + output + cacheRead + cacheCreation,
+        providerEstimatedCostUSD: Number(row.provider_cost) || 0,
+        billedCostUSD: Number(row.billed_cost) || 0,
+        runCount: Number(row.run_count) || 0,
+        modelCallCount: Number(row.model_call_count) || 0,
+      };
+    });
+  };
+
+  const inputTokens = Number(summaryRow.input_tokens) || 0;
+  const outputTokens = Number(summaryRow.output_tokens) || 0;
+  const cacheReadTokens = Number(summaryRow.cache_read_tokens) || 0;
+  const cacheCreationTokens = Number(summaryRow.cache_creation_tokens) || 0;
+  return {
+    summary: {
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheCreationTokens,
+      totalTokens:
+        inputTokens + outputTokens + cacheReadTokens + cacheCreationTokens,
+      providerEstimatedCostUSD: Number(summaryRow.provider_cost) || 0,
+      billedCostUSD: Number(summaryRow.billed_cost) || 0,
+      runCount: Number(summaryRow.run_count) || 0,
+      modelCallCount: Number(summaryRow.model_call_count) || 0,
+      activeDays: Number(summaryRow.active_days) || 0,
+    },
+    breakdown,
+    daily,
+    attributions: {
+      models: attribution('model'),
+      agents: attribution('agent_id'),
+      workspaces: attribution('group_folder'),
+      sources: attribution('source'),
+    },
+  };
+}
+
+export function getUsageModelsForFilters(filters: UsageQueryFilters): string[] {
+  const where = buildUsageWhere({ ...filters, model: undefined });
+  return (
+    db
+      .prepare(
+        `SELECT DISTINCT r.model FROM usage_records r
+         WHERE ${where.sql} ORDER BY r.model`,
+      )
+      .all(...where.params) as Array<{ model: string }>
+  ).map((row) => row.model);
+}
+
+export function getUsageRecordsPage(
+  filters: UsageQueryFilters,
+  page: number,
+  pageSize: number,
+): { records: Array<Record<string, unknown>>; total: number } {
+  const where = buildUsageWhere(filters);
+  const safePage = Math.max(1, Math.trunc(page) || 1);
+  // Public JSON routes cap this at 500. The higher internal ceiling is used by
+  // the authenticated CSV export to avoid silently truncating downloads.
+  const safePageSize = Math.min(
+    Math.max(1, Math.trunc(pageSize) || 50),
+    100_000,
+  );
+  const total = Number(
+    (
+      db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM usage_records r WHERE ${where.sql}`,
+        )
+        .get(...where.params) as { count: number }
+    ).count,
+  );
+  const records = db
+    .prepare(
+      `SELECT r.event_id AS eventId, r.user_id AS userId,
+        r.group_folder AS groupFolder, r.agent_id AS agentId,
+        r.message_id AS messageId, r.model,
+        r.input_tokens AS inputTokens, r.output_tokens AS outputTokens,
+        r.cache_read_input_tokens AS cacheReadTokens,
+        r.cache_creation_input_tokens AS cacheCreationTokens,
+        r.provider_estimated_cost_usd AS providerEstimatedCostUSD,
+        r.billed_cost_usd AS billedCostUSD, r.duration_ms AS durationMs,
+        r.num_turns AS numTurns, r.source, r.created_at AS createdAt
+       FROM usage_records r WHERE ${where.sql}
+       ORDER BY r.created_at DESC, r.id DESC LIMIT ? OFFSET ?`,
+    )
+    .all(...where.params, safePageSize, (safePage - 1) * safePageSize) as Array<
+    Record<string, unknown>
+  >;
+  return { records, total };
+}
+
 /**
  * Get list of users that have usage data.
  */
@@ -2250,9 +3196,9 @@ export function getUsageUsers(): Array<{ id: string; username: string }> {
   const rows = db
     .prepare(
       `
-    SELECT DISTINCT uds.user_id as id, COALESCE(u.username, uds.user_id) as username
-    FROM usage_daily_summary uds
-    LEFT JOIN users u ON u.id = uds.user_id
+    SELECT DISTINCT r.user_id as id, COALESCE(u.username, r.user_id) as username
+    FROM usage_records r
+    LEFT JOIN users u ON u.id = r.user_id
     ORDER BY u.username
   `,
     )
@@ -3058,17 +4004,60 @@ function parseAgentProfileRuntimePolicy(
 
 export function computeAgentProfileIdentityHash(
   identityPrompt: string,
-  includeClaudePreset = true,
+  includeClaudePreset?: boolean,
   runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null,
-  name = '',
+  name?: string,
+): string;
+export function computeAgentProfileIdentityHash(
+  prompts: AgentProfilePrompts,
+  runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null,
+  name?: string,
+): string;
+export function computeAgentProfileIdentityHash(
+  promptsOrIdentity: string | AgentProfilePrompts,
+  includeOrRuntime:
+    | boolean
+    | RuntimePolicyInput
+    | AgentProfileRuntimePolicy
+    | null = true,
+  runtimeOrName?:
+    | RuntimePolicyInput
+    | AgentProfileRuntimePolicy
+    | null
+    | string,
+  legacyName = '',
 ): string {
+  const legacyCall = typeof promptsOrIdentity === 'string';
+  const prompts = legacyCall
+    ? normalizeAgentProfilePrompts({
+        identity_prompt: promptsOrIdentity,
+        prompt_mode: promptModeFromLegacyPreset(
+          typeof includeOrRuntime === 'boolean' ? includeOrRuntime : true,
+        ),
+      })
+    : normalizeAgentProfilePrompts(promptsOrIdentity);
+  const runtimePolicy = legacyCall
+    ? (runtimeOrName as
+        | RuntimePolicyInput
+        | AgentProfileRuntimePolicy
+        | null
+        | undefined)
+    : (includeOrRuntime as
+        | RuntimePolicyInput
+        | AgentProfileRuntimePolicy
+        | null
+        | undefined);
+  const name = legacyCall
+    ? legacyName
+    : typeof runtimeOrName === 'string'
+      ? runtimeOrName
+      : '';
   const normalizedPolicy = normalizeAgentProfileRuntimePolicy(runtimePolicy);
   const payload: {
-    identityPrompt: string;
-    includeClaudePreset: boolean;
+    prompts: AgentProfilePrompts;
     runtimePolicy?: Record<string, unknown>;
     name?: string;
-  } = { identityPrompt, includeClaudePreset };
+  } = { prompts };
   const identityPolicy = {
     context: { source: normalizedPolicy.context.source },
     skills: normalizedPolicy.skills,
@@ -3093,16 +4082,119 @@ export function computeAgentProfileIdentityHash(
     .digest('hex');
 }
 
+function mapAgentProfilePromptVersionRow(
+  row: Record<string, unknown>,
+): AgentProfilePromptVersion {
+  return {
+    id: String(row.id),
+    agent_profile_id: String(row.agent_profile_id),
+    version: Number(row.version),
+    name: String(row.name),
+    identity_prompt: String(row.identity_prompt ?? ''),
+    soul_prompt: String(row.soul_prompt ?? ''),
+    agents_prompt: String(row.agents_prompt ?? ''),
+    tools_prompt: String(row.tools_prompt ?? ''),
+    prompt_mode: row.prompt_mode === 'replace' ? 'replace' : 'append',
+    identity_hash: String(row.identity_hash),
+    change_source:
+      row.change_source === 'create' ||
+      row.change_source === 'restore' ||
+      row.change_source === 'migration'
+        ? row.change_source
+        : 'update',
+    restored_from_version:
+      row.restored_from_version == null
+        ? null
+        : Number(row.restored_from_version),
+    created_at: String(row.created_at),
+  };
+}
+
+function insertAgentProfilePromptVersionSnapshot(input: {
+  profileId: string;
+  version: number;
+  name: string;
+  prompts: AgentProfilePrompts;
+  identityHash: string;
+  changeSource: AgentProfilePromptVersion['change_source'];
+  restoredFromVersion?: number | null;
+  createdAt?: string;
+}): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO agent_profile_prompt_versions (
+      id, agent_profile_id, version, name,
+      identity_prompt, soul_prompt, agents_prompt, tools_prompt, prompt_mode,
+      identity_hash, change_source, restored_from_version, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    crypto.randomUUID(),
+    input.profileId,
+    input.version,
+    input.name,
+    input.prompts.identity_prompt,
+    input.prompts.soul_prompt,
+    input.prompts.agents_prompt,
+    input.prompts.tools_prompt,
+    input.prompts.prompt_mode,
+    input.identityHash,
+    input.changeSource,
+    input.restoredFromVersion ?? null,
+    input.createdAt ?? new Date().toISOString(),
+  );
+}
+
+export function listAgentProfilePromptVersions(
+  profileId: string,
+  ownerUserId: string,
+): AgentProfilePromptVersion[] {
+  const profile = getAgentProfileForUser(profileId, ownerUserId);
+  if (!profile) return [];
+  const rows = db
+    .prepare(
+      `SELECT * FROM agent_profile_prompt_versions
+       WHERE agent_profile_id = ? ORDER BY version DESC`,
+    )
+    .all(profileId) as Array<Record<string, unknown>>;
+  return rows.map(mapAgentProfilePromptVersionRow);
+}
+
+export function getAgentProfilePromptVersion(
+  profileId: string,
+  ownerUserId: string,
+  version: number,
+): AgentProfilePromptVersion | undefined {
+  const profile = getAgentProfileForUser(profileId, ownerUserId);
+  if (!profile) return undefined;
+  const row = db
+    .prepare(
+      `SELECT * FROM agent_profile_prompt_versions
+       WHERE agent_profile_id = ? AND version = ?`,
+    )
+    .get(profileId, version) as Record<string, unknown> | undefined;
+  return row ? mapAgentProfilePromptVersionRow(row) : undefined;
+}
+
 function mapAgentProfileRow(row: Record<string, unknown>): AgentProfile {
   const name = String(row.name);
-  const prompt = String(row.identity_prompt ?? '');
-  const includeClaudePreset = Number(row.include_claude_preset ?? 1) === 1;
+  const persistedIncludeClaudePreset =
+    Number(row.include_claude_preset ?? 1) === 1;
+  const prompts = normalizeAgentProfilePrompts({
+    identity_prompt: String(row.identity_prompt ?? ''),
+    soul_prompt: String(row.soul_prompt ?? ''),
+    agents_prompt: String(row.agents_prompt ?? ''),
+    tools_prompt: String(row.tools_prompt ?? ''),
+    prompt_mode:
+      row.prompt_mode === 'replace' || row.prompt_mode === 'append'
+        ? row.prompt_mode
+        : promptModeFromLegacyPreset(persistedIncludeClaudePreset),
+  });
+  const includeClaudePreset = includeClaudePresetForMode(prompts.prompt_mode);
   const runtimePolicy = parseAgentProfileRuntimePolicy(row.runtime_policy);
   return {
     id: String(row.id),
     owner_user_id: String(row.owner_user_id),
     name,
-    identity_prompt: prompt,
+    ...prompts,
     include_claude_preset: includeClaudePreset,
     avatar_emoji:
       typeof row.avatar_emoji === 'string' ? row.avatar_emoji : null,
@@ -3112,12 +4204,7 @@ function mapAgentProfileRow(row: Record<string, unknown>): AgentProfile {
     runtime_policy: runtimePolicy,
     identity_hash: String(
       row.identity_hash ??
-        computeAgentProfileIdentityHash(
-          prompt,
-          includeClaudePreset,
-          runtimePolicy,
-          name,
-        ),
+        computeAgentProfileIdentityHash(prompts, runtimePolicy, name),
     ),
     version: Number(row.version ?? 1),
     is_default: Number(row.is_default ?? 0) === 1,
@@ -3164,54 +4251,72 @@ export function getOrCreateDefaultAgentProfile(userId: string): AgentProfile {
     const name = migrateName ? DEFAULT_AGENT_PROFILE_NAME : profile.name;
     const runtimePolicy = profile.runtime_policy;
     const identityHash = computeAgentProfileIdentityHash(
-      profile.identity_prompt,
-      profile.include_claude_preset,
+      profile,
       runtimePolicy,
       name,
     );
-    db.prepare(
-      `UPDATE agent_profiles
-       SET name = ?, runtime_policy = ?, identity_hash = ?, version = version + 1, updated_at = ?
-       WHERE id = ?`,
-    ).run(
-      name,
-      serializeAgentProfileRuntimePolicy(runtimePolicy),
-      identityHash,
-      now,
-      profile.id,
-    );
+    const nextVersion = profile.version + 1;
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE agent_profiles
+         SET name = ?, runtime_policy = ?, identity_hash = ?, version = ?, updated_at = ?
+         WHERE id = ?`,
+      ).run(
+        name,
+        serializeAgentProfileRuntimePolicy(runtimePolicy),
+        identityHash,
+        nextVersion,
+        now,
+        profile.id,
+      );
+    })();
     return getAgentProfile(profile.id)!;
   }
 
   const now = new Date().toISOString();
   const id = crypto.randomUUID();
   const name = DEFAULT_AGENT_PROFILE_NAME;
-  const identityPrompt = '';
-  const includeClaudePreset = true;
+  const prompts = normalizeAgentProfilePrompts();
   const runtimePolicy = normalizeAgentProfileRuntimePolicy();
   const identityHash = computeAgentProfileIdentityHash(
-    identityPrompt,
-    includeClaudePreset,
+    prompts,
     runtimePolicy,
     name,
   );
   const runtimePolicyJson = serializeAgentProfileRuntimePolicy(runtimePolicy);
-  db.prepare(
-    `INSERT INTO agent_profiles (
-      id, owner_user_id, name, identity_prompt, include_claude_preset, runtime_policy, identity_hash, version,
-      is_default, status, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, 'active', ?, ?)`,
-  ).run(
-    id,
-    userId,
-    name,
-    identityPrompt,
-    includeClaudePreset ? 1 : 0,
-    runtimePolicyJson,
-    identityHash,
-    now,
-    now,
-  );
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO agent_profiles (
+        id, owner_user_id, name,
+        identity_prompt, soul_prompt, agents_prompt, tools_prompt, prompt_mode,
+        include_claude_preset, runtime_policy, identity_hash, version,
+        is_default, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 'active', ?, ?)`,
+    ).run(
+      id,
+      userId,
+      name,
+      prompts.identity_prompt,
+      prompts.soul_prompt,
+      prompts.agents_prompt,
+      prompts.tools_prompt,
+      prompts.prompt_mode,
+      includeClaudePresetForMode(prompts.prompt_mode) ? 1 : 0,
+      runtimePolicyJson,
+      identityHash,
+      now,
+      now,
+    );
+    insertAgentProfilePromptVersionSnapshot({
+      profileId: id,
+      version: 1,
+      name,
+      prompts,
+      identityHash,
+      changeSource: 'create',
+      createdAt: now,
+    });
+  })();
   return getAgentProfile(id)!;
 }
 
@@ -3231,6 +4336,10 @@ export function createAgentProfile(input: {
   ownerUserId: string;
   name: string;
   identityPrompt?: string;
+  soulPrompt?: string;
+  agentsPrompt?: string;
+  toolsPrompt?: string;
+  promptMode?: AgentProfilePromptMode;
   includeClaudePreset?: boolean;
   avatarEmoji?: string | null;
   avatarColor?: string | null;
@@ -3238,34 +4347,57 @@ export function createAgentProfile(input: {
 }): AgentProfile {
   const now = new Date().toISOString();
   const id = crypto.randomUUID();
-  const identityPrompt = input.identityPrompt ?? '';
-  const includeClaudePreset = input.includeClaudePreset ?? true;
+  const prompts = normalizeAgentProfilePrompts({
+    identity_prompt: input.identityPrompt ?? '',
+    soul_prompt: input.soulPrompt ?? '',
+    agents_prompt: input.agentsPrompt ?? '',
+    tools_prompt: input.toolsPrompt ?? '',
+    prompt_mode:
+      input.promptMode ??
+      promptModeFromLegacyPreset(input.includeClaudePreset ?? true),
+  });
   const runtimePolicy = normalizeAgentProfileRuntimePolicy(input.runtimePolicy);
   const runtimePolicyJson = serializeAgentProfileRuntimePolicy(runtimePolicy);
   const identityHash = computeAgentProfileIdentityHash(
-    identityPrompt,
-    includeClaudePreset,
+    prompts,
     runtimePolicy,
     input.name,
   );
-  db.prepare(
-    `INSERT INTO agent_profiles (
-      id, owner_user_id, name, identity_prompt, include_claude_preset, avatar_emoji, avatar_color, runtime_policy, identity_hash, version,
-      is_default, status, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 'active', ?, ?)`,
-  ).run(
-    id,
-    input.ownerUserId,
-    input.name,
-    identityPrompt,
-    includeClaudePreset ? 1 : 0,
-    input.avatarEmoji ?? null,
-    input.avatarColor ?? null,
-    runtimePolicyJson,
-    identityHash,
-    now,
-    now,
-  );
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO agent_profiles (
+        id, owner_user_id, name,
+        identity_prompt, soul_prompt, agents_prompt, tools_prompt, prompt_mode,
+        include_claude_preset, avatar_emoji, avatar_color, runtime_policy, identity_hash, version,
+        is_default, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 'active', ?, ?)`,
+    ).run(
+      id,
+      input.ownerUserId,
+      input.name,
+      prompts.identity_prompt,
+      prompts.soul_prompt,
+      prompts.agents_prompt,
+      prompts.tools_prompt,
+      prompts.prompt_mode,
+      includeClaudePresetForMode(prompts.prompt_mode) ? 1 : 0,
+      input.avatarEmoji ?? null,
+      input.avatarColor ?? null,
+      runtimePolicyJson,
+      identityHash,
+      now,
+      now,
+    );
+    insertAgentProfilePromptVersionSnapshot({
+      profileId: id,
+      version: 1,
+      name: input.name,
+      prompts,
+      identityHash,
+      changeSource: 'create',
+      createdAt: now,
+    });
+  })();
   return getAgentProfile(id)!;
 }
 
@@ -3275,19 +4407,34 @@ export function updateAgentProfile(
   updates: {
     name?: string;
     identityPrompt?: string;
+    soulPrompt?: string;
+    agentsPrompt?: string;
+    toolsPrompt?: string;
+    promptMode?: AgentProfilePromptMode;
     includeClaudePreset?: boolean;
     avatarEmoji?: string | null;
     avatarColor?: string | null;
     avatarUrl?: string | null;
     runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null;
+    changeSource?: AgentProfilePromptVersion['change_source'];
+    restoredFromVersion?: number | null;
   },
 ): AgentProfile | undefined {
   const existing = getAgentProfileForUser(profileId, ownerUserId);
   if (!existing) return undefined;
   const nextName = updates.name ?? existing.name;
-  const nextPrompt = updates.identityPrompt ?? existing.identity_prompt;
-  const nextIncludeClaudePreset =
-    updates.includeClaudePreset ?? existing.include_claude_preset;
+  const nextPromptMode =
+    updates.promptMode ??
+    (updates.includeClaudePreset === undefined
+      ? existing.prompt_mode
+      : promptModeFromLegacyPreset(updates.includeClaudePreset));
+  const nextPrompts = normalizeAgentProfilePrompts({
+    identity_prompt: updates.identityPrompt ?? existing.identity_prompt,
+    soul_prompt: updates.soulPrompt ?? existing.soul_prompt,
+    agents_prompt: updates.agentsPrompt ?? existing.agents_prompt,
+    tools_prompt: updates.toolsPrompt ?? existing.tools_prompt,
+    prompt_mode: nextPromptMode,
+  });
   const nextRuntimePolicy =
     updates.runtimePolicy !== undefined
       ? mergeAgentProfileRuntimePolicy(
@@ -3306,32 +4453,62 @@ export function updateAgentProfile(
   const nextAvatarUrl =
     updates.avatarUrl === undefined ? existing.avatar_url : updates.avatarUrl;
   const nextHash = computeAgentProfileIdentityHash(
-    nextPrompt,
-    nextIncludeClaudePreset,
+    nextPrompts,
     nextRuntimePolicy,
     nextName,
   );
   const identityChanged = nextHash !== existing.identity_hash;
+  const promptChanged =
+    nextPrompts.identity_prompt !== existing.identity_prompt ||
+    nextPrompts.soul_prompt !== existing.soul_prompt ||
+    nextPrompts.agents_prompt !== existing.agents_prompt ||
+    nextPrompts.tools_prompt !== existing.tools_prompt ||
+    nextPrompts.prompt_mode !== existing.prompt_mode;
   const nextVersion = identityChanged ? existing.version + 1 : existing.version;
   const now = new Date().toISOString();
-  db.prepare(
-    `UPDATE agent_profiles
-     SET name = ?, identity_prompt = ?, include_claude_preset = ?, avatar_emoji = ?, avatar_color = ?, avatar_url = ?, runtime_policy = ?, identity_hash = ?, version = ?, updated_at = ?
-     WHERE id = ? AND owner_user_id = ? AND status = 'active'`,
-  ).run(
-    nextName,
-    nextPrompt,
-    nextIncludeClaudePreset ? 1 : 0,
-    nextAvatarEmoji,
-    nextAvatarColor,
-    nextAvatarUrl,
-    serializeAgentProfileRuntimePolicy(nextRuntimePolicy),
-    nextHash,
-    nextVersion,
-    now,
-    profileId,
-    ownerUserId,
-  );
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE agent_profiles
+       SET name = ?, identity_prompt = ?, soul_prompt = ?, agents_prompt = ?, tools_prompt = ?,
+           prompt_mode = ?, include_claude_preset = ?, avatar_emoji = ?, avatar_color = ?, avatar_url = ?,
+           runtime_policy = ?, identity_hash = ?, version = ?, updated_at = ?
+       WHERE id = ? AND owner_user_id = ? AND status = 'active'`,
+    ).run(
+      nextName,
+      nextPrompts.identity_prompt,
+      nextPrompts.soul_prompt,
+      nextPrompts.agents_prompt,
+      nextPrompts.tools_prompt,
+      nextPrompts.prompt_mode,
+      includeClaudePresetForMode(nextPrompts.prompt_mode) ? 1 : 0,
+      nextAvatarEmoji,
+      nextAvatarColor,
+      nextAvatarUrl,
+      serializeAgentProfileRuntimePolicy(nextRuntimePolicy),
+      nextHash,
+      nextVersion,
+      now,
+      profileId,
+      ownerUserId,
+    );
+    // Runtime identity versions intentionally also advance for name and
+    // capability-policy changes so existing SDK sessions are invalidated.
+    // Prompt history, however, is a history of the four prompt sections and
+    // prompt mode only; recording unrelated identity versions here would show
+    // duplicate prompt revisions in the editor.
+    if (promptChanged) {
+      insertAgentProfilePromptVersionSnapshot({
+        profileId,
+        version: nextVersion,
+        name: nextName,
+        prompts: nextPrompts,
+        identityHash: nextHash,
+        changeSource: updates.changeSource ?? 'update',
+        restoredFromVersion: updates.restoredFromVersion,
+        createdAt: now,
+      });
+    }
+  })();
   return getAgentProfile(profileId);
 }
 
@@ -3521,6 +4698,7 @@ type RegisteredGroupRow = {
   init_source_path: string | null;
   init_git_url: string | null;
   created_by: string | null;
+  channel_account_id: string | null;
   is_home: number;
   selected_skills: string | null;
   target_agent_id: string | null;
@@ -3534,6 +4712,7 @@ type RegisteredGroupRow = {
   conversation_source: string | null;
   conversation_nav_mode: string | null;
   binding_mode: string | null;
+  native_context_type: string | null;
   feishu_chat_mode: string | null;
   feishu_group_message_type: string | null;
   sender_allowlist: string | null;
@@ -3593,6 +4772,7 @@ function parseGroupRow(
     initSourcePath: row.init_source_path ?? undefined,
     initGitUrl: row.init_git_url ?? undefined,
     created_by: row.created_by ?? undefined,
+    channel_account_id: row.channel_account_id ?? undefined,
     is_home: row.is_home === 1,
     target_agent_id: row.target_agent_id ?? undefined,
     target_main_jid: row.target_main_jid ?? undefined,
@@ -3601,13 +4781,18 @@ function parseGroupRow(
     activation_mode: parseActivationMode(row.activation_mode),
     owner_im_id: row.owner_im_id ?? undefined,
     conversation_source:
-      row.conversation_source === 'feishu_thread' ? 'feishu_thread' : 'manual',
+      row.conversation_source === 'native_thread' ||
+      row.conversation_source === 'feishu_thread'
+        ? row.conversation_source
+        : 'manual',
     conversation_nav_mode:
       row.conversation_nav_mode === 'vertical_threads'
         ? 'vertical_threads'
         : 'horizontal',
     binding_mode:
       row.binding_mode === 'thread_map' ? 'thread_map' : 'single_context',
+    native_context_type:
+      row.native_context_type === 'thread' ? 'thread' : 'none',
     feishu_chat_mode: row.feishu_chat_mode ?? undefined,
     feishu_group_message_type: row.feishu_group_message_type ?? undefined,
     sender_allowlist: senderAllowlist,
@@ -3861,11 +5046,12 @@ function syncAgentChannelMountFromMount(mount: ChannelMount): void {
     : null;
   db.prepare(
     `INSERT INTO agent_channel_mounts (
-      channel_jid, agent_profile_id, owner_user_id, channel_type,
+      channel_jid, channel_account_id, agent_profile_id, owner_user_id, channel_type,
       workspace_jid, workspace_folder, session_id, routing_mode, reply_policy,
       activation_mode, owner_im_id, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(channel_jid) DO UPDATE SET
+      channel_account_id = excluded.channel_account_id,
       agent_profile_id = excluded.agent_profile_id,
       owner_user_id = excluded.owner_user_id,
       channel_type = excluded.channel_type,
@@ -3879,6 +5065,7 @@ function syncAgentChannelMountFromMount(mount: ChannelMount): void {
       updated_at = excluded.updated_at`,
   ).run(
     mount.channel_jid,
+    mount.channel_account_id ?? null,
     agentProfileId,
     workspace?.created_by ?? null,
     mount.channel_type,
@@ -4067,12 +5254,323 @@ export function getRegisteredGroup(
   return parseGroupRow(row);
 }
 
+type ChannelAccountRow = {
+  id: string;
+  owner_user_id: string;
+  provider: string;
+  name: string;
+  secret_ref: string;
+  enabled: number;
+  is_default: number;
+  is_legacy_default: number;
+  auth_mode: string;
+  auth_status: string;
+  transport_status: string;
+  status: string;
+  default_agent_profile_id: string | null;
+  default_workspace_jid: string | null;
+  last_error: string | null;
+  connected_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+function parseChannelAccountRow(row: ChannelAccountRow): ChannelAccount {
+  const transportStatus = ['connecting', 'connected', 'error'].includes(
+    row.transport_status || row.status,
+  )
+    ? ((row.transport_status ||
+        row.status) as ChannelAccount['transport_status'])
+    : 'disconnected';
+  const authMode = ['bot_token', 'qr_session'].includes(row.auth_mode)
+    ? (row.auth_mode as ChannelAccount['auth_mode'])
+    : 'credentials';
+  const authStatus = [
+    'awaiting_scan',
+    'authorized',
+    'revoked',
+    'error',
+  ].includes(row.auth_status)
+    ? (row.auth_status as ChannelAccount['auth_status'])
+    : 'draft';
+  return {
+    id: row.id,
+    owner_user_id: row.owner_user_id,
+    provider: row.provider as ChannelProvider,
+    name: row.name,
+    secret_ref: row.secret_ref,
+    enabled: row.enabled === 1,
+    is_default: row.is_default === 1,
+    is_legacy_default: row.is_legacy_default === 1,
+    auth_mode: authMode,
+    auth_status: authStatus,
+    transport_status: transportStatus,
+    status: transportStatus,
+    default_agent_profile_id: row.default_agent_profile_id,
+    default_workspace_jid: row.default_workspace_jid,
+    last_error: row.last_error,
+    connected_at: row.connected_at,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+export function createChannelAccount(input: {
+  id?: string;
+  owner_user_id: string;
+  provider: ChannelProvider;
+  name: string;
+  secret_ref: string;
+  enabled?: boolean;
+  is_default?: boolean;
+  is_legacy_default?: boolean;
+  auth_mode?: ChannelAccount['auth_mode'];
+  auth_status?: ChannelAccount['auth_status'];
+  default_agent_profile_id?: string | null;
+  default_workspace_jid?: string | null;
+}): ChannelAccount {
+  return db.transaction(() => {
+    const id = input.id ?? crypto.randomUUID();
+    const now = new Date().toISOString();
+    const wantsDefault = input.is_default === true;
+    const existingCount = db
+      .prepare(
+        'SELECT COUNT(*) AS count FROM channel_accounts WHERE owner_user_id = ? AND provider = ?',
+      )
+      .get(input.owner_user_id, input.provider) as { count: number };
+    const isDefault = wantsDefault || existingCount.count === 0;
+    if (isDefault) {
+      db.prepare(
+        'UPDATE channel_accounts SET is_default = 0, updated_at = ? WHERE owner_user_id = ? AND provider = ?',
+      ).run(now, input.owner_user_id, input.provider);
+    }
+    db.prepare(
+      `INSERT INTO channel_accounts (
+        id, owner_user_id, provider, name, secret_ref, enabled, is_default, is_legacy_default,
+        auth_mode, auth_status, transport_status, status, default_agent_profile_id, default_workspace_jid,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'disconnected', 'disconnected', ?, ?, ?, ?)`,
+    ).run(
+      id,
+      input.owner_user_id,
+      input.provider,
+      input.name.trim(),
+      input.secret_ref,
+      input.enabled === false ? 0 : 1,
+      isDefault ? 1 : 0,
+      input.is_legacy_default === true ? 1 : 0,
+      input.auth_mode ?? 'credentials',
+      input.auth_status ?? 'draft',
+      input.default_agent_profile_id ?? null,
+      input.default_workspace_jid ?? null,
+      now,
+      now,
+    );
+    return getChannelAccount(id)!;
+  })();
+}
+
+export function getChannelAccount(id: string): ChannelAccount | undefined {
+  const row = db
+    .prepare('SELECT * FROM channel_accounts WHERE id = ?')
+    .get(id) as ChannelAccountRow | undefined;
+  return row ? parseChannelAccountRow(row) : undefined;
+}
+
+export function getChannelAccountForUser(
+  id: string,
+  ownerUserId: string,
+): ChannelAccount | undefined {
+  const row = db
+    .prepare(
+      'SELECT * FROM channel_accounts WHERE id = ? AND owner_user_id = ?',
+    )
+    .get(id, ownerUserId) as ChannelAccountRow | undefined;
+  return row ? parseChannelAccountRow(row) : undefined;
+}
+
+export function getDefaultChannelAccount(
+  ownerUserId: string,
+  provider: ChannelProvider,
+): ChannelAccount | undefined {
+  const row = db
+    .prepare(
+      'SELECT * FROM channel_accounts WHERE owner_user_id = ? AND provider = ? ORDER BY is_default DESC, created_at ASC LIMIT 1',
+    )
+    .get(ownerUserId, provider) as ChannelAccountRow | undefined;
+  return row ? parseChannelAccountRow(row) : undefined;
+}
+
+/** The account that owns historical unscoped JIDs, independent of UI default. */
+export function getLegacyChannelAccount(
+  ownerUserId: string,
+  provider: ChannelProvider,
+): ChannelAccount | undefined {
+  const row = db
+    .prepare(
+      'SELECT * FROM channel_accounts WHERE owner_user_id = ? AND provider = ? AND is_legacy_default = 1 ORDER BY created_at ASC LIMIT 1',
+    )
+    .get(ownerUserId, provider) as ChannelAccountRow | undefined;
+  return row ? parseChannelAccountRow(row) : undefined;
+}
+
+export function listChannelAccountsForUser(
+  ownerUserId: string,
+): ChannelAccount[] {
+  const rows = db
+    .prepare(
+      'SELECT * FROM channel_accounts WHERE owner_user_id = ? ORDER BY provider, is_default DESC, created_at ASC',
+    )
+    .all(ownerUserId) as ChannelAccountRow[];
+  return rows.map(parseChannelAccountRow);
+}
+
+export function listEnabledChannelAccounts(): ChannelAccount[] {
+  return (
+    db
+      .prepare(
+        'SELECT * FROM channel_accounts WHERE enabled = 1 ORDER BY owner_user_id, provider, created_at',
+      )
+      .all() as ChannelAccountRow[]
+  ).map(parseChannelAccountRow);
+}
+
+export function updateChannelAccount(
+  id: string,
+  ownerUserId: string,
+  patch: Partial<
+    Pick<
+      ChannelAccount,
+      | 'name'
+      | 'enabled'
+      | 'is_default'
+      | 'default_agent_profile_id'
+      | 'default_workspace_jid'
+    >
+  >,
+): ChannelAccount | undefined {
+  return db.transaction(() => {
+    const current = getChannelAccountForUser(id, ownerUserId);
+    if (!current) return undefined;
+    const now = new Date().toISOString();
+    if (patch.is_default === true) {
+      db.prepare(
+        'UPDATE channel_accounts SET is_default = 0, updated_at = ? WHERE owner_user_id = ? AND provider = ? AND id != ?',
+      ).run(now, ownerUserId, current.provider, id);
+    }
+    db.prepare(
+      `UPDATE channel_accounts SET
+        name = ?, enabled = ?, is_default = ?, default_agent_profile_id = ?,
+        default_workspace_jid = ?, updated_at = ?
+       WHERE id = ? AND owner_user_id = ?`,
+    ).run(
+      patch.name?.trim() ?? current.name,
+      (patch.enabled ?? current.enabled) ? 1 : 0,
+      (patch.is_default ?? current.is_default) ? 1 : 0,
+      patch.default_agent_profile_id === undefined
+        ? current.default_agent_profile_id
+        : patch.default_agent_profile_id,
+      patch.default_workspace_jid === undefined
+        ? current.default_workspace_jid
+        : patch.default_workspace_jid,
+      now,
+      id,
+      ownerUserId,
+    );
+    if (current.is_default && patch.is_default === false) {
+      const replacement = db
+        .prepare(
+          'SELECT id FROM channel_accounts WHERE owner_user_id = ? AND provider = ? AND id != ? ORDER BY created_at ASC LIMIT 1',
+        )
+        .get(ownerUserId, current.provider, id) as { id: string } | undefined;
+      if (replacement) {
+        db.prepare(
+          'UPDATE channel_accounts SET is_default = 1, updated_at = ? WHERE id = ?',
+        ).run(now, replacement.id);
+      } else {
+        db.prepare(
+          'UPDATE channel_accounts SET is_default = 1, updated_at = ? WHERE id = ?',
+        ).run(now, id);
+      }
+    }
+    return getChannelAccountForUser(id, ownerUserId);
+  })();
+}
+
+export function updateChannelAccountStatus(
+  id: string,
+  status: ChannelAccount['status'],
+  error?: string | null,
+): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `UPDATE channel_accounts SET transport_status = ?, status = ?, last_error = ?, connected_at = ?, updated_at = ?
+     WHERE id = ?`,
+  ).run(
+    status,
+    status,
+    error ?? null,
+    status === 'connected' ? now : null,
+    now,
+    id,
+  );
+}
+
+export function updateChannelAccountAuthStatus(
+  id: string,
+  authStatus: ChannelAccount['auth_status'],
+  error?: string | null,
+): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `UPDATE channel_accounts SET auth_status = ?, last_error = ?, updated_at = ? WHERE id = ?`,
+  ).run(authStatus, error ?? null, now, id);
+}
+
+export function countChannelAccountBindings(id: string): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM (
+        SELECT jid AS key FROM registered_groups WHERE channel_account_id = ?
+        UNION SELECT channel_jid AS key FROM channel_mounts WHERE channel_account_id = ?
+        UNION SELECT channel_jid AS key FROM agent_channel_mounts WHERE channel_account_id = ?
+      )`,
+    )
+    .get(id, id, id) as { count: number };
+  return row.count;
+}
+
+export function deleteChannelAccount(id: string, ownerUserId: string): boolean {
+  return db.transaction(() => {
+    const current = getChannelAccountForUser(id, ownerUserId);
+    if (!current) return false;
+    const result = db
+      .prepare(
+        'DELETE FROM channel_accounts WHERE id = ? AND owner_user_id = ?',
+      )
+      .run(id, ownerUserId);
+    if (result.changes > 0 && current.is_default) {
+      const replacement = db
+        .prepare(
+          'SELECT id FROM channel_accounts WHERE owner_user_id = ? AND provider = ? ORDER BY created_at ASC LIMIT 1',
+        )
+        .get(ownerUserId, current.provider) as { id: string } | undefined;
+      if (replacement) {
+        db.prepare(
+          'UPDATE channel_accounts SET is_default = 1, updated_at = ? WHERE id = ?',
+        ).run(new Date().toISOString(), replacement.id);
+      }
+    }
+    return result.changes > 0;
+  })();
+}
+
 export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   db.transaction(() => {
     const existing = getRegisteredGroup(jid);
     db.prepare(
-      `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, owner_im_id, mcp_mode, selected_mcps, conversation_source, conversation_nav_mode, binding_mode, feishu_chat_mode, feishu_group_message_type, sender_allowlist)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, channel_account_id, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, owner_im_id, mcp_mode, selected_mcps, conversation_source, conversation_nav_mode, binding_mode, native_context_type, feishu_chat_mode, feishu_group_message_type, sender_allowlist)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       jid,
       group.name,
@@ -4084,6 +5582,7 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
       group.initSourcePath ?? null,
       group.initGitUrl ?? null,
       group.created_by ?? null,
+      group.channel_account_id ?? null,
       group.is_home ? 1 : 0,
       null, // selected_skills: deprecated, always null (user-level skills apply globally)
       group.target_agent_id ?? null,
@@ -4097,6 +5596,7 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
       group.conversation_source ?? 'manual',
       group.conversation_nav_mode ?? 'horizontal',
       group.binding_mode ?? 'single_context',
+      group.native_context_type ?? 'none',
       group.feishu_chat_mode ?? null,
       group.feishu_group_message_type ?? null,
       group.sender_allowlist != null
@@ -4176,6 +5676,29 @@ export function backfillEmptyAllowlistsForUser(
   return jids;
 }
 
+/** Account-scoped counterpart used by first-class Feishu bots. */
+export function backfillEmptyAllowlistsForChannelAccount(
+  userId: string,
+  channelAccountId: string,
+  ownerOpenId: string,
+): string[] {
+  const rows = db
+    .prepare(
+      `SELECT jid FROM registered_groups
+       WHERE created_by = ? AND channel_account_id = ?
+         AND jid LIKE 'feishu:%' AND sender_allowlist = '[]'`,
+    )
+    .all(userId, channelAccountId) as Array<{ jid: string }>;
+  if (!rows.length) return [];
+  const stmt = db.prepare(
+    'UPDATE registered_groups SET sender_allowlist = ? WHERE jid = ?',
+  );
+  db.transaction(() => {
+    for (const row of rows) stmt.run(JSON.stringify([ownerOpenId]), row.jid);
+  })();
+  return rows.map((row) => row.jid);
+}
+
 /**
  * Clear `sender_allowlist` for a single group (set to NULL = unrestricted).
  * Used as a manual escape hatch from the owner-locked trap.
@@ -4242,6 +5765,7 @@ export function getGroupsByTargetMainJid(
 
 type ChannelMountRow = {
   channel_jid: string;
+  channel_account_id: string | null;
   channel_type: string;
   workspace_jid: string;
   session_id: string | null;
@@ -4256,6 +5780,7 @@ type ChannelMountRow = {
 function parseChannelMountRow(row: ChannelMountRow): ChannelMount {
   return {
     channel_jid: row.channel_jid,
+    channel_account_id: row.channel_account_id,
     channel_type: row.channel_type,
     workspace_jid: row.workspace_jid,
     session_id: row.session_id,
@@ -4297,6 +5822,7 @@ function channelMountFromRegisteredGroup(
     if (!agent?.chat_jid) return null;
     return {
       channel_jid: channelJid,
+      channel_account_id: group.channel_account_id ?? null,
       channel_type: channelType,
       workspace_jid: agent.chat_jid,
       session_id: group.target_agent_id,
@@ -4312,6 +5838,7 @@ function channelMountFromRegisteredGroup(
     if (!workspaceJid) return null;
     return {
       channel_jid: channelJid,
+      channel_account_id: group.channel_account_id ?? null,
       channel_type: channelType,
       workspace_jid: workspaceJid,
       session_id: null,
@@ -4337,10 +5864,11 @@ export function upsertChannelMount(
     const updatedAt = mount.updated_at ?? now;
     db.prepare(
       `INSERT INTO channel_mounts (
-        channel_jid, channel_type, workspace_jid, session_id, routing_mode,
+        channel_jid, channel_account_id, channel_type, workspace_jid, session_id, routing_mode,
         reply_policy, activation_mode, owner_im_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(channel_jid) DO UPDATE SET
+        channel_account_id = excluded.channel_account_id,
         channel_type = excluded.channel_type,
         workspace_jid = excluded.workspace_jid,
         session_id = excluded.session_id,
@@ -4351,6 +5879,7 @@ export function upsertChannelMount(
         updated_at = excluded.updated_at`,
     ).run(
       mount.channel_jid,
+      mount.channel_account_id ?? null,
       mount.channel_type,
       mount.workspace_jid,
       mount.session_id ?? null,
@@ -4550,11 +6079,11 @@ export function touchImContextBindingActivity(
   ).run(lastActiveAt, lastActiveAt, sourceJid, contextType, contextId);
 }
 
-/** List feishu_thread agent IDs for a workspace JID (for cleanup on unbind). */
+/** List native-thread agent IDs for a workspace JID (legacy Feishu included). */
 export function listFeishuThreadAgentIds(workspaceJid: string): string[] {
   const rows = db
     .prepare(
-      "SELECT id FROM agents WHERE chat_jid = ? AND source_kind = 'feishu_thread'",
+      "SELECT id FROM agents WHERE chat_jid = ? AND source_kind IN ('native_thread', 'feishu_thread')",
     )
     .all(workspaceJid) as { id: string }[];
   return rows.map((r) => r.id);
@@ -4657,6 +6186,20 @@ export function deleteChatHistory(chatJid: string): void {
  */
 export function deleteImGroupRecord(jid: string): void {
   const tx = db.transaction(() => {
+    const conversationJid = channelConversationJid(jid);
+    const replyAgents = db
+      .prepare(
+        'SELECT id, last_im_jid FROM agents WHERE last_im_jid IS NOT NULL',
+      )
+      .all() as Array<{ id: string; last_im_jid: string }>;
+    const clearLastImJid = db.prepare(
+      'UPDATE agents SET last_im_jid = NULL WHERE id = ?',
+    );
+    for (const agent of replyAgents) {
+      if (channelConversationJid(agent.last_im_jid) === conversationJid) {
+        clearLastImJid.run(agent.id);
+      }
+    }
     db.prepare('DELETE FROM channel_mounts WHERE channel_jid = ?').run(jid);
     db.prepare('DELETE FROM agent_channel_mounts WHERE channel_jid = ?').run(
       jid,
@@ -6184,7 +7727,11 @@ function mapAgentRow(row: Record<string, unknown>): SubAgent {
       typeof row.spawned_from_jid === 'string' ? row.spawned_from_jid : null,
     source_kind:
       typeof row.source_kind === 'string'
-        ? (row.source_kind as 'manual' | 'feishu_thread' | 'auto_im')
+        ? (row.source_kind as
+            | 'manual'
+            | 'native_thread'
+            | 'feishu_thread'
+            | 'auto_im')
         : null,
     thread_id: typeof row.thread_id === 'string' ? row.thread_id : null,
     root_message_id:
@@ -6193,6 +7740,7 @@ function mapAgentRow(row: Record<string, unknown>): SubAgent {
       typeof row.title_source === 'string'
         ? (row.title_source as
             | 'manual'
+            | 'native_root'
             | 'feishu_root'
             | 'auto'
             | 'auto_pending')

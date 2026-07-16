@@ -5,6 +5,7 @@ import {
   Check,
   Link as ChainLink,
   ArrowRight,
+  Trash2,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import type { PairedChat } from './hooks/usePairedChats';
@@ -22,6 +23,7 @@ interface PairingSectionProps {
   paired: {
     chats: PairedChat[];
     loading: boolean;
+    error?: string | null;
     removingJid: string | null;
     renamingJid?: string | null;
     load: () => void;
@@ -36,7 +38,7 @@ export function PairingSection({
   paired,
 }: PairingSectionProps) {
   return (
-    <div className="border-t border-border mt-4 pt-4">
+    <div className="mt-4 border-t border-border pt-4">
       <div className="flex items-center gap-2 mb-3">
         <ChainLink className="w-4 h-4 text-muted-foreground" />
         <h4 className="text-sm font-medium text-foreground">聊天配对</h4>
@@ -110,13 +112,20 @@ export function PairingSection({
             已配对的聊天
           </h5>
           <button
-            onClick={paired.load}
+            type="button"
+            onClick={() => paired.load()}
             disabled={paired.loading}
-            className="text-xs text-muted-foreground hover:text-foreground disabled:opacity-50"
+            className="min-h-9 rounded px-2 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-50"
+            aria-label={`刷新 ${channelName} 已配对聊天`}
           >
-            刷新
+            {paired.loading ? '加载中…' : '刷新'}
           </button>
         </div>
+        {paired.error && (
+          <p role="alert" className="mb-2 text-xs text-error">
+            {paired.error}
+          </p>
+        )}
         {paired.loading ? (
           <div className="text-xs text-muted-foreground">加载中...</div>
         ) : paired.chats.length === 0 ? (
@@ -124,13 +133,40 @@ export function PairingSection({
         ) : (
           <div className="space-y-2">
             {paired.chats.map((chat) => (
-              <div key={chat.jid} className="rounded-lg bg-muted px-3 py-2">
-                <div className="truncate text-sm text-foreground">
-                  {chat.name}
+              <div
+                key={chat.jid}
+                className="flex items-center gap-3 rounded-lg bg-muted px-3 py-2"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm text-foreground">
+                    {chat.name}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {new Date(chat.addedAt).toLocaleString('zh-CN')}
+                  </div>
                 </div>
-                <div className="text-xs text-muted-foreground">
-                  {new Date(chat.addedAt).toLocaleString('zh-CN')}
-                </div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="shrink-0 text-error hover:text-error"
+                  disabled={paired.removingJid === chat.jid}
+                  onClick={() => {
+                    if (
+                      window.confirm(
+                        `解除「${chat.name}」与这个 ${channelName} 账号的配对？`,
+                      )
+                    )
+                      paired.remove(chat.jid);
+                  }}
+                  aria-label={`解除配对 ${chat.name}`}
+                >
+                  {paired.removingJid === chat.jid ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <Trash2 className="size-3.5" />
+                  )}
+                </Button>
               </div>
             ))}
             <RouterLink

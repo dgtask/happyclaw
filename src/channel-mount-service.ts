@@ -1,11 +1,24 @@
 import type {
+  ChannelAccount,
+  ChannelProvider,
   ChannelMount,
   ChannelRoutingMode,
   RegisteredGroup,
   SubAgent,
 } from './types.js';
 import { getChannelType } from './im-channel.js';
-import { setRegisteredGroup } from './db.js';
+import { parseChannelAddress } from './channel-address.js';
+import { isThreadMapCapableChat } from './im-channel-capabilities.js';
+import {
+  getChannelAccount,
+  getAllRegisteredGroups,
+  getDefaultChannelAccount,
+  getJidsByFolder,
+  getLegacyChannelAccount,
+  getRegisteredGroup,
+  getUserHomeGroup,
+  setRegisteredGroup,
+} from './db.js';
 import { getWebDeps } from './web-context.js';
 
 export interface ChannelMountResolutionDeps {
@@ -21,6 +34,59 @@ export interface ChannelMountUpdateOptions {
   activationMode?: ChannelMount['activation_mode'];
   ownerImId?: string | null;
 }
+
+export interface NativeContextMetadata {
+  chat_mode?: string | null;
+  group_message_type?: string | null;
+  native_context_type?: string | null;
+  thread_capable?: boolean | null;
+}
+
+export interface RestoreDefaultChannelMountDeps {
+  getAccount: (id: string) => ChannelAccount | undefined;
+  getDefaultAccount: (
+    ownerUserId: string,
+    provider: ChannelProvider,
+  ) => ChannelAccount | undefined;
+  getLegacyAccount?: (
+    ownerUserId: string,
+    provider: ChannelProvider,
+  ) => ChannelAccount | undefined;
+  getGroup: (jid: string) => RegisteredGroup | undefined;
+  getHome: (
+    ownerUserId: string,
+  ) => (RegisteredGroup & { jid: string }) | undefined;
+  getJidsByFolder?: (folder: string) => string[];
+}
+
+export interface ThreadMapMountLookupDeps {
+  getAllGroups: () => Record<string, RegisteredGroup>;
+  getGroup: (jid: string) => RegisteredGroup | undefined;
+  getJidsByFolder?: (folder: string) => string[];
+}
+
+export type RestoreDefaultChannelMountResult =
+  | {
+      status: 'resolved';
+      workspaceJid: string;
+      routingMode: ChannelRoutingMode;
+      accountId: string | null;
+      updated: RegisteredGroup;
+    }
+  | {
+      status: 'unavailable';
+      reason:
+        | 'missing_owner'
+        | 'account_mismatch'
+        | 'missing_default_workspace';
+    };
+
+export type NativeContextMountUpgradeResult =
+  | { status: 'upgraded' | 'unchanged'; updated: RegisteredGroup }
+  | {
+      status: 'conflict';
+      reason: 'bound_to_session' | 'missing_workspace';
+    };
 
 export type ChannelMountTargetResolution =
   | {
@@ -43,6 +109,179 @@ export type ChannelMountTargetResolution =
 
 export function isImChannelJid(jid: string): boolean {
   return jid !== '' && !jid.startsWith('web:') && getChannelType(jid) !== null;
+}
+
+/**
+ * A native-context container owns many platform conversations (for example a
+ * Feishu topic group or Telegram Forum). It must route through thread_map;
+ * ordinary chats can route either to a workspace main conversation or one
+ * explicitly selected session.
+ */
+export function isNativeContextContainer(
+  channelJid: string,
+  group: RegisteredGroup,
+  liveInfo: NativeContextMetadata = {},
+): boolean {
+  const persisted = group as RegisteredGroup & NativeContextMetadata;
+  return isThreadMapCapableChat({
+    channel_type: getChannelType(channelJid),
+    chat_mode:
+      liveInfo.chat_mode ?? persisted.chat_mode ?? group.feishu_chat_mode,
+    group_message_type:
+      liveInfo.group_message_type ??
+      persisted.group_message_type ??
+      group.feishu_group_message_type,
+    native_context_type:
+      liveInfo.native_context_type ?? persisted.native_context_type,
+    thread_capable: liveInfo.thread_capable ?? persisted.thread_capable,
+  });
+}
+
+/**
+ * Resolve the account-owned default workspace before mutating a mount. This
+ * lets REST endpoints perform a single committed update: a failed restore can
+ * never leave a channel temporarily unbound.
+ */
+export function buildRestoreDefaultChannelMountUpdate(
+  channelJid: string,
+  group: RegisteredGroup,
+  ownerUserId: string | undefined,
+  deps: RestoreDefaultChannelMountDeps,
+  liveInfo: NativeContextMetadata = {},
+): RestoreDefaultChannelMountResult {
+  const provider = getChannelType(channelJid) as ChannelProvider | null;
+  const encodedAccountId = parseChannelAddress(channelJid)?.channelAccountId;
+  const storedAccountId = group.channel_account_id;
+  if (
+    storedAccountId &&
+    encodedAccountId &&
+    storedAccountId !== encodedAccountId
+  ) {
+    return { status: 'unavailable', reason: 'account_mismatch' };
+  }
+  const accountId = storedAccountId ?? encodedAccountId ?? null;
+
+  let account = accountId ? deps.getAccount(accountId) : undefined;
+  if (account && ownerUserId && account.owner_user_id !== ownerUserId) {
+    return { status: 'unavailable', reason: 'account_mismatch' };
+  }
+  const effectiveOwner =
+    account?.owner_user_id ?? ownerUserId ?? group.created_by;
+  if (!effectiveOwner || !provider) {
+    return { status: 'unavailable', reason: 'missing_owner' };
+  }
+
+  // Historical unscoped JIDs belong to the legacy default account, even if
+  // the user later selected another account as the UI default.
+  if (!account && !encodedAccountId && !storedAccountId) {
+    account =
+      deps.getLegacyAccount?.(effectiveOwner, provider) ??
+      deps.getDefaultAccount(effectiveOwner, provider);
+  }
+
+  let workspaceJid: string | null = null;
+  if (account?.default_workspace_jid) {
+    const resolved = resolveWorkspaceJid(account.default_workspace_jid, {
+      getRegisteredGroup: deps.getGroup,
+      getJidsByFolder: deps.getJidsByFolder,
+    });
+    const workspace = resolved ? deps.getGroup(resolved) : undefined;
+    if (resolved && workspace?.created_by === effectiveOwner) {
+      workspaceJid = resolved;
+    }
+  }
+
+  if (!workspaceJid) {
+    workspaceJid = deps.getHome(effectiveOwner)?.jid ?? null;
+  }
+  if (!workspaceJid) {
+    return { status: 'unavailable', reason: 'missing_default_workspace' };
+  }
+
+  const routingMode: ChannelRoutingMode = isNativeContextContainer(
+    channelJid,
+    group,
+    liveInfo,
+  )
+    ? 'thread_map'
+    : 'single_session';
+  return {
+    status: 'resolved',
+    workspaceJid,
+    routingMode,
+    accountId: account?.id ?? accountId,
+    updated: {
+      ...buildWorkspaceMountUpdate(group, workspaceJid, routingMode, {
+        replyPolicy: 'source_only',
+      }),
+      ...((account?.id ?? accountId)
+        ? { channel_account_id: account?.id ?? accountId ?? undefined }
+        : {}),
+    },
+  };
+}
+
+/** Resolve and commit the default target in one write. */
+export function restoreDefaultChannelMount(
+  channelJid: string,
+  group: RegisteredGroup,
+  ownerUserId: string | undefined,
+  liveInfo: NativeContextMetadata = {},
+): RestoreDefaultChannelMountResult {
+  const resolved = buildRestoreDefaultChannelMountUpdate(
+    channelJid,
+    group,
+    ownerUserId,
+    {
+      getAccount: getChannelAccount,
+      getDefaultAccount: getDefaultChannelAccount,
+      getLegacyAccount: getLegacyChannelAccount,
+      getGroup: getRegisteredGroup,
+      getHome: getUserHomeGroup,
+      getJidsByFolder,
+    },
+    liveInfo,
+  );
+  if (resolved.status === 'resolved') {
+    commitChannelMountUpdate(channelJid, resolved.updated);
+  }
+  return resolved;
+}
+
+/**
+ * Upgrade a newly detected native-context container before its first message
+ * is routed. A container bound to one fixed session is an invalid state and is
+ * rejected. Multiple native-context containers may share one workspace;
+ * context identities remain isolated by their account-scoped source JID.
+ */
+export function upgradeNativeContextChannelMount(
+  channelJid: string,
+  group: RegisteredGroup,
+): NativeContextMountUpgradeResult {
+  if (group.target_agent_id) {
+    return { status: 'conflict', reason: 'bound_to_session' };
+  }
+  if (!group.target_main_jid) {
+    return { status: 'conflict', reason: 'missing_workspace' };
+  }
+  if (group.binding_mode === 'thread_map') {
+    return { status: 'unchanged', updated: group };
+  }
+
+  const workspaceJid = resolveWorkspaceJid(group.target_main_jid, {
+    getRegisteredGroup,
+    getJidsByFolder,
+  });
+  if (!workspaceJid) {
+    return { status: 'conflict', reason: 'missing_workspace' };
+  }
+  if (!getRegisteredGroup(workspaceJid)) {
+    return { status: 'conflict', reason: 'missing_workspace' };
+  }
+
+  const updated = buildWorkspaceMountUpdate(group, workspaceJid, 'thread_map');
+  commitChannelMountUpdate(channelJid, updated);
+  return { status: 'upgraded', updated };
 }
 
 export function toRoutingMode(
@@ -88,6 +327,7 @@ export function normalizeChannelMountFromGroup(
     if (!session?.chat_jid) return null;
     return {
       channel_jid: channelJid,
+      channel_account_id: group.channel_account_id ?? null,
       channel_type: channelType,
       workspace_jid: session.chat_jid,
       session_id: group.target_agent_id,
@@ -103,6 +343,7 @@ export function normalizeChannelMountFromGroup(
     if (!workspaceJid) return null;
     return {
       channel_jid: channelJid,
+      channel_account_id: group.channel_account_id ?? null,
       channel_type: channelType,
       workspace_jid: workspaceJid,
       session_id: null,
@@ -280,18 +521,46 @@ export function hasWorkspaceMountConflict(
   );
 }
 
-export function findWorkspaceThreadMapConflict(
-  groups: Record<string, RegisteredGroup>,
-  channelJid: string,
+/**
+ * Whether another native-context source still maps threads into a workspace.
+ *
+ * A workspace may be shared by many Feishu topic groups and Telegram forums.
+ * Callers use this after moving/removing one source so the workspace only
+ * returns to horizontal/manual navigation when the final thread-map source
+ * leaves. Both canonical `web:{uuid}` and historical `web:{folder}` targets
+ * are normalized before comparison.
+ */
+export function hasRemainingThreadMapMount(
   workspaceJid: string,
-  legacyWorkspaceJid: string,
-): [string, RegisteredGroup] | undefined {
-  return Object.entries(groups).find(
-    ([otherJid, otherGroup]) =>
-      otherJid !== channelJid &&
-      otherGroup.binding_mode === 'thread_map' &&
-      matchesWorkspaceMount(otherGroup, workspaceJid, legacyWorkspaceJid),
-  );
+  excludingImJid?: string,
+  deps: ThreadMapMountLookupDeps = {
+    getAllGroups: getAllRegisteredGroups,
+    getGroup: getRegisteredGroup,
+    getJidsByFolder,
+  },
+): boolean {
+  const canonicalWorkspaceJid =
+    resolveWorkspaceJid(workspaceJid, {
+      getRegisteredGroup: deps.getGroup,
+      getJidsByFolder: deps.getJidsByFolder,
+    }) ?? workspaceJid;
+  const workspace = deps.getGroup(canonicalWorkspaceJid);
+  const legacyWorkspaceJid = workspace
+    ? `web:${workspace.folder}`
+    : workspaceJid;
+
+  return Object.entries(deps.getAllGroups()).some(([jid, group]) => {
+    if (jid === excludingImJid || group.binding_mode !== 'thread_map') {
+      return false;
+    }
+    const mountedWorkspaceJid = resolveWorkspaceJid(group.target_main_jid, {
+      getRegisteredGroup: deps.getGroup,
+      getJidsByFolder: deps.getJidsByFolder,
+    });
+    return mountedWorkspaceJid
+      ? mountedWorkspaceJid === canonicalWorkspaceJid
+      : matchesWorkspaceMount(group, canonicalWorkspaceJid, legacyWorkspaceJid);
+  });
 }
 
 /**
@@ -306,5 +575,21 @@ export function buildDetachedWorkspaceUpdate(
     ...workspace,
     conversation_source: 'manual',
     conversation_nav_mode: 'horizontal',
+  };
+}
+
+/** Keep workspace navigation aligned with an active native thread-map mount. */
+export function buildNativeThreadWorkspaceUpdate(
+  workspace: RegisteredGroup,
+): RegisteredGroup {
+  return {
+    ...workspace,
+    // Preserve the historical Feishu marker when it already exists; all new
+    // providers use the provider-neutral native_thread value.
+    conversation_source:
+      workspace.conversation_source === 'feishu_thread'
+        ? 'feishu_thread'
+        : 'native_thread',
+    conversation_nav_mode: 'vertical_threads',
   };
 }

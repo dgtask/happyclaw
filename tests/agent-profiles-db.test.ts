@@ -33,6 +33,7 @@ const {
   normalizeAgentProfileRuntimePolicy,
   migrateAgentProfileAutoCompactWindow,
   getAgentChannelMount,
+  listAgentProfilePromptVersions,
 } = await import('../src/db.js');
 
 beforeAll(() => {
@@ -152,6 +153,7 @@ describe('AgentProfile DB model', () => {
     const migrated = listAgentProfilesForUser(userId)[0];
     expect(migrated.name).toBe('HappyClaw');
     expect(migrated.version).toBe((legacy?.version ?? 0) + 1);
+    expect(listAgentProfilePromptVersions(migrated.id, userId)).toHaveLength(1);
     expect(migrated.identity_hash).toBe(
       computeAgentProfileIdentityHash(
         migrated.identity_prompt,
@@ -374,6 +376,58 @@ describe('AgentProfile DB model', () => {
         'Policy Agent',
       ),
     );
+  });
+
+  test('records prompt history only when prompt sections or mode change', () => {
+    const userId = 'agent-profile-prompt-history-scope';
+    seedUser(userId);
+    const profile = createAgentProfile({
+      ownerUserId: userId,
+      name: 'History Scope',
+      identityPrompt: 'Identity v1',
+      soulPrompt: 'Soul v1',
+    });
+
+    expect(listAgentProfilePromptVersions(profile.id, userId)).toHaveLength(1);
+
+    const renamed = updateAgentProfile(profile.id, userId, {
+      name: 'History Scope Renamed',
+    })!;
+    expect(renamed.version).toBe(profile.version + 1);
+    expect(listAgentProfilePromptVersions(profile.id, userId)).toHaveLength(1);
+
+    const policyUpdated = updateAgentProfile(profile.id, userId, {
+      runtimePolicy: { tools: { mode: 'readonly' } },
+    })!;
+    expect(policyUpdated.version).toBe(renamed.version + 1);
+    expect(listAgentProfilePromptVersions(profile.id, userId)).toHaveLength(1);
+
+    const promptUpdated = updateAgentProfile(profile.id, userId, {
+      toolsPrompt: 'Tools v2',
+    })!;
+    expect(promptUpdated.version).toBe(policyUpdated.version + 1);
+    expect(listAgentProfilePromptVersions(profile.id, userId)).toMatchObject([
+      {
+        version: promptUpdated.version,
+        name: 'History Scope Renamed',
+        identity_prompt: 'Identity v1',
+        soul_prompt: 'Soul v1',
+        tools_prompt: 'Tools v2',
+        change_source: 'update',
+      },
+      {
+        version: profile.version,
+        name: 'History Scope',
+        tools_prompt: '',
+        change_source: 'create',
+      },
+    ]);
+
+    const modeUpdated = updateAgentProfile(profile.id, userId, {
+      promptMode: 'replace',
+    })!;
+    expect(modeUpdated.version).toBe(promptUpdated.version + 1);
+    expect(listAgentProfilePromptVersions(profile.id, userId)).toHaveLength(3);
   });
 
   test('deep-merges partial runtime policy patches without reopening siblings', () => {

@@ -15,6 +15,8 @@ import {
   getSessionWithUser,
 } from './db.js';
 import type { WhatsAppConnectionState } from './whatsapp.js';
+import type { ChannelAccount } from './types.js';
+import type { ChannelAccountSecret } from './channel-account-secrets.js';
 
 export interface WsClientInfo {
   sessionId: string;
@@ -93,6 +95,13 @@ export interface WebDeps {
       | 'discord'
       | 'whatsapp',
   ) => Promise<boolean>;
+  reloadChannelAccount?: (accountId: string) => Promise<boolean>;
+  disconnectChannelAccount?: (accountId: string) => Promise<void>;
+  testChannelAccount?: (
+    account: ChannelAccount,
+    secret: ChannelAccountSecret,
+  ) => Promise<{ success: boolean; unsupported?: boolean; error?: string }>;
+  isChannelAccountConnected?: (accountId: string) => boolean;
   /**
    * Reconnect all of a user's IM channels from their persisted config.
    * Symmetric counterpart to `imManager.disconnectAllUserChannels` — called
@@ -110,7 +119,10 @@ export interface WebDeps {
   isUserDingTalkConnected?: (userId: string) => boolean;
   isUserDiscordConnected?: (userId: string) => boolean;
   isUserWhatsAppConnected?: (userId: string) => boolean;
-  getUserWhatsAppState?: (userId: string) => WhatsAppConnectionState;
+  getUserWhatsAppState?: (
+    userId: string,
+    accountId?: string,
+  ) => WhatsAppConnectionState;
   /** Hard logout: clears WhatsApp auth state on disk so next enable starts fresh. */
   logoutUserWhatsApp?: (userId: string, accountId?: string) => Promise<void>;
   processAgentConversation?: (
@@ -128,6 +140,18 @@ export interface WebDeps {
     chat_mode?: string;
     group_message_type?: string;
   } | null>;
+  getChannelChatInfo?: (jid: string) => Promise<
+    | {
+        avatar?: string;
+        name?: string;
+        user_count?: string;
+        chat_type?: string;
+        chat_mode?: string;
+        group_message_type?: string;
+      }
+    | null
+    | undefined
+  >;
   clearImFailCounts?: (jid: string) => void;
   /**
    * Fully remove an IM group's registered_groups entry (plus jid-scoped data

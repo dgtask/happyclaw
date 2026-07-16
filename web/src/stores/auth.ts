@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { api, apiFetch } from '../api/client';
 import { clearApiCaches } from '../utils/pwaCache';
 import { clearMessageSnapshotCache } from '../utils/messageSnapshotCache';
+import { useUsageStore } from './usage';
 
 export type Permission =
   | 'manage_system_config'
@@ -103,6 +104,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     // Clear API caches BEFORE login: previous user may have left data behind
     // (e.g. they closed the browser without logout). Without this, the new
     // user could see the previous user's data on first frame from SWR cache.
+    useUsageStore.getState().reset();
     await Promise.allSettled([clearApiCaches(), clearMessageSnapshotCache()]);
     const data = await api.post<{
       success: boolean;
@@ -121,6 +123,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   register: async (payload) => {
     // Same rationale as login: belt-and-suspenders cache clear on tenant switch.
+    useUsageStore.getState().reset();
     await Promise.allSettled([clearApiCaches(), clearMessageSnapshotCache()]);
     const data = await api.post<{ success: boolean; user: UserPublic }>(
       '/api/auth/register',
@@ -138,6 +141,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     await api.post('/api/auth/logout');
     // Clear AFTER server-side session is invalidated so subsequent users on
     // this device don't see this user's cached messages/agents/profile.
+    useUsageStore.getState().reset();
     await Promise.allSettled([clearApiCaches(), clearMessageSnapshotCache()]);
     set({
       authenticated: false,

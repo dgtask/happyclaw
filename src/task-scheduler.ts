@@ -59,6 +59,10 @@ import {
   HOST_EXECUTION_FORBIDDEN_ERROR,
 } from './host-execution-policy.js';
 import { resolveEffectiveAgentProfile } from './agent-profile-runtime.js';
+import {
+  buildAgentProfilePrompt,
+  hasAgentProfilePrompts,
+} from './agent-profile-prompts.js';
 import { stripAgentInternalTags } from './utils.js';
 import {
   markIsolatedTaskRunIpcComplete,
@@ -115,8 +119,8 @@ function toRunnerAgentProfile(profile: AgentProfile | undefined) {
     name: profile.name,
     version: profile.version,
     identityHash: profile.identity_hash,
-    identityPrompt: profile.identity_prompt,
-    includeClaudePreset: profile.include_claude_preset,
+    identityPrompt: buildAgentProfilePrompt(profile),
+    includeClaudePreset: profile.prompt_mode === 'append',
     runtimePolicy: profile.runtime_policy,
   };
 }
@@ -132,8 +136,8 @@ function taskSessionNeedsAgentProfileReset(
   if (
     !current.agent_profile_id &&
     !current.identity_hash &&
-    profile.identity_prompt.trim() === '' &&
-    profile.include_claude_preset
+    !hasAgentProfilePrompts(profile) &&
+    profile.prompt_mode === 'append'
   ) {
     return false;
   }

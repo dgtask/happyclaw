@@ -7,7 +7,12 @@ import {
   GroupPatchSchema,
   ContainerEnvSchema,
 } from '../schemas.js';
-import type { AuthUser, RegisteredGroup, ExecutionMode } from '../types.js';
+import type {
+  AuthUser,
+  ConversationSource,
+  RegisteredGroup,
+  ExecutionMode,
+} from '../types.js';
 import { checkGroupLimit } from '../billing.js';
 import { DATA_DIR, GROUPS_DIR, isDockerAvailable } from '../config.js';
 import {
@@ -130,7 +135,7 @@ interface GroupPayloadItem {
     | 'when_mentioned'
     | 'owner_mentioned'
     | 'disabled';
-  conversation_source?: 'manual' | 'feishu_thread';
+  conversation_source?: ConversationSource;
   conversation_nav_mode?: 'horizontal' | 'vertical_threads';
   agent_profile_id?: string;
   agent_profile_name?: string;

@@ -61,6 +61,9 @@ import workspaceRoutes from './routes/workspaces.js';
 import { usage as usageRoutes } from './routes/usage.js';
 import billingRoutes from './routes/billing.js';
 import bugReportRoutes from './routes/bug-report.js';
+import channelAccountRoutes, {
+  injectChannelAccountDeps,
+} from './routes/channel-accounts.js';
 import {
   checkBillingAccess,
   formatBillingAccessDeniedMessage,
@@ -255,6 +258,7 @@ app.route('/api', monitorRoutes);
 app.route('/api/usage', usageRoutes);
 app.route('/api/billing', billingRoutes);
 app.route('/api/bug-report', bugReportRoutes);
+app.route('/api/channel-accounts', channelAccountRoutes);
 
 // --- POST /api/messages ---
 
@@ -2382,6 +2386,7 @@ export function broadcastBillingUpdate(
 
 export function broadcastWhatsAppStatus(
   userId: string,
+  accountId: string,
   state: {
     status: 'connecting' | 'qr' | 'connected' | 'disconnected' | 'logged_out';
     qr?: string;
@@ -2394,6 +2399,7 @@ export function broadcastWhatsAppStatus(
   const msg: WsMessageOut = {
     type: 'whatsapp_status',
     userId,
+    accountId,
     ...state,
   };
   const allowedUserIds = new Set([userId]);
@@ -2569,6 +2575,7 @@ export function createAppForTest(webDeps: WebDeps): typeof app {
   deps = webDeps;
   setWebDeps(webDeps);
   injectConfigDeps(webDeps);
+  injectChannelAccountDeps(webDeps);
   injectMonitorDeps({
     broadcastDockerBuildLog,
     broadcastDockerBuildComplete,
@@ -2580,6 +2587,7 @@ export function startWebServer(webDeps: WebDeps): void {
   deps = webDeps;
   setWebDeps(webDeps);
   injectConfigDeps(webDeps);
+  injectChannelAccountDeps(webDeps);
   injectMonitorDeps({
     broadcastDockerBuildLog,
     broadcastDockerBuildComplete,

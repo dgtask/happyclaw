@@ -82,14 +82,26 @@ afterAll(() => {
 });
 
 describe('channel_mounts compatibility model', () => {
-  test('startup cleanup removes orphaned user balances before FK enforcement', () => {
+  test('startup preserves orphaned user balances for operator review', () => {
     const row = probeDb
       .prepare('SELECT COUNT(*) as cnt FROM user_balances WHERE user_id = ?')
       .get('deleted-user') as { cnt: number };
-    expect(row.cnt).toBe(0);
+    expect(row.cnt).toBe(1);
 
-    const violations = probeDb.prepare('PRAGMA foreign_key_check').all();
-    expect(violations).toEqual([]);
+    const violations = probeDb
+      .prepare('PRAGMA foreign_key_check')
+      .all() as Array<{
+      table: string;
+      parent: string;
+    }>;
+    expect(violations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          table: 'user_balances',
+          parent: 'users',
+        }),
+      ]),
+    );
   });
 
   test('session binding written to registered_groups is mirrored to channel_mounts', () => {

@@ -297,7 +297,12 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const isConversationTab = activeAgent?.kind === 'conversation';
   const isTopicWorkspace =
     group?.conversation_nav_mode === 'vertical_threads' ||
-    agents.some((a) => a.source_kind === 'feishu_thread');
+    group?.conversation_source === 'native_thread' ||
+    group?.conversation_source === 'feishu_thread' ||
+    agents.some(
+      (a) =>
+        a.source_kind === 'native_thread' || a.source_kind === 'feishu_thread',
+    );
   const conversationAgents = useMemo(
     () =>
       agents
@@ -643,7 +648,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
       mainLabel={
         group.is_my_home ? `${agentProfileLabel} 对话` : `${group.name} 对话`
       }
-      mainMeta={group.lastMessage || '独立上下文'}
+      mainMeta={group.lastMessage || '暂无消息'}
       onClose={mobile ? onBack : undefined}
       onSelectSession={(id) => {
         selectTab(id);

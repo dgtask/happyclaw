@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useCallback } from 'react';
 import {
   Loader2,
   Link2,
-  Unlink,
+  RotateCcw,
   MessageSquare,
   Users,
   ArrowRightLeft,
@@ -20,13 +20,17 @@ import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { useChatStore } from '../../stores/chat';
 import { showToast } from '../../utils/toast';
 import type { AgentInfo, AvailableImGroup } from '../../types';
-import { ChannelBadge } from '../settings/channel-meta';
+import { ChannelAccountBadge, ChannelBadge } from '../settings/channel-meta';
 import { ACTIVATION_MODE_OPTIONS } from '../../constants/im';
 import {
   getImChannelCapabilities,
   IM_CHANNEL_ORDER,
   type ImChannelType,
 } from '../../constants/im-capabilities';
+import {
+  buildChannelAccountFilterOptions,
+  channelAccountKey,
+} from '../../utils/channel-accounts';
 
 interface ImBindingDialogProps {
   open: boolean;
@@ -62,6 +66,7 @@ export function ImBindingDialog({
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
   const [channelFilter, setChannelFilter] = useState<ChannelFilter>('all');
+  const [accountFilter, setAccountFilter] = useState('all');
   const [rebindTarget, setRebindTarget] = useState<{
     imJid: string;
     group: AvailableImGroup;
@@ -81,9 +86,12 @@ export function ImBindingDialog({
 
   const compatibleGroups = useMemo(
     () =>
-      imGroups.filter((group) =>
-        isWorkspaceMode ? !!group.is_thread_capable : !group.is_thread_capable,
-      ),
+      imGroups.filter((group) => {
+        const capabilities = getImChannelCapabilities(group.channel_type);
+        return isWorkspaceMode
+          ? capabilities?.can_bind_workspace === true
+          : capabilities?.can_bind_session === true && !group.is_thread_capable;
+      }),
     [imGroups, isWorkspaceMode],
   );
 
@@ -118,6 +126,7 @@ export function ImBindingDialog({
       setActionLoading(null);
       setFilter('');
       setChannelFilter('all');
+      setAccountFilter('all');
       setRebindTarget(null);
       setActivationModes({});
       setLoadError(null);
@@ -129,6 +138,7 @@ export function ImBindingDialog({
     setActivationModes({});
     setFilter('');
     setChannelFilter('all');
+    setAccountFilter('all');
     void loadGroupsForDialog();
   }, [open, groupJid, agentId, loadGroupsForDialog]);
 
@@ -155,9 +165,18 @@ export function ImBindingDialog({
     channelFilter === 'all'
       ? null
       : (getImChannelCapabilities(channelFilter)?.label ?? channelFilter);
+  const accountOptions = useMemo(
+    () => buildChannelAccountFilterOptions(compatibleGroups),
+    [compatibleGroups],
+  );
 
   const filteredGroups = useMemo(() => {
     let groups = compatibleGroups;
+    if (accountFilter !== 'all') {
+      groups = groups.filter(
+        (group) => channelAccountKey(group) === accountFilter,
+      );
+    }
     if (channelFilter !== 'all') {
       groups = groups.filter((g) => g.channel_type === channelFilter);
     }
@@ -167,7 +186,7 @@ export function ImBindingDialog({
       (g) =>
         g.name.toLowerCase().includes(q) || g.jid.toLowerCase().includes(q),
     );
-  }, [compatibleGroups, channelFilter, filter]);
+  }, [accountFilter, compatibleGroups, channelFilter, filter]);
 
   const isBoundToThis = (group: AvailableImGroup): boolean => {
     if (isMainMode) {
@@ -219,7 +238,7 @@ export function ImBindingDialog({
     setActionLoading(null);
   };
 
-  const handleUnbind = async (imJid: string) => {
+  const handleRestoreDefault = async (imJid: string) => {
     setActionLoading(imJid);
     try {
       let ok: boolean;
@@ -231,10 +250,10 @@ export function ImBindingDialog({
       if (ok) {
         await reloadGroups();
       } else {
-        showToast('解绑失败');
+        showToast('恢复默认工作区失败');
       }
     } catch {
-      showToast('解绑失败');
+      showToast('恢复默认工作区失败');
     }
     setActionLoading(null);
   };
@@ -303,7 +322,7 @@ export function ImBindingDialog({
     if (!group.is_thread_capable) return null;
     return (
       <span className="inline-flex items-center rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[10px] font-medium text-sky-700 dark:border-sky-800 dark:bg-sky-950/30 dark:text-sky-300">
-        话题群
+        原生话题
       </span>
     );
   };
@@ -321,8 +340,8 @@ export function ImBindingDialog({
 
           <div className="rounded-lg border border-border/70 bg-muted/40 px-3 py-2 text-xs leading-5 text-muted-foreground">
             {isWorkspaceMode
-              ? '绑定飞书话题群后，每个话题会在当前工作区生成一个独立会话。'
-              : '将普通群或私聊绑定到当前会话，后续消息会继续使用这段上下文。'}
+              ? '普通聊天会进入工作区主会话；飞书话题群或 Telegram Forum 会按原生话题生成独立会话。'
+              : '将普通群或私聊绑定到当前会话，后续消息会继续使用这段上下文；原生话题容器只能绑定工作区。'}
           </div>
 
           {!loading && !loadError && (
@@ -347,6 +366,21 @@ export function ImBindingDialog({
                   </button>
                 ))}
               </div>
+              {accountOptions.length > 1 && (
+                <select
+                  value={accountFilter}
+                  onChange={(event) => setAccountFilter(event.target.value)}
+                  aria-label="筛选 Bot 账号"
+                  className="h-8 rounded-md border border-border bg-background px-2 text-xs text-foreground"
+                >
+                  <option value="all">全部 Bot 账号</option>
+                  {accountOptions.map((account) => (
+                    <option key={account.id} value={account.id}>
+                      {account.name}
+                    </option>
+                  ))}
+                </select>
+              )}
               {compatibleGroups.length > 0 && (
                 <SearchInput
                   value={filter}
@@ -384,7 +418,7 @@ export function ImBindingDialog({
             {!loading && !loadError && compatibleGroups.length === 0 && (
               <div className="text-center py-8 text-muted-foreground text-sm">
                 {isWorkspaceMode
-                  ? '暂无可绑定的飞书话题群。请先将 Bot 加入话题群，并发送一条消息。'
+                  ? '暂无可绑定的渠道聊天。请先完成渠道接入，并向 Bot 发送一条消息。'
                   : '暂无可绑定的普通群或私聊。请先在对应渠道中向 Bot 发送一条消息。'}
               </div>
             )}
@@ -446,6 +480,10 @@ export function ImBindingDialog({
                       </div>
                       <div className="flex items-center gap-2 text-xs text-muted-foreground">
                         <ChannelBadge channelType={group.channel_type} />
+                        <ChannelAccountBadge
+                          accountId={group.channel_account_id}
+                          accountName={group.channel_account_name}
+                        />
                         {group.member_count != null && (
                           <span className="flex items-center gap-0.5">
                             <Users className="w-3 h-3" />
@@ -543,15 +581,15 @@ export function ImBindingDialog({
                         <Button
                           size="sm"
                           variant="outline"
-                          onClick={() => handleUnbind(group.jid)}
+                          onClick={() => handleRestoreDefault(group.jid)}
                           disabled={isActioning}
                         >
                           {isActioning ? (
                             <Loader2 className="w-3 h-3 animate-spin" />
                           ) : (
-                            <Unlink className="w-3 h-3 mr-1" />
+                            <RotateCcw className="w-3 h-3 mr-1" />
                           )}
-                          解绑
+                          恢复默认
                         </Button>
                       </div>
                     ) : boundToOther ? (

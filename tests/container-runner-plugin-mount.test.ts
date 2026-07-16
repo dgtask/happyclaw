@@ -527,6 +527,20 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
         },
       }),
     );
+    const systemMcpDir = path.join(tmpDataDir, 'mcp-servers', 'system');
+    fs.mkdirSync(systemMcpDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(systemMcpDir, 'servers.json'),
+      JSON.stringify({
+        servers: {
+          platform: {
+            enabled: true,
+            command: 'platform-mcp',
+            memberAccess: 'shared',
+          },
+        },
+      }),
+    );
     const workspaceDir = path.join(tmpDataDir, 'groups', 'grp-policy-mcp');
     fs.mkdirSync(workspaceDir, { recursive: true });
     fs.writeFileSync(
@@ -579,6 +593,130 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
     expect(fs.readFileSync(envFile, 'utf8')).toContain(
       "HAPPYCLAW_AGENT_MCP_POLICY='custom'",
     );
+  });
+
+  test('host_claude always includes every host Skill and MCP while managed custom selection stays additive', () => {
+    const external = path.join(tmpDataDir, 'native-claude');
+    writeSystemSettings({ externalClaudeDir: external });
+    fs.mkdirSync(path.join(external, 'skills', 'native-a'), {
+      recursive: true,
+    });
+    fs.mkdirSync(path.join(external, 'skills', 'native-b'), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      path.join(external, 'skills', 'native-a', 'SKILL.md'),
+      '# native a',
+    );
+    fs.writeFileSync(
+      path.join(external, 'skills', 'native-b', 'SKILL.md'),
+      '# native b',
+    );
+    fs.writeFileSync(
+      path.join(external, 'settings.json'),
+      JSON.stringify({
+        mcpServers: {
+          nativeA: { command: 'native-a' },
+          nativeB: { command: 'native-b' },
+        },
+      }),
+    );
+    const managedSkills = path.join(tmpDataDir, 'skills', USER);
+    for (const id of ['managed-a', 'managed-b']) {
+      fs.mkdirSync(path.join(managedSkills, id), { recursive: true });
+      fs.writeFileSync(path.join(managedSkills, id, 'SKILL.md'), `# ${id}`);
+    }
+    const mcpDir = path.join(tmpDataDir, 'mcp-servers', USER);
+    fs.mkdirSync(mcpDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(mcpDir, 'servers.json'),
+      JSON.stringify({
+        servers: {
+          managedA: { enabled: true, command: 'managed-a' },
+          managedB: { enabled: true, command: 'managed-b' },
+        },
+      }),
+    );
+    const systemMcpDir = path.join(tmpDataDir, 'mcp-servers', 'system');
+    fs.mkdirSync(systemMcpDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(systemMcpDir, 'servers.json'),
+      JSON.stringify({
+        servers: {
+          platform: {
+            enabled: true,
+            command: 'platform-mcp',
+            memberAccess: 'shared',
+          },
+        },
+      }),
+    );
+
+    const group = fakeGroup('grp-host-additive', USER) as any;
+    const mounts = buildVolumeMounts(
+      group,
+      false,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        id: 'host-additive-profile',
+        name: 'Host additive',
+        version: 1,
+        identityHash: 'hash',
+        identityPrompt: '',
+        includeClaudePreset: true,
+        runtimePolicy: {
+          context: {
+            source: 'host_claude',
+            auto_compact_window: 0,
+            auto_compact_percentage: 0,
+          },
+          skills: { mode: 'custom', ids: ['managed-a'] },
+          mcp: {
+            mode: 'custom',
+            ids: ['system:platform', 'managedA'],
+          },
+          tools: { mode: 'inherit' },
+        },
+      },
+    );
+
+    expect(
+      mounts.find(
+        (mount) => mount.containerPath === '/workspace/external-skills',
+      )?.hostPath,
+    ).toBe(path.join(external, 'skills'));
+    const managedMount = mounts.find(
+      (mount) => mount.containerPath === '/workspace/user-skills',
+    )!;
+    expect(fs.existsSync(path.join(managedMount.hostPath, 'managed-a'))).toBe(
+      true,
+    );
+    expect(fs.existsSync(path.join(managedMount.hostPath, 'managed-b'))).toBe(
+      false,
+    );
+    const settings = JSON.parse(
+      fs.readFileSync(
+        path.join(
+          tmpDataDir,
+          'sessions',
+          group.folder,
+          '.claude',
+          'settings.json',
+        ),
+        'utf8',
+      ),
+    );
+    expect(Object.keys(settings.mcpServers).sort()).toEqual([
+      'managedA',
+      'nativeA',
+      'nativeB',
+      'platform',
+    ]);
   });
 
   test('host MCP env replaces inherited servers and clears disabled policy', () => {

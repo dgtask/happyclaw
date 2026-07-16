@@ -2,54 +2,45 @@
 
 import { Hono } from 'hono';
 import fs from 'fs/promises';
-import path from 'path';
-import os from 'os';
 import type { Variables } from '../web-context.js';
 import type { AuthUser } from '../types.js';
 import { authMiddleware } from '../middleware/auth.js';
-import { DATA_DIR } from '../config.js';
 import { checkMcpServerLimit } from '../billing.js';
+import { getAllUsers, listAgentProfilesForUser } from '../db.js';
+import { getEffectiveExternalDir } from '../runtime-config.js';
+import { loadHostClaudeMcpServers } from '../mcp-context.js';
+import {
+  getUserMcpSecretsFilePath,
+  getUserMcpServersDir,
+  getUserMcpServersFilePath,
+  readStoredUserMcpServers,
+  type StoredMcpServerDefinition,
+  type StoredMcpServerSecrets,
+  type StoredMcpServersFile,
+  type StoredMcpSecretsFile,
+  type ManagedMcpScope,
+  type McpMemberAccess,
+} from '../mcp-utils.js';
+import {
+  SYSTEM_CAPABILITY_LOCK_KEY,
+  userCapabilityLockKey,
+  withCapabilityScopeLocks,
+} from '../capability-lock.js';
+import {
+  CapabilityRuntimeCommitError,
+  mutateCapabilityAroundRuntimeQuiesce,
+  repairCapabilityRuntimeSafetyBlock,
+  type CapabilityMutationImpact,
+} from '../capability-runtime-mutation.js';
+import { WorkspaceRuntimeQuiesceError } from '../agent-profile-runtime.js';
 
 // --- Types ---
 
-interface McpServerEntry {
-  // stdio type
-  command?: string;
-  args?: string[];
-  env?: Record<string, string>;
-  // http/sse type
-  type?: 'http' | 'sse';
-  url?: string;
-  headers?: Record<string, string>;
-  // metadata
-  enabled: boolean;
-  syncedFromHost?: boolean;
-  description?: string;
-  addedAt: string;
-}
-
-interface McpServersFile {
-  servers: Record<string, McpServerEntry>;
-}
-
-interface HostSyncManifest {
-  syncedServers: string[];
-  lastSyncAt: string;
-}
+type McpServerEntry = StoredMcpServerDefinition;
+type McpServersFile = StoredMcpServersFile;
+type McpSecretsFile = StoredMcpSecretsFile;
 
 // --- Utility Functions ---
-
-function getUserMcpServersDir(userId: string): string {
-  return path.join(DATA_DIR, 'mcp-servers', userId);
-}
-
-function getServersFilePath(userId: string): string {
-  return path.join(getUserMcpServersDir(userId), 'servers.json');
-}
-
-function getHostSyncManifestPath(userId: string): string {
-  return path.join(getUserMcpServersDir(userId), '.host-sync.json');
-}
 
 function validateServerId(id: string): boolean {
   // Length cap mirrors MAX_MCP_KEY_LEN (256) — id is the JSON object key
@@ -63,43 +54,47 @@ function validateServerId(id: string): boolean {
   );
 }
 
-async function readMcpServersFile(userId: string): Promise<McpServersFile> {
-  try {
-    const data = await fs.readFile(getServersFilePath(userId), 'utf-8');
-    return JSON.parse(data);
-  } catch {
-    return { servers: {} };
-  }
+async function readMcpServersFile(userId: string): Promise<{
+  definitions: McpServersFile;
+  secrets: McpSecretsFile;
+}> {
+  return readStoredUserMcpServers(userId);
 }
 
 async function writeMcpServersFile(
   userId: string,
-  data: McpServersFile,
+  definitions: McpServersFile,
+  secrets: McpSecretsFile,
 ): Promise<void> {
   const dir = getUserMcpServersDir(userId);
-  await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(getServersFilePath(userId), JSON.stringify(data, null, 2));
-}
-
-async function readHostSyncManifest(userId: string): Promise<HostSyncManifest> {
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await fs.chmod(dir, 0o700).catch(() => undefined);
+  const definitionPath = getUserMcpServersFilePath(userId);
+  const secretPath = getUserMcpSecretsFilePath(userId);
+  const suffix = `${process.pid}.${Date.now()}.tmp`;
+  const definitionTmp = `${definitionPath}.${suffix}`;
+  const secretTmp = `${secretPath}.${suffix}`;
   try {
-    const data = await fs.readFile(getHostSyncManifestPath(userId), 'utf-8');
-    return JSON.parse(data);
-  } catch {
-    return { syncedServers: [], lastSyncAt: '' };
+    await fs.writeFile(
+      definitionTmp,
+      `${JSON.stringify(definitions, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    await fs.writeFile(secretTmp, `${JSON.stringify(secrets, null, 2)}\n`, {
+      mode: 0o600,
+    });
+    await fs.rename(secretTmp, secretPath);
+    await fs.rename(definitionTmp, definitionPath);
+    await Promise.all([
+      fs.chmod(definitionPath, 0o600),
+      fs.chmod(secretPath, 0o600),
+    ]);
+  } finally {
+    await Promise.all([
+      fs.rm(definitionTmp, { force: true }),
+      fs.rm(secretTmp, { force: true }),
+    ]);
   }
-}
-
-async function writeHostSyncManifest(
-  userId: string,
-  manifest: HostSyncManifest,
-): Promise<void> {
-  const dir = getUserMcpServersDir(userId);
-  await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(
-    getHostSyncManifestPath(userId),
-    JSON.stringify(manifest, null, 2),
-  );
 }
 
 // --- Routes ---
@@ -176,38 +171,191 @@ function validateMcpKeyValueRecord(
 
 const mcpServersRoutes = new Hono<{ Variables: Variables }>();
 
-function toMcpServerSummary(id: string, entry: McpServerEntry) {
-  const { env, headers, ...metadata } = entry;
+function requestedScope(value: unknown): ManagedMcpScope | null {
+  if (value === undefined || value === null || value === '') return 'user';
+  return value === 'system' || value === 'user' ? value : null;
+}
+
+function scopeOwnerId(scope: ManagedMcpScope, userId: string): string {
+  return scope === 'system' ? 'system' : userId;
+}
+
+function canMutateScope(user: AuthUser, scope: ManagedMcpScope): boolean {
+  return scope === 'user' || user.role === 'admin';
+}
+
+function isMcpMemberAccess(value: unknown): value is McpMemberAccess {
+  return value === 'admin_only' || value === 'shared';
+}
+
+function mcpMutationImpact(
+  userId: string,
+  scope: ManagedMcpScope,
+  ids?: string[],
+): CapabilityMutationImpact {
+  return { kind: 'mcp', ownerUserId: userId, scope, ids };
+}
+
+function runtimeMutationFailure(error: unknown, action: string) {
+  if (error instanceof WorkspaceRuntimeQuiesceError) {
+    return {
+      error: error.persisted
+        ? `${action} was saved, but runtime cleanup failed; retry the request`
+        : `Failed to stop affected workspaces; ${action} was not saved`,
+      persisted: error.persisted,
+      retryable: true,
+    };
+  }
+  if (error instanceof CapabilityRuntimeCommitError) {
+    return {
+      error: `${action} has an uncertain commit outcome; retry the request to finish fail-closed cleanup`,
+      persisted: 'unknown',
+      retryable: true,
+    };
+  }
+  return null;
+}
+
+async function repairPreviousMcpCleanup(
+  userId: string,
+  scope: ManagedMcpScope,
+  ids: string[] | undefined,
+  action: string,
+): Promise<number> {
+  return repairCapabilityRuntimeSafetyBlock(
+    mcpMutationImpact(userId, scope, ids),
+    action,
+  );
+}
+
+// All managed MCP mutations share the same scope locks as Agent policy
+// validation/commit. Locking system + current user also makes cross-scope name
+// collisions deterministic for list/update operations.
+mcpServersRoutes.use('*', authMiddleware, async (c, next) => {
+  if (!['POST', 'PATCH', 'DELETE'].includes(c.req.method)) return next();
+  const user = c.get('user') as AuthUser;
+  return withCapabilityScopeLocks(
+    [SYSTEM_CAPABILITY_LOCK_KEY, userCapabilityLockKey(user.id)],
+    next,
+  );
+});
+
+function toMcpServerSummary(
+  id: string,
+  entry: McpServerEntry,
+  secrets?: StoredMcpServerSecrets,
+  source: ManagedMcpScope = 'user',
+  readonly = false,
+) {
+  const hasEnvSecrets = Object.keys(secrets?.env ?? {}).length > 0;
+  const hasHeaderSecrets = Object.keys(secrets?.headers ?? {}).length > 0;
+  const memberAccess: McpMemberAccess | undefined =
+    source === 'system'
+      ? entry.memberAccess === 'shared'
+        ? 'shared'
+        : 'admin_only'
+      : undefined;
+  const systemMemberView = source === 'system' && readonly;
+  const runtimeAvailable =
+    source !== 'system' || !readonly || memberAccess === 'shared';
+  const { memberAccess: _storedMemberAccess, ...definition } = entry;
+  const visibleDefinition =
+    systemMemberView && memberAccess === 'admin_only'
+      ? {
+          enabled: definition.enabled,
+          ...(definition.type ? { type: definition.type } : {}),
+          ...(definition.importedFromHost ? { importedFromHost: true } : {}),
+          ...(definition.syncedFromHost ? { syncedFromHost: true } : {}),
+          addedAt: definition.addedAt,
+        }
+      : definition;
   return {
     id,
-    ...metadata,
-    envKeys: Object.keys(env ?? {}),
-    headerKeys: Object.keys(headers ?? {}),
+    source,
+    sourceKey: `${source}:${id}`,
+    readonly,
+    ...visibleDefinition,
+    ...(memberAccess ? { memberAccess } : {}),
+    // System secret key names stay inside the administrator boundary even
+    // when the server is explicitly shared for member Agent runtimes.
+    envKeys: systemMemberView ? [] : Object.keys(secrets?.env ?? {}),
+    headerKeys: systemMemberView ? [] : Object.keys(secrets?.headers ?? {}),
+    hasEnvSecrets,
+    hasHeaderSecrets,
+    runtimeAvailable,
+    ...(!runtimeAvailable
+      ? { unavailableReason: 'system_admin_only' as const }
+      : {}),
   };
+}
+
+function referencedByCustomMcpProfiles(
+  userId: string,
+  id: string,
+  scope: ManagedMcpScope,
+): string[] {
+  const userIds =
+    scope === 'system' ? getAllUsers().map((user) => user.id) : [userId];
+  return userIds.flatMap((ownerId) =>
+    listAgentProfilesForUser(ownerId)
+      .filter((profile) => {
+        if (profile.runtime_policy.mcp.mode !== 'custom') return false;
+        return profile.runtime_policy.mcp.ids.some((reference) =>
+          scope === 'system'
+            ? reference === `system:${id}`
+            : reference === id || reference === `user:${id}`,
+        );
+      })
+      .map((profile) => profile.name),
+  );
 }
 
 // GET / — list all MCP servers for the current user
 mcpServersRoutes.get('/', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
-  const file = await readMcpServersFile(authUser.id);
-  const servers = Object.entries(file.servers).map(([id, entry]) =>
-    toMcpServerSummary(id, entry),
-  );
+  const [systemStore, userStore] = await Promise.all([
+    readMcpServersFile('system'),
+    readMcpServersFile(authUser.id),
+  ]);
+  const servers = [
+    ...Object.entries(systemStore.definitions.servers).map(([id, entry]) =>
+      toMcpServerSummary(
+        id,
+        entry,
+        systemStore.secrets.servers[id],
+        'system',
+        authUser.role !== 'admin',
+      ),
+    ),
+    ...Object.entries(userStore.definitions.servers).map(([id, entry]) =>
+      toMcpServerSummary(id, entry, userStore.secrets.servers[id], 'user'),
+    ),
+  ];
   return c.json({ servers });
 });
 
-// GET /:id — load one server, including secrets, only when its detail is opened
+// GET /:id — load one server definition. Secret values are never returned.
 mcpServersRoutes.get('/:id', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
   const id = c.req.param('id');
   if (!validateServerId(id)) {
     return c.json({ error: 'Invalid server ID' }, 400);
   }
+  const scope = requestedScope(c.req.query('source'));
+  if (!scope) return c.json({ error: 'Invalid MCP source' }, 400);
 
-  const file = await readMcpServersFile(authUser.id);
-  const entry = file.servers[id];
+  const store = await readMcpServersFile(scopeOwnerId(scope, authUser.id));
+  const entry = store.definitions.servers[id];
   if (!entry) return c.json({ error: 'Server not found' }, 404);
-  return c.json({ server: { id, ...entry } });
+  return c.json({
+    server: toMcpServerSummary(
+      id,
+      entry,
+      store.secrets.servers[id],
+      scope,
+      scope === 'system' && authUser.role !== 'admin',
+    ),
+  });
 });
 
 // POST / — add a new MCP server
@@ -215,7 +363,18 @@ mcpServersRoutes.post('/', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
   const body = await c.req.json().catch(() => ({}));
 
-  const { id, command, args, env, description, type, url, headers } = body as {
+  const {
+    id,
+    command,
+    args,
+    env,
+    description,
+    type,
+    url,
+    headers,
+    scope: rawScope,
+    memberAccess,
+  } = body as {
     id?: string;
     command?: string;
     args?: string[];
@@ -224,7 +383,27 @@ mcpServersRoutes.post('/', authMiddleware, async (c) => {
     type?: string;
     url?: string;
     headers?: Record<string, string>;
+    scope?: string;
+    memberAccess?: McpMemberAccess;
   };
+  const scope = requestedScope(rawScope);
+  if (!scope) return c.json({ error: 'Invalid MCP scope' }, 400);
+  if (!canMutateScope(authUser, scope)) {
+    return c.json({ error: 'Only admin can manage system MCP servers' }, 403);
+  }
+  if (memberAccess !== undefined && !isMcpMemberAccess(memberAccess)) {
+    return c.json(
+      { error: 'memberAccess must be "admin_only" or "shared"' },
+      400,
+    );
+  }
+  if (scope === 'user' && memberAccess !== undefined) {
+    return c.json(
+      { error: 'memberAccess is only valid for system MCP servers' },
+      400,
+    );
+  }
+  const ownerId = scopeOwnerId(scope, authUser.id);
 
   if (!id || typeof id !== 'string') {
     return c.json({ error: 'id is required and must be a string' }, 400);
@@ -239,10 +418,18 @@ mcpServersRoutes.post('/', authMiddleware, async (c) => {
     );
   }
 
+  try {
+    await repairPreviousMcpCleanup(authUser.id, scope, [id], 'Create MCP');
+  } catch (error) {
+    const failure = runtimeMutationFailure(error, 'MCP creation cleanup');
+    if (failure) return c.json(failure, 503);
+    throw error;
+  }
+
   // Billing: check MCP server limit
-  const existingServers = await readMcpServersFile(authUser.id);
-  const currentCount = Object.keys(existingServers.servers).length;
-  if (!existingServers.servers[id]) {
+  const existingStore = await readMcpServersFile(ownerId);
+  const currentCount = Object.keys(existingStore.definitions.servers).length;
+  if (scope === 'user' && !existingStore.definitions.servers[id]) {
     // Only check limit for new servers, not updates
     const limit = checkMcpServerLimit(authUser.id, authUser.role, currentCount);
     if (!limit.allowed) {
@@ -294,33 +481,59 @@ mcpServersRoutes.post('/', authMiddleware, async (c) => {
     }
   }
 
-  const file = await readMcpServersFile(authUser.id);
-  if (file.servers[id]) {
+  const store = await readMcpServersFile(ownerId);
+  if (store.definitions.servers[id]) {
     return c.json({ error: `Server "${id}" already exists` }, 409);
   }
 
   const entry: McpServerEntry = {
     enabled: true,
     ...(description ? { description } : {}),
+    ...(scope === 'system'
+      ? { memberAccess: memberAccess ?? 'admin_only' }
+      : {}),
     addedAt: new Date().toISOString(),
   };
 
   if (isHttpType) {
     entry.type = type as 'http' | 'sse';
     entry.url = url;
-    if (headers && Object.keys(headers).length > 0) entry.headers = headers;
   } else {
     entry.command = command;
     if (args && args.length > 0) entry.args = args;
-    if (env && Object.keys(env).length > 0) entry.env = env;
   }
 
-  file.servers[id] = entry;
+  store.definitions.servers[id] = entry;
+  const secretEntry: StoredMcpServerSecrets = {};
+  if (env && Object.keys(env).length > 0) secretEntry.env = env;
+  if (headers && Object.keys(headers).length > 0) secretEntry.headers = headers;
+  if (secretEntry.env || secretEntry.headers) {
+    store.secrets.servers[id] = secretEntry;
+  }
 
-  await writeMcpServersFile(authUser.id, file);
+  let invalidatedRuntimeJids = 0;
+  try {
+    invalidatedRuntimeJids = (
+      await mutateCapabilityAroundRuntimeQuiesce(
+        mcpMutationImpact(authUser.id, scope, [id]),
+        `MCP ${scope}:${id} created`,
+        () => writeMcpServersFile(ownerId, store.definitions, store.secrets),
+      )
+    ).invalidatedRuntimeJids;
+  } catch (error) {
+    const failure = runtimeMutationFailure(error, 'MCP creation');
+    if (failure) return c.json(failure, 503);
+    throw error;
+  }
   return c.json({
     success: true,
-    server: toMcpServerSummary(id, file.servers[id]),
+    invalidated_runtime_jids: invalidatedRuntimeJids,
+    server: toMcpServerSummary(
+      id,
+      store.definitions.servers[id],
+      store.secrets.servers[id],
+      scope,
+    ),
   });
 });
 
@@ -332,20 +545,62 @@ mcpServersRoutes.patch('/:id', authMiddleware, async (c) => {
   if (!validateServerId(id)) {
     return c.json({ error: 'Invalid server ID' }, 400);
   }
+  const scope = requestedScope(c.req.query('source'));
+  if (!scope) return c.json({ error: 'Invalid MCP source' }, 400);
+  if (!canMutateScope(authUser, scope)) {
+    return c.json({ error: 'Only admin can manage system MCP servers' }, 403);
+  }
+  const ownerId = scopeOwnerId(scope, authUser.id);
 
-  const body = await c.req.json().catch(() => ({}));
-  const { command, args, env, enabled, description, url, headers } = body as {
+  const body = (await c.req.json().catch(() => ({}))) as Record<
+    string,
+    unknown
+  >;
+  const {
+    command,
+    args,
+    env,
+    enabled,
+    description,
+    url,
+    headers,
+    memberAccess,
+  } = body as {
     command?: string;
     args?: string[];
-    env?: Record<string, string>;
+    env?: Record<string, string> | null;
     enabled?: boolean;
-    description?: string;
+    description?: string | null;
     url?: string;
-    headers?: Record<string, string>;
+    headers?: Record<string, string> | null;
+    memberAccess?: McpMemberAccess;
   };
 
-  const file = await readMcpServersFile(authUser.id);
-  const entry = file.servers[id];
+  if (Object.prototype.hasOwnProperty.call(body, 'memberAccess')) {
+    if (!isMcpMemberAccess(memberAccess)) {
+      return c.json(
+        { error: 'memberAccess must be "admin_only" or "shared"' },
+        400,
+      );
+    }
+    if (scope !== 'system') {
+      return c.json(
+        { error: 'memberAccess is only valid for system MCP servers' },
+        400,
+      );
+    }
+  }
+
+  try {
+    await repairPreviousMcpCleanup(authUser.id, scope, [id], 'Update MCP');
+  } catch (error) {
+    const failure = runtimeMutationFailure(error, 'MCP update cleanup');
+    if (failure) return c.json(failure, 503);
+    throw error;
+  }
+
+  const store = await readMcpServersFile(ownerId);
+  const entry = store.definitions.servers[id];
   if (!entry) {
     return c.json({ error: 'Server not found' }, 404);
   }
@@ -369,9 +624,10 @@ mcpServersRoutes.patch('/:id', authMiddleware, async (c) => {
     entry.args = args;
   }
   if (env !== undefined) {
-    const r = validateMcpKeyValueRecord(env, 'env', MAX_MCP_ENV_ENTRIES);
-    if (!r.ok) return c.json({ error: r.reason }, 400);
-    entry.env = env;
+    if (env !== null) {
+      const r = validateMcpKeyValueRecord(env, 'env', MAX_MCP_ENV_ENTRIES);
+      if (!r.ok) return c.json({ error: r.reason }, 400);
+    }
   }
   // http/sse fields
   if (url !== undefined) {
@@ -384,14 +640,31 @@ mcpServersRoutes.patch('/:id', authMiddleware, async (c) => {
     entry.url = url;
   }
   if (headers !== undefined) {
-    const r = validateMcpKeyValueRecord(headers, 'headers', MAX_MCP_HEADERS);
-    if (!r.ok) return c.json({ error: r.reason }, 400);
-    entry.headers = headers;
+    if (headers !== null) {
+      const r = validateMcpKeyValueRecord(headers, 'headers', MAX_MCP_HEADERS);
+      if (!r.ok) return c.json({ error: r.reason }, 400);
+    }
   }
   // common fields
   if (enabled !== undefined) {
     if (typeof enabled !== 'boolean') {
       return c.json({ error: 'enabled must be a boolean' }, 400);
+    }
+    if (!enabled) {
+      const referencedByProfiles = referencedByCustomMcpProfiles(
+        authUser.id,
+        id,
+        scope,
+      );
+      if (referencedByProfiles.length > 0) {
+        return c.json(
+          {
+            error: 'MCP server is selected by one or more Agents',
+            referencedByProfiles,
+          },
+          409,
+        );
+      }
     }
     entry.enabled = enabled;
   }
@@ -411,9 +684,50 @@ mcpServersRoutes.patch('/:id', authMiddleware, async (c) => {
     entry.description =
       typeof description === 'string' ? description : undefined;
   }
+  if (memberAccess !== undefined) {
+    entry.memberAccess = memberAccess;
+  }
 
-  await writeMcpServersFile(authUser.id, file);
-  return c.json({ success: true, server: toMcpServerSummary(id, entry) });
+  const secretEntry = { ...(store.secrets.servers[id] ?? {}) };
+  if (Object.prototype.hasOwnProperty.call(body, 'env')) {
+    if (env === null || Object.keys(env ?? {}).length === 0) {
+      delete secretEntry.env;
+    } else {
+      secretEntry.env = env;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'headers')) {
+    if (headers === null || Object.keys(headers ?? {}).length === 0) {
+      delete secretEntry.headers;
+    } else {
+      secretEntry.headers = headers;
+    }
+  }
+  if (secretEntry.env || secretEntry.headers) {
+    store.secrets.servers[id] = secretEntry;
+  } else {
+    delete store.secrets.servers[id];
+  }
+
+  let invalidatedRuntimeJids = 0;
+  try {
+    invalidatedRuntimeJids = (
+      await mutateCapabilityAroundRuntimeQuiesce(
+        mcpMutationImpact(authUser.id, scope, [id]),
+        `MCP ${scope}:${id} updated`,
+        () => writeMcpServersFile(ownerId, store.definitions, store.secrets),
+      )
+    ).invalidatedRuntimeJids;
+  } catch (error) {
+    const failure = runtimeMutationFailure(error, 'MCP update');
+    if (failure) return c.json(failure, 503);
+    throw error;
+  }
+  return c.json({
+    success: true,
+    invalidated_runtime_jids: invalidatedRuntimeJids,
+    server: toMcpServerSummary(id, entry, store.secrets.servers[id], scope),
+  });
 });
 
 // DELETE /:id — delete a server
@@ -424,53 +738,97 @@ mcpServersRoutes.delete('/:id', authMiddleware, async (c) => {
   if (!validateServerId(id)) {
     return c.json({ error: 'Invalid server ID' }, 400);
   }
+  const scope = requestedScope(c.req.query('source'));
+  if (!scope) return c.json({ error: 'Invalid MCP source' }, 400);
+  if (!canMutateScope(authUser, scope)) {
+    return c.json({ error: 'Only admin can manage system MCP servers' }, 403);
+  }
+  const ownerId = scopeOwnerId(scope, authUser.id);
 
-  const file = await readMcpServersFile(authUser.id);
-  if (!file.servers[id]) {
+  let repairedRuntimeJids = 0;
+  try {
+    repairedRuntimeJids = await repairPreviousMcpCleanup(
+      authUser.id,
+      scope,
+      [id],
+      'Delete MCP',
+    );
+  } catch (error) {
+    const failure = runtimeMutationFailure(error, 'MCP deletion cleanup');
+    if (failure) return c.json(failure, 503);
+    throw error;
+  }
+
+  const store = await readMcpServersFile(ownerId);
+  if (!store.definitions.servers[id]) {
+    if (repairedRuntimeJids > 0) {
+      return c.json({
+        success: true,
+        recovered_runtime_cleanup: true,
+        invalidated_runtime_jids: repairedRuntimeJids,
+      });
+    }
     return c.json({ error: 'Server not found' }, 404);
   }
 
-  delete file.servers[id];
-  await writeMcpServersFile(authUser.id, file);
-  return c.json({ success: true });
+  const referencedByProfiles = referencedByCustomMcpProfiles(
+    authUser.id,
+    id,
+    scope,
+  );
+  if (referencedByProfiles.length > 0) {
+    return c.json(
+      {
+        error: 'MCP server is selected by one or more Agents',
+        referencedByProfiles,
+      },
+      409,
+    );
+  }
+
+  delete store.definitions.servers[id];
+  delete store.secrets.servers[id];
+  try {
+    const result = await mutateCapabilityAroundRuntimeQuiesce(
+      mcpMutationImpact(authUser.id, scope, [id]),
+      `MCP ${scope}:${id} deleted`,
+      () => writeMcpServersFile(ownerId, store.definitions, store.secrets),
+    );
+    return c.json({
+      success: true,
+      invalidated_runtime_jids: result.invalidatedRuntimeJids,
+    });
+  } catch (error) {
+    const failure = runtimeMutationFailure(error, 'MCP deletion');
+    if (failure) return c.json(failure, 503);
+    throw error;
+  }
 });
 
-// POST /sync-host — sync from host MCP configs (admin only)
-// Reads from both ~/.claude/settings.json and ~/.claude.json
+// POST /sync-host — explicitly import copies from the configured host Claude
+// directory (admin only). Despite the legacy route name this is intentionally
+// not a live sync: existing managed definitions are never overwritten or
+// deleted when the host changes.
 mcpServersRoutes.post('/sync-host', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
   if (authUser.role !== 'admin') {
     return c.json({ error: 'Only admin can sync host MCP servers' }, 403);
   }
-
-  // Read MCP servers from both config file locations
-  let hostServers: Record<string, any> = {};
-
-  // Source 1: ~/.claude/settings.json
-  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
   try {
-    const raw = await fs.readFile(settingsPath, 'utf-8');
-    const settings = JSON.parse(raw);
-    if (settings.mcpServers) {
-      hostServers = { ...hostServers, ...settings.mcpServers };
-    }
-  } catch {
-    // File may not exist, that's OK
+    await repairPreviousMcpCleanup(
+      authUser.id,
+      'user',
+      undefined,
+      'Import host MCP',
+    );
+  } catch (error) {
+    const failure = runtimeMutationFailure(error, 'Host MCP import cleanup');
+    if (failure) return c.json(failure, 503);
+    throw error;
   }
 
-  // Source 2: ~/.claude.json (global Claude Code config, stores per-user MCP settings)
-  // When both files define the same server ID, ~/.claude.json wins because it's
-  // the primary user-facing config file where Claude Code persists MCP settings.
-  const globalConfigPath = path.join(os.homedir(), '.claude.json');
-  try {
-    const raw = await fs.readFile(globalConfigPath, 'utf-8');
-    const config = JSON.parse(raw);
-    if (config.mcpServers) {
-      hostServers = { ...hostServers, ...config.mcpServers };
-    }
-  } catch {
-    // File may not exist, that's OK
-  }
+  const externalClaudeDir = getEffectiveExternalDir();
+  const hostServers = loadHostClaudeMcpServers(externalClaudeDir);
 
   if (Object.keys(hostServers).length === 0) {
     return c.json({
@@ -478,82 +836,109 @@ mcpServersRoutes.post('/sync-host', authMiddleware, async (c) => {
       updated: 0,
       deleted: 0,
       skipped: 0,
-      message: 'No MCP servers found in host config files',
+      importedFrom: externalClaudeDir,
+      message: 'No MCP servers found in the configured host Claude directory',
     });
   }
 
-  const file = await readMcpServersFile(authUser.id);
-  const manifest = await readHostSyncManifest(authUser.id);
-  const previouslySynced = new Set(manifest.syncedServers);
-  const hostServerIds = new Set(Object.keys(hostServers));
-
+  const store = await readMcpServersFile(authUser.id);
   const stats = { added: 0, updated: 0, deleted: 0, skipped: 0 };
-  const newSyncedList: string[] = [];
-
-  // Add/update from host
-  for (const [id, hostEntry] of Object.entries(hostServers) as [
-    string,
-    any,
-  ][]) {
+  for (const [id, hostEntry] of Object.entries(hostServers)) {
     if (!validateServerId(id)) {
       stats.skipped++;
       continue;
     }
-
-    const existsInUser = !!file.servers[id];
-    const wasSynced = previouslySynced.has(id);
-
-    // Skip manually added entries
-    if (existsInUser && !wasSynced) {
+    if (store.definitions.servers[id]) {
+      stats.skipped++;
+      continue;
+    }
+    const limit = checkMcpServerLimit(
+      authUser.id,
+      authUser.role,
+      Object.keys(store.definitions.servers).length,
+    );
+    if (!limit.allowed) {
       stats.skipped++;
       continue;
     }
 
     const isHttpType = hostEntry.type === 'http' || hostEntry.type === 'sse';
-
     const entry: McpServerEntry = {
       enabled: true,
+      importedFromHost: true,
       syncedFromHost: true,
-      addedAt: existsInUser
-        ? file.servers[id].addedAt || new Date().toISOString()
-        : new Date().toISOString(),
+      addedAt: new Date().toISOString(),
     };
-
     if (isHttpType) {
+      if (
+        (hostEntry.type !== 'http' && hostEntry.type !== 'sse') ||
+        typeof hostEntry.url !== 'string' ||
+        !hostEntry.url
+      ) {
+        stats.skipped++;
+        continue;
+      }
+      const headersResult = hostEntry.headers
+        ? validateMcpKeyValueRecord(
+            hostEntry.headers,
+            'headers',
+            MAX_MCP_HEADERS,
+          )
+        : { ok: true as const };
+      if (!headersResult.ok) {
+        stats.skipped++;
+        continue;
+      }
       entry.type = hostEntry.type;
-      entry.url = hostEntry.url || '';
-      if (hostEntry.headers) entry.headers = hostEntry.headers;
+      entry.url = hostEntry.url;
     } else {
-      entry.command = hostEntry.command || '';
-      if (hostEntry.args) entry.args = hostEntry.args;
-      if (hostEntry.env) entry.env = hostEntry.env;
+      if (typeof hostEntry.command !== 'string' || !hostEntry.command) {
+        stats.skipped++;
+        continue;
+      }
+      const argsResult = hostEntry.args
+        ? validateMcpStringArrayLikeArgs(hostEntry.args)
+        : { ok: true as const };
+      const envResult = hostEntry.env
+        ? validateMcpKeyValueRecord(hostEntry.env, 'env', MAX_MCP_ENV_ENTRIES)
+        : { ok: true as const };
+      if (!argsResult.ok || !envResult.ok) {
+        stats.skipped++;
+        continue;
+      }
+      entry.command = hostEntry.command;
+      if (Array.isArray(hostEntry.args))
+        entry.args = hostEntry.args as string[];
     }
-
-    if (existsInUser) {
-      stats.updated++;
-    } else {
-      stats.added++;
+    store.definitions.servers[id] = entry;
+    const secretEntry: StoredMcpServerSecrets = {};
+    if (hostEntry.env && typeof hostEntry.env === 'object') {
+      secretEntry.env = hostEntry.env as Record<string, string>;
     }
-
-    file.servers[id] = entry;
-    newSyncedList.push(id);
+    if (hostEntry.headers && typeof hostEntry.headers === 'object') {
+      secretEntry.headers = hostEntry.headers as Record<string, string>;
+    }
+    if (secretEntry.env || secretEntry.headers)
+      store.secrets.servers[id] = secretEntry;
+    stats.added++;
   }
 
-  // Delete servers that were synced before but no longer on host
-  for (const id of previouslySynced) {
-    if (!hostServerIds.has(id) && file.servers[id]?.syncedFromHost) {
-      delete file.servers[id];
-      stats.deleted++;
-    }
+  try {
+    const result = await mutateCapabilityAroundRuntimeQuiesce(
+      mcpMutationImpact(authUser.id, 'user'),
+      'Host MCP copies imported into managed user scope',
+      () => writeMcpServersFile(authUser.id, store.definitions, store.secrets),
+    );
+    return c.json({
+      ...stats,
+      importedFrom: externalClaudeDir,
+      invalidated_runtime_jids: result.invalidatedRuntimeJids,
+    });
+  } catch (error) {
+    const failure = runtimeMutationFailure(error, 'Host MCP import');
+    if (failure) return c.json(failure, 503);
+    throw error;
   }
-
-  await writeMcpServersFile(authUser.id, file);
-  await writeHostSyncManifest(authUser.id, {
-    syncedServers: newSyncedList,
-    lastSyncAt: new Date().toISOString(),
-  });
-
-  return c.json(stats);
 });
 
 export { getUserMcpServersDir, readMcpServersFile };

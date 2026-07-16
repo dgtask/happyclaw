@@ -6,6 +6,11 @@ export interface Skill {
   name: string;
   description: string;
   source: 'user' | 'project' | 'external';
+  sourceKey: string;
+  conflictSources?: Skill['source'][];
+  effectiveSource?: Skill['source'] | null;
+  effective?: boolean;
+  readonly?: boolean;
   enabled: boolean;
   packageName?: string;
   installedAt?: string;
@@ -64,7 +69,7 @@ interface SkillsState {
   importSkillArchive: (file: File, replace?: boolean) => Promise<string[]>;
   reinstallSkill: (id: string) => Promise<void>;
   deleteAllUserSkills: () => Promise<number>;
-  getSkillDetail: (id: string) => Promise<SkillDetail>;
+  getSkillDetail: (sourceKey: string) => Promise<SkillDetail>;
   searchSkills: (query: string) => Promise<void>;
   fetchSearchDetail: (result: SearchResult) => Promise<void>;
 }
@@ -83,7 +88,15 @@ export const useSkillsStore = create<SkillsState>((set, get) => ({
     set({ loading: true });
     try {
       const data = await api.get<{ skills: Skill[] }>('/api/skills');
-      set({ skills: data.skills, loading: false, error: null });
+      set({
+        skills: data.skills.map((skill) => ({
+          ...skill,
+          sourceKey: skill.sourceKey ?? `${skill.source}:${skill.id}`,
+          conflictSources: skill.conflictSources ?? [],
+        })),
+        loading: false,
+        error: null,
+      });
     } catch (err) {
       set({
         loading: false,
@@ -193,8 +206,13 @@ export const useSkillsStore = create<SkillsState>((set, get) => ({
     return result.deleted;
   },
 
-  getSkillDetail: async (id: string) => {
-    const data = await api.get<{ skill: SkillDetail }>(`/api/skills/${id}`);
+  getSkillDetail: async (sourceKey: string) => {
+    const separator = sourceKey.indexOf(':');
+    const source = separator > 0 ? sourceKey.slice(0, separator) : 'user';
+    const id = separator > 0 ? sourceKey.slice(separator + 1) : sourceKey;
+    const data = await api.get<{ skill: SkillDetail }>(
+      `/api/skills/${encodeURIComponent(id)}?source=${encodeURIComponent(source)}`,
+    );
     return data.skill;
   },
 

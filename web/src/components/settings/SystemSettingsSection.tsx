@@ -645,9 +645,9 @@ export function HostIntegrationSettingsSection({
                   id="host-integration-main-agent-context-description"
                   className="mt-1 text-xs leading-5 text-muted-foreground"
                 >
-                  仅管理员用户的默认 HappyClaw 可继承宿主机提示词、规则和
-                  Skills；普通用户的默认 HappyClaw 始终使用托管配置。HappyClaw
-                  管理的能力仍会附加生效。
+                  开启后自动继承宿主机提示词、Rules、全部 Skills 与 MCP，
+                  无需再逐项选择；HappyClaw 管理的能力继续附加。普通用户的 默认
+                  HappyClaw 始终使用托管配置。
                 </p>
               </div>
               <Switch
@@ -837,7 +837,7 @@ export function HostIntegrationSettingsSection({
               >
                 留空时使用当前服务用户的
                 ~/.claude；自定义目录必须是宿主机上的绝对路径。
-                当前目录同时作为提示词、规则、Skills 和 Plugin Marketplace
+                当前目录同时作为提示词、Rules、Skills、MCP 与 Plugin Marketplace
                 的来源。
               </p>
             </div>
@@ -872,7 +872,7 @@ export function HostIntegrationSettingsSection({
                 to="/capabilities/mcp"
                 className="flex min-h-11 items-center justify-between rounded-lg border border-border px-3 text-sm font-medium text-foreground hover:bg-muted"
               >
-                同步并管理宿主机 MCP
+                导入宿主机 MCP 副本
                 <ArrowRight className="size-4 text-muted-foreground" />
               </Link>
               <Link

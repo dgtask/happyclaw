@@ -170,6 +170,15 @@ describe('system settings capability boundaries', () => {
       created_by: 'settings-admin-owner',
     });
     db.assignWorkspaceAgentProfile('settings-admin-custom', adminCustom.id);
+    db.setSession('settings-admin-custom', 'sdk-session-dir-a', null, {
+      agentProfileId: adminCustom.id,
+      agentProfileVersion: adminCustom.version,
+      identityHash: adminCustom.identity_hash,
+    });
+    expect(db.getSession('settings-admin-custom')).toBe('sdk-session-dir-a');
+    expect(
+      db.listWorkspaceRuntimeSessionsByWorkspace('web:settings-admin-custom'),
+    ).toHaveLength(1);
     db.setRegisteredGroup('web:settings-member-default', {
       name: 'Member default',
       folder: 'settings-member-default',
@@ -199,6 +208,28 @@ describe('system settings capability boundaries', () => {
       'web:settings-member-default',
       expect.objectContaining({ force: true, preserveQueuedWork: true }),
     );
+    expect(db.getSession('settings-admin-custom')).toBeUndefined();
+    expect(
+      db.listWorkspaceRuntimeSessionsByWorkspace('web:settings-admin-custom'),
+    ).toEqual([]);
+
+    db.setSession('settings-admin-custom', 'sdk-session-dir-b', null, {
+      agentProfileId: adminCustom.id,
+      agentProfileVersion: adminCustom.version,
+      identityHash: adminCustom.identity_hash,
+    });
+    const finalClaudeDir = path.join(tmpDir, 'final-claude');
+    fs.mkdirSync(finalClaudeDir);
+    const secondResponse = await app.request('/api/config/host-integration', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ externalClaudeDir: finalClaudeDir }),
+    });
+    expect(secondResponse.status).toBe(200);
+    expect(db.getSession('settings-admin-custom')).toBeUndefined();
+    expect(
+      db.listWorkspaceRuntimeSessionsByWorkspace('web:settings-admin-custom'),
+    ).toEqual([]);
   });
 });
 

@@ -61,7 +61,8 @@ describe('schema v46 migration', () => {
     legacy.close();
 
     db.initDatabase();
-    expect(db.getRouterState('schema_version')).toBe('47');
+    // Startup continues through the later channel-account lifecycle migration.
+    expect(db.getRouterState('schema_version')).toBe('51');
     expect(
       db.getWorkspaceRuntimeSession(
         'migration-runtime-workspace',
@@ -113,7 +114,7 @@ describe('schema v46 migration', () => {
     // duplicate/drop the preserved runtime state. It also reconciles ghosts
     // that have no authoritative registered-group/session/channel source.
     db.initDatabase();
-    expect(db.getRouterState('schema_version')).toBe('47');
+    expect(db.getRouterState('schema_version')).toBe('51');
     expect(
       db.getWorkspaceRuntimeSession(
         'migration-runtime-workspace',

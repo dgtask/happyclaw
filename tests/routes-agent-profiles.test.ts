@@ -98,6 +98,33 @@ beforeAll(() => {
       },
     }),
   );
+  const systemMcpDir = path.join(tmpDataDir, 'mcp-servers', 'system');
+  fs.mkdirSync(systemMcpDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(systemMcpDir, 'servers.json'),
+    JSON.stringify({
+      servers: {
+        platform: {
+          command: 'platform-mcp',
+          enabled: true,
+          memberAccess: 'shared',
+          addedAt: '2026-07-10T00:00:00.000Z',
+        },
+        vault: {
+          command: 'vault-mcp',
+          enabled: true,
+          memberAccess: 'admin_only',
+          addedAt: '2026-07-10T00:00:00.000Z',
+        },
+      },
+    }),
+  );
+  fs.writeFileSync(
+    path.join(systemMcpDir, 'secrets.json'),
+    JSON.stringify({
+      servers: { vault: { env: { SYSTEM_TOKEN: 'system-secret' } } },
+    }),
+  );
 });
 
 afterAll(() => {
@@ -181,6 +208,129 @@ describe('/api/agent-profiles routes', () => {
       tools: { mode: 'restricted' },
     });
     expect(patchedBody.profile.version).toBe(2);
+  });
+
+  test('keeps legacy all-in-one prompt payloads compatible while complete payloads use IDENTITY', async () => {
+    const createdRes = await routes.request('/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Legacy Prompt Client',
+        identity_prompt: 'legacy operating instructions',
+        include_claude_preset: false,
+      }),
+    });
+    expect(createdRes.status).toBe(201);
+    const created = (await createdRes.json()).profile;
+    expect(created).toMatchObject({
+      identity_prompt: '',
+      agents_prompt: 'legacy operating instructions',
+      prompt_mode: 'replace',
+    });
+
+    const legacyPatch = await routes.request(`/${created.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        identity_prompt: 'updated legacy operating instructions',
+      }),
+    });
+    expect(legacyPatch.status).toBe(200);
+    const legacyUpdated = (await legacyPatch.json()).profile;
+    expect(legacyUpdated).toMatchObject({
+      identity_prompt: '',
+      agents_prompt: 'updated legacy operating instructions',
+      version: created.version + 1,
+    });
+
+    // The four-part editor always sends all sections plus prompt_mode. That
+    // explicit shape disambiguates its narrow IDENTITY field from the legacy
+    // client's historical all-in-one `identity_prompt` field.
+    const completePatch = await routes.request(`/${created.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        identity_prompt: 'narrow identity',
+        soul_prompt: '',
+        agents_prompt: legacyUpdated.agents_prompt,
+        tools_prompt: '',
+        prompt_mode: legacyUpdated.prompt_mode,
+      }),
+    });
+    expect(completePatch.status).toBe(200);
+    expect((await completePatch.json()).profile).toMatchObject({
+      identity_prompt: 'narrow identity',
+      agents_prompt: 'updated legacy operating instructions',
+      version: legacyUpdated.version + 1,
+    });
+
+    const modernIdentityOnlyPatch = await routes.request(`/${created.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        prompt_schema_version: 2,
+        identity_prompt: 'modern partial identity',
+      }),
+    });
+    expect(modernIdentityOnlyPatch.status).toBe(200);
+    expect((await modernIdentityOnlyPatch.json()).profile).toMatchObject({
+      identity_prompt: 'modern partial identity',
+      agents_prompt: 'updated legacy operating instructions',
+      version: legacyUpdated.version + 2,
+    });
+  });
+
+  test('accepts source-qualified system MCP and keeps bare ids user-scoped', async () => {
+    const response = await routes.request('/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Scoped MCP Agent',
+        runtime_policy: {
+          mcp: { mode: 'custom', ids: ['system:platform', 'github'] },
+        },
+      }),
+    });
+    expect(response.status).toBe(201);
+    expect((await response.json()).profile.runtime_policy.mcp).toEqual({
+      mode: 'custom',
+      ids: ['system:platform', 'github'],
+    });
+  });
+
+  test('rejects admin-only system MCP for members with an explicit reason but allows admins', async () => {
+    const memberResponse = await routes.request('/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Restricted System MCP Agent',
+        runtime_policy: {
+          mcp: { mode: 'custom', ids: ['system:vault'] },
+        },
+      }),
+    });
+    expect(memberResponse.status).toBe(400);
+    expect(await memberResponse.json()).toMatchObject({
+      invalid_runtime_policy: {
+        mcp: ['system:vault'],
+        restricted_system_mcp: ['system:vault'],
+      },
+    });
+
+    const adminResponse = await routes.request('/', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-test-role': 'admin',
+      },
+      body: JSON.stringify({
+        name: 'Admin System MCP Agent',
+        runtime_policy: {
+          mcp: { mode: 'custom', ids: ['system:vault'] },
+        },
+      }),
+    });
+    expect(adminResponse.status).toBe(201);
   });
 
   test('rejects AgentProfile model policy because models are configured by providers', async () => {
@@ -647,6 +797,7 @@ describe('/api/agent-profiles routes', () => {
     db.assignWorkspaceAgentProfile('post-commit-invalidation', profile.id);
 
     let stopCalls = 0;
+    let runtimeSafetyBlocked = false;
     const stopGroup = vi.fn(async () => {
       stopCalls += 1;
       if (stopCalls === 2) {
@@ -659,6 +810,13 @@ describe('/api/agent-profiles routes', () => {
         resumeGroupsAfterMutation: () => {},
         listDescendantJids: () => [],
         stopGroup,
+        blockGroupsForRuntimeSafety: () => {
+          runtimeSafetyBlocked = true;
+        },
+        unblockGroupsForRuntimeSafety: () => {
+          runtimeSafetyBlocked = false;
+        },
+        isGroupRuntimeSafetyBlocked: () => runtimeSafetyBlocked,
       },
     } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
 
@@ -685,6 +843,7 @@ describe('/api/agent-profiles routes', () => {
       identity_prompt: 'new post-commit identity',
       version: profile.version + 1,
     });
+    expect(runtimeSafetyBlocked).toBe(true);
 
     const retried = await request();
     expect(retried.status).toBe(200);
@@ -692,9 +851,11 @@ describe('/api/agent-profiles routes', () => {
       identity_prompt: 'new post-commit identity',
       version: profile.version + 1,
     });
-    // Retrying the already-persisted payload is an effective no-op and must
-    // not quiesce the workspace again.
-    expect(stopGroup).toHaveBeenCalledTimes(2);
+    // The first post-commit teardown failure installs a persistent fail-closed
+    // gate. Retrying the same already-persisted payload tears the runtime down
+    // again without another version bump, then releases that gate.
+    expect(stopGroup).toHaveBeenCalledTimes(4);
+    expect(runtimeSafetyBlocked).toBe(false);
   });
 
   test('emoji-only and normalized no-op PATCHes do not quiesce Agent workspaces', async () => {
@@ -809,6 +970,161 @@ describe('/api/agent-profiles routes', () => {
     expect(db.getSessionAgentIdentity(folder)?.identity_hash).not.toBe(
       updated.identity_hash,
     );
+  });
+
+  test('persists four-part prompt history and restores an old version as a new version', async () => {
+    const createResponse = await routes.request('/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Four Part Agent',
+        identity_prompt: '\nIdentity\n',
+        soul_prompt: 'Soul',
+        agents_prompt: 'Agents v1',
+        tools_prompt: 'Tools v1',
+        prompt_mode: 'append',
+      }),
+    });
+    expect(createResponse.status).toBe(201);
+    const created = (await createResponse.json()).profile;
+    expect(created).toMatchObject({
+      identity_prompt: '\nIdentity\n',
+      soul_prompt: 'Soul',
+      agents_prompt: 'Agents v1',
+      tools_prompt: 'Tools v1',
+      prompt_mode: 'append',
+      include_claude_preset: true,
+      version: 1,
+    });
+
+    const patchResponse = await routes.request(`/${created.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        tools_prompt: 'Tools v2',
+        prompt_mode: 'replace',
+      }),
+    });
+    expect(patchResponse.status).toBe(200);
+    expect((await patchResponse.json()).profile).toMatchObject({
+      identity_prompt: '\nIdentity\n',
+      tools_prompt: 'Tools v2',
+      prompt_mode: 'replace',
+      include_claude_preset: false,
+      version: 2,
+    });
+
+    const historyResponse = await routes.request(
+      `/${created.id}/prompt-versions`,
+    );
+    expect(historyResponse.status).toBe(200);
+    const history = (await historyResponse.json()).versions;
+    expect(history.map((item: { version: number }) => item.version)).toEqual([
+      2, 1,
+    ]);
+    expect(history[0]).toMatchObject({
+      tools_prompt: 'Tools v2',
+      prompt_mode: 'replace',
+      change_source: 'update',
+    });
+
+    const restoreResponse = await routes.request(
+      `/${created.id}/prompt-versions/1/restore`,
+      { method: 'POST' },
+    );
+    expect(restoreResponse.status).toBe(200);
+    expect(await restoreResponse.json()).toMatchObject({
+      restored_from_version: 1,
+      profile: {
+        identity_prompt: '\nIdentity\n',
+        tools_prompt: 'Tools v1',
+        prompt_mode: 'append',
+        include_claude_preset: true,
+        version: 3,
+      },
+    });
+
+    const restoredHistory = await routes.request(
+      `/${created.id}/prompt-versions`,
+    );
+    const restoredVersions = (await restoredHistory.json()).versions;
+    expect(restoredVersions[0]).toMatchObject({
+      version: 3,
+      change_source: 'restore',
+      restored_from_version: 1,
+    });
+  });
+
+  test('keeps prompt-restore workspaces fail-closed until teardown retry succeeds', async () => {
+    const profile = db.createAgentProfile({
+      ownerUserId: 'routes-agent-user',
+      name: 'Restore Safety Agent',
+      identityPrompt: 'Restore v1',
+    });
+    const updated = db.updateAgentProfile(profile.id, 'routes-agent-user', {
+      identityPrompt: 'Restore v2',
+    })!;
+    const workspaceJid = 'web:prompt-restore-safety';
+    db.setRegisteredGroup(workspaceJid, {
+      name: 'Prompt Restore Safety',
+      folder: 'prompt-restore-safety',
+      added_at: '2026-07-10T00:00:00.000Z',
+      created_by: 'routes-agent-user',
+    });
+    db.assignWorkspaceAgentProfile('prompt-restore-safety', profile.id);
+
+    let stopCalls = 0;
+    let runtimeSafetyBlocked = false;
+    webContext.setWebDeps({
+      queue: {
+        pauseGroupsForMutation: () => ({ keys: ['prompt-restore-safety'] }),
+        resumeGroupsAfterMutation: () => {},
+        listDescendantJids: () => [],
+        stopGroup: async () => {
+          stopCalls += 1;
+          if (stopCalls === 2) {
+            throw new Error('injected restore post-commit cleanup failure');
+          }
+        },
+        blockGroupsForRuntimeSafety: () => {
+          runtimeSafetyBlocked = true;
+        },
+        unblockGroupsForRuntimeSafety: () => {
+          runtimeSafetyBlocked = false;
+        },
+        isGroupRuntimeSafetyBlocked: () => runtimeSafetyBlocked,
+      },
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    const restore = () =>
+      routes.request(`/${profile.id}/prompt-versions/1/restore`, {
+        method: 'POST',
+      });
+    const failed = await restore();
+    expect(failed.status).toBe(503);
+    expect(await failed.json()).toMatchObject({
+      persisted: true,
+      profile: { identity_prompt: 'Restore v1', version: updated.version + 1 },
+    });
+    expect(runtimeSafetyBlocked).toBe(true);
+
+    const retried = await restore();
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toMatchObject({
+      profile: { identity_prompt: 'Restore v1', version: updated.version + 1 },
+      restored_from_version: 1,
+    });
+    expect(stopCalls).toBe(4);
+    expect(runtimeSafetyBlocked).toBe(false);
+
+    const historyResponse = await routes.request(
+      `/${profile.id}/prompt-versions`,
+    );
+    expect(
+      (await historyResponse.json()).versions.map(
+        (item: { version: number }) => item.version,
+      ),
+    ).toEqual([updated.version + 1, updated.version, profile.version]);
   });
 
   test('DELETE waits for membership publication and then refuses to archive the target', async () => {

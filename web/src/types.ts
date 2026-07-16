@@ -21,7 +21,7 @@ export interface GroupInfo {
     | 'owner_mentioned'
     | 'disabled';
   require_mention?: boolean;
-  conversation_source?: 'manual' | 'feishu_thread';
+  conversation_source?: 'manual' | 'native_thread' | 'feishu_thread';
   conversation_nav_mode?: 'horizontal' | 'vertical_threads';
   agent_profile_id?: string;
   agent_profile_name?: string;
@@ -36,6 +36,11 @@ export interface AgentProfile {
   owner_user_id: string;
   name: string;
   identity_prompt: string;
+  soul_prompt: string;
+  agents_prompt: string;
+  tools_prompt: string;
+  prompt_mode: AgentProfilePromptMode;
+  /** @deprecated Compatibility alias for prompt_mode === 'append'. */
   include_claude_preset: boolean;
   avatar_emoji: string | null;
   avatar_color: string | null;
@@ -49,6 +54,27 @@ export interface AgentProfile {
   status: 'active' | 'archived';
   created_at: string;
   updated_at: string;
+}
+
+export type AgentProfilePromptMode = 'append' | 'replace';
+
+export interface AgentProfilePrompts {
+  identity_prompt: string;
+  soul_prompt: string;
+  agents_prompt: string;
+  tools_prompt: string;
+  prompt_mode: AgentProfilePromptMode;
+}
+
+export interface AgentProfilePromptVersion extends AgentProfilePrompts {
+  id: string;
+  agent_profile_id: string;
+  version: number;
+  name: string;
+  identity_hash: string;
+  change_source: 'create' | 'update' | 'restore' | 'migration';
+  restored_from_version: number | null;
+  created_at: string;
 }
 
 export interface AgentProfileRuntimePolicy {
@@ -139,13 +165,16 @@ export type CapabilityLayerSource =
   | 'host'
   | 'project'
   | 'workspace'
-  | 'managed';
+  | 'managed'
+  | 'system'
+  | 'user';
 
 export interface EffectiveCapabilityEntry {
   id: string;
   source: CapabilityLayerSource;
   overrides: CapabilityLayerSource[];
   available: boolean;
+  unavailableReason?: 'tool_boundary' | 'system_admin_only';
 }
 
 export interface AgentCapabilityPreview {
@@ -183,10 +212,16 @@ export interface AgentInfo {
   completed_at?: string;
   result_summary?: string;
   linked_im_groups?: Array<{ jid: string; name: string }>;
-  source_kind?: 'manual' | 'feishu_thread' | 'auto_im' | null;
+  source_kind?: 'manual' | 'native_thread' | 'feishu_thread' | 'auto_im' | null;
   thread_id?: string | null;
   root_message_id?: string | null;
-  title_source?: 'manual' | 'feishu_root' | 'auto' | 'auto_pending' | null;
+  title_source?:
+    | 'manual'
+    | 'native_root'
+    | 'feishu_root'
+    | 'auto'
+    | 'auto_pending'
+    | null;
   title_generating?: boolean;
   last_active_at?: string | null;
   latest_message?: { content: string; timestamp: string } | null;
@@ -195,6 +230,8 @@ export interface AgentInfo {
 export interface AvailableImGroup {
   jid: string;
   name: string;
+  channel_account_id?: string | null;
+  channel_account_name?: string | null;
   bound_agent_id: string | null;
   bound_session_id?: string | null;
   bound_main_jid: string | null;

@@ -20,7 +20,7 @@ import {
 import { logger } from '../logger.js';
 import { DATA_DIR } from '../config.js';
 import { buildAgentCapabilityPreview } from '../agent-capability-preview.js';
-import { loadUserMcpServers } from '../mcp-utils.js';
+import { loadManagedMcpLayers, resolveManagedMcpPolicy } from '../mcp-utils.js';
 import { validateSkillId } from '../skill-utils.js';
 import {
   avatarUploadBodyLimit,
@@ -36,17 +36,28 @@ import {
 import {
   archiveAgentProfile,
   createAgentProfile,
+  getAgentProfilePromptVersion,
   getAgentProfileForUser,
   getAllRegisteredGroups,
   getOrCreateDefaultAgentProfile,
   getWorkspaceAgentProfileId,
   listAgentChannelMountsForProfile,
   listAgentProfilesForUser,
+  listAgentProfilePromptVersions,
   listWorkspaceRuntimeSessionsByWorkspace,
   mergeAgentProfileRuntimePolicy,
   normalizeAgentProfileRuntimePolicy,
   updateAgentProfile,
 } from '../db.js';
+import {
+  SYSTEM_CAPABILITY_LOCK_KEY,
+  userCapabilityLockKey,
+  withCapabilityScopeLocks,
+} from '../capability-lock.js';
+import {
+  agentProfilePromptsFromLegacy,
+  promptModeFromLegacyPreset,
+} from '../agent-profile-prompts.js';
 
 const agentProfileRoutes = new Hono<{ Variables: Variables }>();
 const AVATARS_DIR = path.join(DATA_DIR, 'avatars');
@@ -82,10 +93,12 @@ function isUnauthorizedHostClaudeContext(
 function validateRuntimePolicyReferences(
   userId: string,
   policy: ReturnType<typeof normalizeAgentProfileRuntimePolicy>,
-): { skills: string[]; mcp: string[] } {
+  allowAdminOnlySystemMcp: boolean,
+): { skills: string[]; mcp: string[]; restricted_system_mcp: string[] } {
   const invalid = {
     skills: [] as string[],
     mcp: [] as string[],
+    restricted_system_mcp: [] as string[],
   };
 
   if (policy.skills.mode === 'custom') {
@@ -101,11 +114,18 @@ function validateRuntimePolicyReferences(
   }
 
   if (policy.mcp.mode === 'custom') {
-    const enabledServers = loadUserMcpServers(userId);
-    for (const id of policy.mcp.ids) {
-      if (!Object.prototype.hasOwnProperty.call(enabledServers, id)) {
-        invalid.mcp.push(id);
-      }
+    const layers = loadManagedMcpLayers(userId, {
+      allowAdminOnlySystemMcp,
+    });
+    invalid.mcp.push(...resolveManagedMcpPolicy(layers, policy.mcp).missing);
+    if (!allowAdminOnlySystemMcp) {
+      const restricted = new Set(layers.restrictedSystemIds);
+      invalid.restricted_system_mcp.push(
+        ...policy.mcp.ids.filter((reference) => {
+          if (!reference.startsWith('system:')) return false;
+          return restricted.has(reference.slice('system:'.length));
+        }),
+      );
     }
   }
   return invalid;
@@ -115,6 +135,22 @@ function hasInvalidRuntimePolicyReferences(
   invalid: ReturnType<typeof validateRuntimePolicyReferences>,
 ): boolean {
   return invalid.skills.length + invalid.mcp.length > 0;
+}
+
+function usesFourPartPromptPayload(input: {
+  prompt_schema_version?: 2;
+  soul_prompt?: string;
+  agents_prompt?: string;
+  tools_prompt?: string;
+  prompt_mode?: 'append' | 'replace';
+}): boolean {
+  return (
+    input.prompt_schema_version === 2 ||
+    input.soul_prompt !== undefined ||
+    input.agents_prompt !== undefined ||
+    input.tools_prompt !== undefined ||
+    input.prompt_mode !== undefined
+  );
 }
 
 agentProfileRoutes.get('/', authMiddleware, (c) => {
@@ -145,29 +181,49 @@ agentProfileRoutes.post('/', authMiddleware, async (c) => {
   const runtimePolicy = normalizeAgentProfileRuntimePolicy(
     parsed.data.runtime_policy,
   );
-  const invalidReferences = validateRuntimePolicyReferences(
-    user.id,
-    runtimePolicy,
+  return withCapabilityScopeLocks(
+    [SYSTEM_CAPABILITY_LOCK_KEY, userCapabilityLockKey(user.id)],
+    () => {
+      const invalidReferences = validateRuntimePolicyReferences(
+        user.id,
+        runtimePolicy,
+        user.role === 'admin',
+      );
+      if (hasInvalidRuntimePolicyReferences(invalidReferences)) {
+        return c.json(
+          {
+            error: 'Runtime policy references unavailable capabilities',
+            invalid_runtime_policy: invalidReferences,
+          },
+          400,
+        );
+      }
+      const profile = createAgentProfile({
+        ownerUserId: user.id,
+        name: parsed.data.name,
+        ...(usesFourPartPromptPayload(parsed.data)
+          ? {
+              identityPrompt: parsed.data.identity_prompt ?? '',
+              soulPrompt: parsed.data.soul_prompt ?? '',
+              agentsPrompt: parsed.data.agents_prompt ?? '',
+              toolsPrompt: parsed.data.tools_prompt ?? '',
+            }
+          : {
+              identityPrompt: '',
+              soulPrompt: '',
+              agentsPrompt: parsed.data.identity_prompt ?? '',
+              toolsPrompt: '',
+            }),
+        promptMode:
+          parsed.data.prompt_mode ??
+          promptModeFromLegacyPreset(parsed.data.include_claude_preset),
+        avatarEmoji: parsed.data.avatar_emoji,
+        avatarColor: parsed.data.avatar_color,
+        runtimePolicy,
+      });
+      return c.json({ profile }, 201);
+    },
   );
-  if (hasInvalidRuntimePolicyReferences(invalidReferences)) {
-    return c.json(
-      {
-        error: 'Runtime policy references unavailable capabilities',
-        invalid_runtime_policy: invalidReferences,
-      },
-      400,
-    );
-  }
-  const profile = createAgentProfile({
-    ownerUserId: user.id,
-    name: parsed.data.name,
-    identityPrompt: parsed.data.identity_prompt ?? '',
-    includeClaudePreset: parsed.data.include_claude_preset ?? true,
-    avatarEmoji: parsed.data.avatar_emoji,
-    avatarColor: parsed.data.avatar_color,
-    runtimePolicy,
-  });
-  return c.json({ profile }, 201);
 });
 
 agentProfileRoutes.post('/generate', authMiddleware, async (c) => {
@@ -260,6 +316,7 @@ agentProfileRoutes.post(
       preview: buildAgentCapabilityPreview({
         profile: previewProfile,
         workspace,
+        ownerRole: user.role,
       }),
     });
   },
@@ -341,9 +398,22 @@ agentProfileRoutes.post('/:id/refine-prompt', authMiddleware, async (c) => {
   }
 
   try {
+    const currentPrompts = parsed.data.current_prompts
+      ? {
+          ...parsed.data.current_prompts,
+          prompt_mode: profile.prompt_mode,
+        }
+      : agentProfilePromptsFromLegacy(
+          parsed.data.current_prompt,
+          profile.include_claude_preset,
+        );
     const refinement = await refineAgentProfilePrompt({
       agentName: profile.name,
-      currentPrompt: parsed.data.current_prompt,
+      currentPrompts,
+      currentPrompt:
+        parsed.data.current_prompt ??
+        parsed.data.current_prompts?.agents_prompt,
+      section: parsed.data.section,
       message: parsed.data.message,
       history: parsed.data.history,
     });
@@ -377,6 +447,10 @@ agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
   if (
     parsed.data.name === undefined &&
     parsed.data.identity_prompt === undefined &&
+    parsed.data.soul_prompt === undefined &&
+    parsed.data.agents_prompt === undefined &&
+    parsed.data.tools_prompt === undefined &&
+    parsed.data.prompt_mode === undefined &&
     parsed.data.include_claude_preset === undefined &&
     parsed.data.avatar_emoji === undefined &&
     parsed.data.avatar_color === undefined &&
@@ -384,108 +458,276 @@ agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
   ) {
     return c.json({ error: 'No changes provided' }, 400);
   }
-  return withAgentProfileLocks([id], async () => {
-    // Membership mutations for this profile use the same lock. Reading the
-    // profile and workspace snapshot here prevents a new A-owned workspace
-    // from being published between snapshot and post-commit cleanup.
-    const existing = getAgentProfileForUser(id, user.id);
-    if (!existing) return c.json({ error: 'Agent profile not found' }, 404);
+  return withCapabilityScopeLocks(
+    [SYSTEM_CAPABILITY_LOCK_KEY, userCapabilityLockKey(user.id)],
+    () =>
+      withAgentProfileLocks([id], async () => {
+        // Membership mutations for this profile use the same lock. Reading the
+        // profile and workspace snapshot here prevents a new A-owned workspace
+        // from being published between snapshot and post-commit cleanup.
+        const existing = getAgentProfileForUser(id, user.id);
+        if (!existing) return c.json({ error: 'Agent profile not found' }, 404);
 
-    const effectiveRuntimePolicy =
-      parsed.data.runtime_policy === undefined
-        ? existing.runtime_policy
-        : mergeAgentProfileRuntimePolicy(
-            existing.runtime_policy,
-            parsed.data.runtime_policy,
+        const effectiveRuntimePolicy =
+          parsed.data.runtime_policy === undefined
+            ? existing.runtime_policy
+            : mergeAgentProfileRuntimePolicy(
+                existing.runtime_policy,
+                parsed.data.runtime_policy,
+              );
+        const invalidReferences = validateRuntimePolicyReferences(
+          user.id,
+          effectiveRuntimePolicy,
+          user.role === 'admin',
+        );
+        if (hasInvalidRuntimePolicyReferences(invalidReferences)) {
+          return c.json(
+            {
+              error: 'Runtime policy references unavailable capabilities',
+              invalid_runtime_policy: invalidReferences,
+            },
+            400,
           );
-    const invalidReferences = validateRuntimePolicyReferences(
-      user.id,
-      effectiveRuntimePolicy,
-    );
-    if (hasInvalidRuntimePolicyReferences(invalidReferences)) {
-      return c.json(
-        {
-          error: 'Runtime policy references unavailable capabilities',
-          invalid_runtime_policy: invalidReferences,
-        },
-        400,
-      );
-    }
+        }
 
-    const sensitiveConfigurationChanged =
-      (parsed.data.name !== undefined && parsed.data.name !== existing.name) ||
-      (parsed.data.identity_prompt !== undefined &&
-        parsed.data.identity_prompt !== existing.identity_prompt) ||
-      (parsed.data.include_claude_preset !== undefined &&
-        parsed.data.include_claude_preset !== existing.include_claude_preset) ||
-      (parsed.data.runtime_policy !== undefined &&
-        JSON.stringify(effectiveRuntimePolicy) !==
-          JSON.stringify(
-            normalizeAgentProfileRuntimePolicy(existing.runtime_policy),
-          ));
+        // Direct DB/API consumers created before v48 may still have content in the
+        // old identity column. Migrated and newly-created legacy HTTP profiles put
+        // that all-purpose prompt in AGENTS. Route legacy PATCHes to whichever
+        // representation the profile currently uses so retries remain no-ops.
+        const legacyPromptTargetsIdentity =
+          existing.identity_prompt.length > 0 &&
+          existing.agents_prompt.length === 0;
 
-    let invalidatedRuntimeJids = 0;
-    const commit = () =>
-      updateAgentProfile(id, user.id, {
-        name: parsed.data.name,
-        identityPrompt: parsed.data.identity_prompt,
-        includeClaudePreset: parsed.data.include_claude_preset,
-        avatarEmoji: parsed.data.avatar_emoji,
-        avatarColor: parsed.data.avatar_color,
-        runtimePolicy: parsed.data.runtime_policy,
-      });
-    let profile;
-    const deps = getWebDeps();
-    const workspaces = sensitiveConfigurationChanged
-      ? listWorkspaceGroupsForAgentProfile(user.id, id)
-      : [];
-    if (sensitiveConfigurationChanged && deps && workspaces.length > 0) {
-      try {
-        const result = await quiesceWorkspaceRunnersAroundCommit(
-          deps,
-          workspaces.map((workspace) => ({
-            folder: workspace.group.folder,
-            primaryJid: workspace.jid,
-          })),
-          { reason: `Agent profile ${id} sensitive configuration changed` },
-          commit,
-        );
-        profile = result.value;
-        invalidatedRuntimeJids = result.runtimeJids.length;
-      } catch (err) {
-        if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
-        const persistedProfile = err.persisted
-          ? (err.committedValue as ReturnType<typeof commit>)
-          : undefined;
-        logger.error(
-          { err, agentProfileId: id, persisted: err.persisted },
-          err.persisted
-            ? 'Agent profile persisted but post-commit runtime cleanup failed'
-            : 'Agent profile update aborted before persistence',
-        );
-        return c.json(
-          {
-            error: err.persisted
-              ? 'Agent profile was updated, but runtime cleanup failed; retry the same request'
-              : 'Failed to quiesce active workspaces; profile was not updated',
-            persisted: err.persisted,
-            retryable: true,
-            profile: persistedProfile,
-          },
-          503,
-        );
-      }
-    } else {
-      profile = commit();
-    }
-    if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+        const sensitiveConfigurationChanged =
+          (parsed.data.name !== undefined &&
+            parsed.data.name !== existing.name) ||
+          (usesFourPartPromptPayload(parsed.data)
+            ? (parsed.data.identity_prompt !== undefined &&
+                parsed.data.identity_prompt !== existing.identity_prompt) ||
+              (parsed.data.soul_prompt !== undefined &&
+                parsed.data.soul_prompt !== existing.soul_prompt) ||
+              (parsed.data.agents_prompt !== undefined &&
+                parsed.data.agents_prompt !== existing.agents_prompt) ||
+              (parsed.data.tools_prompt !== undefined &&
+                parsed.data.tools_prompt !== existing.tools_prompt)
+            : parsed.data.identity_prompt !== undefined &&
+              parsed.data.identity_prompt !==
+                (legacyPromptTargetsIdentity
+                  ? existing.identity_prompt
+                  : existing.agents_prompt)) ||
+          ((parsed.data.prompt_mode !== undefined ||
+            parsed.data.include_claude_preset !== undefined) &&
+            (parsed.data.prompt_mode ??
+              promptModeFromLegacyPreset(parsed.data.include_claude_preset)) !==
+              existing.prompt_mode) ||
+          (parsed.data.runtime_policy !== undefined &&
+            JSON.stringify(effectiveRuntimePolicy) !==
+              JSON.stringify(
+                normalizeAgentProfileRuntimePolicy(existing.runtime_policy),
+              ));
 
-    return c.json({
-      profile,
-      invalidated_runtime_jids: invalidatedRuntimeJids,
-    });
-  });
+        let invalidatedRuntimeJids = 0;
+        const fourPartPromptPayload = usesFourPartPromptPayload(parsed.data);
+        const commit = () => {
+          const promptUpdates = fourPartPromptPayload
+            ? {
+                identityPrompt: parsed.data.identity_prompt,
+                soulPrompt: parsed.data.soul_prompt,
+                agentsPrompt: parsed.data.agents_prompt,
+                toolsPrompt: parsed.data.tools_prompt,
+              }
+            : {
+                ...(legacyPromptTargetsIdentity
+                  ? { identityPrompt: parsed.data.identity_prompt }
+                  : { agentsPrompt: parsed.data.identity_prompt }),
+              };
+          return updateAgentProfile(id, user.id, {
+            name: parsed.data.name,
+            ...promptUpdates,
+            promptMode:
+              parsed.data.prompt_mode ??
+              (parsed.data.include_claude_preset === undefined
+                ? undefined
+                : promptModeFromLegacyPreset(
+                    parsed.data.include_claude_preset,
+                  )),
+            avatarEmoji: parsed.data.avatar_emoji,
+            avatarColor: parsed.data.avatar_color,
+            runtimePolicy: parsed.data.runtime_policy,
+          });
+        };
+        let profile;
+        const deps = getWebDeps();
+        const profileWorkspaces = deps
+          ? listWorkspaceGroupsForAgentProfile(user.id, id)
+          : [];
+        const runtimeWasSafetyBlocked =
+          deps != null &&
+          profileWorkspaces.some(
+            ({ jid }) => deps.queue.isGroupRuntimeSafetyBlocked?.(jid) ?? false,
+          );
+        const shouldQuiesce =
+          sensitiveConfigurationChanged || runtimeWasSafetyBlocked;
+        const workspaces = shouldQuiesce ? profileWorkspaces : [];
+        if (shouldQuiesce && deps && workspaces.length > 0) {
+          try {
+            const result = await quiesceWorkspaceRunnersAroundCommit(
+              deps,
+              workspaces.map((workspace) => ({
+                folder: workspace.group.folder,
+                primaryJid: workspace.jid,
+              })),
+              {
+                reason: `Agent profile ${id} sensitive configuration changed`,
+                onPostCommitFailure: (runtimeJids) =>
+                  deps.queue.blockGroupsForRuntimeSafety?.(
+                    runtimeJids,
+                    `Agent profile ${id} runtime cleanup failed after configuration commit`,
+                  ),
+              },
+              commit,
+            );
+            profile = result.value;
+            invalidatedRuntimeJids = result.runtimeJids.length;
+            deps.queue.unblockGroupsForRuntimeSafety?.(result.runtimeJids);
+          } catch (err) {
+            if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+            const persistedProfile = err.persisted
+              ? (err.committedValue as ReturnType<typeof commit>)
+              : undefined;
+            logger.error(
+              { err, agentProfileId: id, persisted: err.persisted },
+              err.persisted
+                ? 'Agent profile persisted but post-commit runtime cleanup failed'
+                : 'Agent profile update aborted before persistence',
+            );
+            return c.json(
+              {
+                error: err.persisted
+                  ? 'Agent profile was updated, but runtime cleanup failed; retry the same request'
+                  : 'Failed to quiesce active workspaces; profile was not updated',
+                persisted: err.persisted,
+                retryable: true,
+                profile: persistedProfile,
+              },
+              503,
+            );
+          }
+        } else {
+          profile = commit();
+        }
+        if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+
+        return c.json({
+          profile,
+          invalidated_runtime_jids: invalidatedRuntimeJids,
+        });
+      }),
+  );
 });
+
+agentProfileRoutes.get('/:id/prompt-versions', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  const id = c.req.param('id');
+  const profile = getAgentProfileForUser(id, user.id);
+  if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+  return c.json({ versions: listAgentProfilePromptVersions(id, user.id) });
+});
+
+agentProfileRoutes.post(
+  '/:id/prompt-versions/:version/restore',
+  authMiddleware,
+  async (c) => {
+    const user = c.get('user') as AuthUser;
+    const id = c.req.param('id');
+    const version = Number(c.req.param('version'));
+    if (!Number.isSafeInteger(version) || version < 1) {
+      return c.json({ error: 'Invalid prompt version' }, 400);
+    }
+
+    return withAgentProfileLocks([id], async () => {
+      const existing = getAgentProfileForUser(id, user.id);
+      if (!existing) return c.json({ error: 'Agent profile not found' }, 404);
+      const target = getAgentProfilePromptVersion(id, user.id, version);
+      if (!target) return c.json({ error: 'Prompt version not found' }, 404);
+
+      const promptChanged =
+        target.identity_prompt !== existing.identity_prompt ||
+        target.soul_prompt !== existing.soul_prompt ||
+        target.agents_prompt !== existing.agents_prompt ||
+        target.tools_prompt !== existing.tools_prompt ||
+        target.prompt_mode !== existing.prompt_mode;
+      const commit = () =>
+        updateAgentProfile(id, user.id, {
+          identityPrompt: target.identity_prompt,
+          soulPrompt: target.soul_prompt,
+          agentsPrompt: target.agents_prompt,
+          toolsPrompt: target.tools_prompt,
+          promptMode: target.prompt_mode,
+          changeSource: 'restore',
+          restoredFromVersion: version,
+        });
+
+      let profile;
+      let invalidatedRuntimeJids = 0;
+      const deps = getWebDeps();
+      const profileWorkspaces = deps
+        ? listWorkspaceGroupsForAgentProfile(user.id, id)
+        : [];
+      const runtimeWasSafetyBlocked =
+        deps != null &&
+        profileWorkspaces.some(
+          ({ jid }) => deps.queue.isGroupRuntimeSafetyBlocked?.(jid) ?? false,
+        );
+      const shouldQuiesce = promptChanged || runtimeWasSafetyBlocked;
+      const workspaces = shouldQuiesce ? profileWorkspaces : [];
+      if (shouldQuiesce && deps && workspaces.length > 0) {
+        try {
+          const result = await quiesceWorkspaceRunnersAroundCommit(
+            deps,
+            workspaces.map((workspace) => ({
+              folder: workspace.group.folder,
+              primaryJid: workspace.jid,
+            })),
+            {
+              reason: `Agent profile ${id} prompt version restored`,
+              onPostCommitFailure: (runtimeJids) =>
+                deps.queue.blockGroupsForRuntimeSafety?.(
+                  runtimeJids,
+                  `Agent profile ${id} runtime cleanup failed after prompt restore`,
+                ),
+            },
+            commit,
+          );
+          profile = result.value;
+          invalidatedRuntimeJids = result.runtimeJids.length;
+          deps.queue.unblockGroupsForRuntimeSafety?.(result.runtimeJids);
+        } catch (err) {
+          if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+          return c.json(
+            {
+              error: err.persisted
+                ? 'Prompt version was restored, but runtime cleanup failed; retry the same request'
+                : 'Failed to quiesce active workspaces; prompt version was not restored',
+              persisted: err.persisted,
+              retryable: true,
+              profile: err.persisted ? err.committedValue : undefined,
+            },
+            503,
+          );
+        }
+      } else {
+        profile = promptChanged ? commit() : existing;
+      }
+
+      return c.json({
+        profile,
+        restored_from_version: version,
+        invalidated_runtime_jids: invalidatedRuntimeJids,
+      });
+    });
+  },
+);
 
 agentProfileRoutes.delete('/:id', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;

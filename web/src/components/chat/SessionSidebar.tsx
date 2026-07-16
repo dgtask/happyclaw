@@ -82,6 +82,15 @@ function messagePreview(session: AgentInfo): string {
   return (session.latest_message?.content || '').replace(/\s+/g, ' ').trim();
 }
 
+function isNativeManagedSession(session: AgentInfo): boolean {
+  return (
+    session.source_kind === 'native_thread' ||
+    session.source_kind === 'feishu_thread' ||
+    session.title_source === 'native_root' ||
+    session.title_source === 'feishu_root'
+  );
+}
+
 export function SessionSidebar({
   sessions,
   activeSessionId,
@@ -145,9 +154,6 @@ export function SessionSidebar({
               <span className="rounded-md bg-brand-50 px-1.5 py-0.5 text-[10px] font-medium text-primary dark:bg-brand-700/15 dark:text-brand-300">
                 {totalCount}
               </span>
-            </div>
-            <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
-              每个{sessionNoun}使用独立上下文
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-1">
@@ -243,6 +249,7 @@ export function SessionSidebar({
           >
             {sessionVirtualizer.getVirtualItems().map((virtualRow) => {
               const session = visibleSessions[virtualRow.index];
+              const nativeManaged = isNativeManagedSession(session);
               return (
                 <div
                   key={session.id}
@@ -257,7 +264,7 @@ export function SessionSidebar({
                     titleGenerating={session.title_generating}
                     linkedCount={session.linked_im_groups?.length ?? 0}
                     canModify={canModify}
-                    readonlyTitle={session.source_kind === 'feishu_thread'}
+                    readonlyTitle={nativeManaged}
                     onSelect={() => onSelectSession(session.id)}
                     onBind={
                       onBindSession
@@ -265,11 +272,15 @@ export function SessionSidebar({
                         : undefined
                     }
                     onRename={
-                      onRenameSession && session.source_kind !== 'feishu_thread'
+                      onRenameSession && !nativeManaged
                         ? () => onRenameSession(session.id, session.name)
                         : undefined
                     }
-                    onDelete={() => onDeleteSession(session.id)}
+                    onDelete={
+                      nativeManaged
+                        ? undefined
+                        : () => onDeleteSession(session.id)
+                    }
                   />
                 </div>
               );
@@ -312,10 +323,10 @@ function buildSessionMeta(session: AgentInfo): string {
 
   if (session.title_generating) detail = '正在生成标题';
   else if (session.status === 'running') detail = '正在生成回复';
-  else if (session.source_kind === 'feishu_thread') detail = '飞书话题';
+  else if (isNativeManagedSession(session)) detail = '渠道原生话题';
   else if ((session.linked_im_groups?.length ?? 0) > 0)
     detail = '已绑定消息渠道';
-  else detail = messagePreview(session) || '独立上下文';
+  else detail = messagePreview(session) || '暂无消息';
 
   return [time, detail].filter(Boolean).join(' · ');
 }

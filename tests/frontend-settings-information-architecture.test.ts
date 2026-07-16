@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, test } from 'vitest';
+import type { Skill } from '../web/src/stores/skills';
+import { isReadonlySkill } from '../web/src/utils/skill-sources';
 
 const root = process.cwd();
 const read = (relativePath: string) =>
@@ -88,7 +90,7 @@ describe('settings information architecture', () => {
     expect(system).toMatch(/普通模型通常为 200K\s+上下文/);
     expect(system).toMatch(/\[1m\] 时按 1M 处理/);
     expect(system).toMatch(
-      /当前目录同时作为提示词、规则、Skills 和 Plugin Marketplace\s+的来源/,
+      /当前目录同时作为提示词、Rules、Skills、MCP 与 Plugin\s+Marketplace\s+的来源/,
     );
     expect(page).toContain("currentUser?.role !== 'admin'");
   });
@@ -125,7 +127,9 @@ describe('settings information architecture', () => {
     );
 
     expect(settings).toContain('<MainAgentCapabilitiesSection />');
-    expect(mainCapabilities).toMatch(/用户 Skills|用户 MCP|工具与扩展能力边界/);
+    expect(mainCapabilities).toMatch(
+      /HappyClaw 用户 Skills|HappyClaw MCP|工具与扩展能力边界/,
+    );
     expect(mainCapabilities).toContain('/api/agent-profiles/');
     expect(workspaceCapabilities).toMatch(
       /CLAUDE\.md、\.claude\/skills 和项目 MCP/,
@@ -144,7 +148,7 @@ describe('settings information architecture', () => {
     );
     expect(agentProfiles).toContain('能力配置');
     expect(agentProfiles).toContain('<EffectiveCapabilitiesPreview');
-    expect(effectivePreview).toMatch(/最终生效能力|同名覆盖|预览工作区/);
+    expect(effectivePreview).toMatch(/最终生效能力|同名来源冲突|预览工作区/);
   });
 
   test('supports governed Skill imports and preserves read-only sources', () => {
@@ -160,7 +164,24 @@ describe('settings information architecture', () => {
       /\/import\/git|\/import\/archive|recordImportedSkills/,
     );
     expect(importer).toMatch(/path traversal|symbolic links|MAX_ARCHIVE_BYTES/);
-    expect(card).toContain("const isReadonly = skill.source !== 'user'");
+    const base = {
+      id: 'skill',
+      name: 'Skill',
+      description: '',
+      sourceKey: 'user:skill',
+      enabled: true,
+      userInvocable: true,
+      allowedTools: [],
+      argumentHint: null,
+      updatedAt: '',
+      files: [],
+    } satisfies Omit<Skill, 'source'>;
+    expect(isReadonlySkill({ ...base, source: 'external' })).toBe(true);
+    expect(isReadonlySkill({ ...base, source: 'user' })).toBe(false);
+    expect(isReadonlySkill({ ...base, source: 'user', readonly: true })).toBe(
+      true,
+    );
+    expect(card).toContain('isReadonlySkill(skill)');
     expect(card).toContain('<Switch');
   });
 
@@ -192,11 +213,16 @@ describe('settings information architecture', () => {
     expect(chatView).toContain('setBindingAgentId(id ?? MAIN_BINDING)');
     expect(chatView).toContain("? 'workspace' : 'session'");
     expect(bindingDialog).toContain(
-      'isWorkspaceMode ? !!group.is_thread_capable : !group.is_thread_capable',
+      'capabilities?.can_bind_workspace === true',
     );
+    expect(bindingDialog).toContain('!group.is_thread_capable');
     expect(bindings).toContain(
       "target.type === 'session' || target.type === 'main'",
     );
+    expect(bindings).toContain(
+      "targetType={rebindGroup?.is_thread_capable ? 'workspace' : 'both'}",
+    );
+    expect(bindings).toContain('恢复账号默认工作区');
     expect(mobileChat).toMatch(/onRename=|onTogglePin=|onDelete=/);
     expect(createWorkspace).toContain('effective_runtime_policy');
     expect(bindingRoute).toContain(
@@ -208,6 +234,14 @@ describe('settings information architecture', () => {
     const sessionBindingRoute = read('src/routes/agents.ts');
     expect(sessionBindingRoute).toContain(
       "threadCapable ? 'thread_map' : 'single_session'",
+    );
+    const frontendTypes = read('web/src/types.ts');
+    expect(frontendTypes).toContain("'native_thread'");
+    expect(frontendTypes).toContain("'native_root'");
+    expect(sessions).toContain('isNativeManagedSession(session)');
+    expect(sessions).toContain("detail = '渠道原生话题'");
+    expect(chatView).toContain(
+      "group?.conversation_source === 'native_thread'",
     );
   });
 });

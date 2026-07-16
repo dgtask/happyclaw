@@ -15,6 +15,10 @@ import {
   IM_CHANNEL_ORDER,
   type ImChannelType,
 } from '../../constants/im-capabilities';
+import {
+  buildChannelAccountFilterOptions,
+  channelAccountKey,
+} from '../../utils/channel-accounts';
 
 type ChannelFilter = 'all' | ImChannelType;
 
@@ -35,6 +39,7 @@ export function BindingsSection() {
   const errorMsg = localError || hookError;
   const [search, setSearch] = useState('');
   const [channelFilter, setChannelFilter] = useState<ChannelFilter>('all');
+  const [accountFilter, setAccountFilter] = useState('all');
   const [actioningJid, setActioningJid] = useState<string | null>(null);
   const [selectingKey, setSelectingKey] = useState<string | null>(null);
 
@@ -66,6 +71,11 @@ export function BindingsSection() {
 
   const filtered = useMemo(() => {
     let list = bindings;
+    if (accountFilter !== 'all') {
+      list = list.filter(
+        (binding) => channelAccountKey(binding) === accountFilter,
+      );
+    }
     if (channelFilter !== 'all') {
       list = list.filter((b) => b.channel_type === channelFilter);
     }
@@ -76,21 +86,25 @@ export function BindingsSection() {
           b.name.toLowerCase().includes(q) ||
           b.jid.toLowerCase().includes(q) ||
           (b.bound_target_name &&
-            b.bound_target_name.toLowerCase().includes(q)),
+            b.bound_target_name.toLowerCase().includes(q)) ||
+          b.channel_account_name?.toLowerCase().includes(q),
       );
     }
     return list;
-  }, [bindings, channelFilter, search]);
+  }, [accountFilter, bindings, channelFilter, search]);
+  const accountOptions = useMemo(
+    () => buildChannelAccountFilterOptions(bindings),
+    [bindings],
+  );
 
   const bindingSections = useMemo(
     () => [
       {
         key: 'workspace',
         title: '工作区绑定',
-        description: '话题群按话题自动生成独立会话',
+        description: '普通聊天进入主会话；原生话题容器按话题生成独立会话',
         items: filtered.filter(
           (item) =>
-            item.is_thread_capable &&
             !(item.bound_session_id ?? item.bound_agent_id) &&
             !!(item.bound_workspace_jid ?? item.bound_main_jid),
         ),
@@ -99,11 +113,8 @@ export function BindingsSection() {
         key: 'session',
         title: '会话绑定',
         description: '普通群和私聊继续使用指定会话上下文',
-        items: filtered.filter(
-          (item) =>
-            Boolean(item.bound_session_id ?? item.bound_agent_id) ||
-            (!item.is_thread_capable &&
-              Boolean(item.bound_workspace_jid ?? item.bound_main_jid)),
+        items: filtered.filter((item) =>
+          Boolean(item.bound_session_id ?? item.bound_agent_id),
         ),
       },
       {
@@ -269,7 +280,7 @@ export function BindingsSection() {
               渠道绑定
             </h1>
             <p className="text-sm text-muted-foreground mt-1">
-              话题群绑定工作区并按话题生成会话；普通群和私聊可绑定主会话或其他会话。
+              所有聊天都可绑定工作区；普通群和私聊也可绑定具体会话，原生话题容器只绑定工作区。
             </p>
           </div>
           <Button
@@ -332,6 +343,21 @@ export function BindingsSection() {
                 debounce={200}
               />
             </div>
+            {accountOptions.length > 1 && (
+              <select
+                value={accountFilter}
+                onChange={(event) => setAccountFilter(event.target.value)}
+                aria-label="筛选 Bot 账号"
+                className="h-9 rounded-md border border-border bg-background px-2 text-xs text-foreground"
+              >
+                <option value="all">全部 Bot 账号</option>
+                {accountOptions.map((account) => (
+                  <option key={account.id} value={account.id}>
+                    {account.name}
+                  </option>
+                ))}
+              </select>
+            )}
           </div>
         )}
 
@@ -413,7 +439,7 @@ export function BindingsSection() {
         imGroupName={rebindGroup?.name || ''}
         targets={selectableTargets}
         targetsLoading={targetsLoading}
-        targetType={rebindGroup?.is_thread_capable ? 'workspace' : 'session'}
+        targetType={rebindGroup?.is_thread_capable ? 'workspace' : 'both'}
         canUnbind={
           !!(
             (rebindGroup?.bound_session_id ?? rebindGroup?.bound_agent_id) ||
@@ -426,18 +452,18 @@ export function BindingsSection() {
         selecting={selectingKey}
       />
 
-      {/* Unbind confirm dialog */}
+      {/* Restore account default confirm dialog */}
       <ConfirmDialog
         open={!!unbindGroup}
         onClose={() => setUnbindGroup(null)}
         onConfirm={confirmUnbind}
-        title="确认解绑"
+        title="恢复账号默认工作区"
         message={
           unbindGroup
-            ? `解绑后，「${unbindGroup.name}」将不再路由到当前目标。已有会话和历史不会被删除。确认解绑？`
+            ? `「${unbindGroup.name}」将改为路由到该 Bot 账号的默认工作区；如账号未指定，则回到账号所有者的主工作区。已有会话和历史不会被删除。`
             : ''
         }
-        confirmText="解绑"
+        confirmText="恢复默认"
       />
 
       {/* Restore default confirm dialog */}
@@ -445,13 +471,13 @@ export function BindingsSection() {
         open={!!restoreConfirmGroup}
         onClose={() => setRestoreConfirmGroup(null)}
         onConfirm={confirmRestoreDefault}
-        title="确认解除绑定"
+        title="恢复账号默认工作区"
         message={
           restoreConfirmGroup
-            ? `确认解除「${restoreConfirmGroup.name}」当前的渠道绑定？已有会话和历史不会被删除。`
+            ? `「${restoreConfirmGroup.name}」将改为路由到该 Bot 账号的默认工作区；如账号未指定，则回到账号所有者的主工作区。已有会话和历史不会被删除。`
             : ''
         }
-        confirmText="解除绑定"
+        confirmText="恢复默认"
       />
 
       {/* Release sender restriction confirm dialog */}
@@ -476,7 +502,7 @@ export function BindingsSection() {
         title="删除接入记录与本地历史"
         message={
           deleteGroup
-            ? `确认删除「${deleteGroup.name}」的接入记录？此操作会删除它在 HappyClaw 中的渠道绑定、本地消息、关联会话及运行数据，且不可撤销；不会删除 IM 平台上的群聊。如果机器人之后再次收到该群消息，它可能会重新注册。若只是更换路由，请使用“解绑”。`
+            ? `确认删除「${deleteGroup.name}」的接入记录？此操作会删除它在 HappyClaw 中的渠道绑定、本地消息、关联会话及运行数据，且不可撤销；不会删除 IM 平台上的群聊。如果机器人之后再次收到该群消息，它可能会重新注册。若只是更换路由，请使用“换绑”或“恢复默认”。`
             : ''
         }
         confirmText="删除接入记录"

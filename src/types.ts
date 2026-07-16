@@ -34,13 +34,14 @@ export interface ContainerConfig {
 }
 
 export type ExecutionMode = 'container' | 'host';
-export type ConversationSource = 'manual' | 'feishu_thread';
+export type ConversationSource = 'manual' | 'native_thread' | 'feishu_thread';
 export type ConversationNavMode = 'horizontal' | 'vertical_threads';
 export type ImBindingMode = 'single_context' | 'thread_map';
 export type ChannelRoutingMode = 'single_session' | 'thread_map';
 
 export interface ChannelMount {
   channel_jid: string;
+  channel_account_id?: string | null;
   channel_type: string;
   workspace_jid: string;
   session_id?: string | null;
@@ -57,14 +58,21 @@ export interface ChannelMount {
   updated_at: string;
 }
 
-/** 飞书消息的话题/线程元数据，用于 thread_map 路由 */
-export interface FeishuMessageMeta {
+/** Provider-native topic/thread metadata used by workspace thread_map routing. */
+export interface ChannelMessageMeta {
+  provider?: string;
+  nativeContextType?: 'thread';
+  contextId?: string;
   threadId?: string;
   rootId?: string;
   parentId?: string;
   messageId?: string;
   text?: string;
+  title?: string;
 }
+
+/** @deprecated Use ChannelMessageMeta. Kept for connector compatibility. */
+export type FeishuMessageMeta = ChannelMessageMeta;
 
 export interface RegisteredGroup {
   name: string;
@@ -76,6 +84,8 @@ export interface RegisteredGroup {
   initSourcePath?: string; // 容器模式下复制来源的宿主机绝对路径
   initGitUrl?: string; // 容器模式下 clone 来源的 Git URL
   created_by?: string;
+  /** Channel account that owns this external chat. Null means legacy/default. */
+  channel_account_id?: string;
   is_home?: boolean; // 用户主容器标记
   target_agent_id?: string; // 兼容旧字段：IM 消息路由到指定工作区会话（conversation session）
   target_main_jid?: string; // IM 消息路由到指定工作区的主会话（web:{folder}）
@@ -94,15 +104,87 @@ export interface RegisteredGroup {
   conversation_source?: ConversationSource; // 工作区会话来源（默认 manual）
   conversation_nav_mode?: ConversationNavMode; // 工作区会话导航模式（默认 horizontal）
   binding_mode?: ImBindingMode; // IM 绑定模式（默认 single_context）
+  native_context_type?: 'none' | 'thread'; // 渠道原生上下文能力（如飞书话题、Telegram Forum）
   feishu_chat_mode?: string; // 飞书群模式：group/topic/p2p 等
   feishu_group_message_type?: string; // 飞书群消息形式：chat/thread
+}
+
+export type ChannelProvider =
+  | 'feishu'
+  | 'telegram'
+  | 'qq'
+  | 'wechat'
+  | 'dingtalk'
+  | 'discord'
+  | 'whatsapp';
+
+export type ChannelAuthMode = 'credentials' | 'bot_token' | 'qr_session';
+export type ChannelAuthStatus =
+  | 'draft'
+  | 'awaiting_scan'
+  | 'authorized'
+  | 'revoked'
+  | 'error';
+export type ChannelTransportStatus =
+  | 'disconnected'
+  | 'connecting'
+  | 'connected'
+  | 'error';
+
+/** Public metadata only. Credentials live behind secret_ref and are never serialized. */
+export interface ChannelAccount {
+  id: string;
+  owner_user_id: string;
+  provider: ChannelProvider;
+  name: string;
+  secret_ref: string;
+  enabled: boolean;
+  is_default: boolean;
+  /** Legacy singleton keeps unscoped JIDs so existing history/bindings survive. */
+  is_legacy_default: boolean;
+  /** How this provider authorizes an account. Derived at creation and immutable. */
+  auth_mode: ChannelAuthMode;
+  /** Authorization lifecycle; separate from the live transport connection. */
+  auth_status: ChannelAuthStatus;
+  /** Live socket/stream lifecycle. */
+  transport_status: ChannelTransportStatus;
+  /** @deprecated Compatibility projection of transport_status. */
+  status: 'disconnected' | 'connecting' | 'connected' | 'error';
+  default_agent_profile_id: string | null;
+  default_workspace_jid: string | null;
+  last_error: string | null;
+  connected_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChannelAccountPublic extends Omit<
+  ChannelAccount,
+  'secret_ref' | 'default_agent_profile_id'
+> {
+  has_credentials: boolean;
+  options?: {
+    bypassProxy?: boolean;
+    streamingMode?: 'card' | 'text' | 'edit' | 'off';
+    phoneNumber?: string;
+  };
 }
 
 export interface AgentProfile {
   id: string;
   owner_user_id: string;
   name: string;
+  /** IDENTITY: concise role and public identity. */
   identity_prompt: string;
+  /** SOUL: values, temperament, and durable judgment principles. */
+  soul_prompt: string;
+  /** AGENTS: operating rules, workflows, and collaboration behavior. */
+  agents_prompt: string;
+  /** TOOLS: tool-selection and tool-usage guidance. */
+  tools_prompt: string;
+  /** Append to or replace the Claude Code preset. HappyClaw safety always remains. */
+  prompt_mode: AgentProfilePromptMode;
+  /** @deprecated Compatibility alias for prompt_mode === 'append'. */
   include_claude_preset: boolean;
   avatar_emoji: string | null;
   avatar_color: string | null;
@@ -114,6 +196,27 @@ export interface AgentProfile {
   status: 'active' | 'archived';
   created_at: string;
   updated_at: string;
+}
+
+export type AgentProfilePromptMode = 'append' | 'replace';
+
+export interface AgentProfilePrompts {
+  identity_prompt: string;
+  soul_prompt: string;
+  agents_prompt: string;
+  tools_prompt: string;
+  prompt_mode: AgentProfilePromptMode;
+}
+
+export interface AgentProfilePromptVersion extends AgentProfilePrompts {
+  id: string;
+  agent_profile_id: string;
+  version: number;
+  name: string;
+  identity_hash: string;
+  change_source: 'create' | 'update' | 'restore' | 'migration';
+  restored_from_version: number | null;
+  created_at: string;
 }
 
 export interface AgentProfileRuntimePolicy {
@@ -391,10 +494,16 @@ export interface SubAgent {
   last_im_jid: string | null;
   /** 发起 /spawn 命令的源会话 JID，用于完成后结果回注 */
   spawned_from_jid: string | null;
-  source_kind?: 'manual' | 'feishu_thread' | 'auto_im' | null;
+  source_kind?: 'manual' | 'native_thread' | 'feishu_thread' | 'auto_im' | null;
   thread_id?: string | null;
   root_message_id?: string | null;
-  title_source?: 'manual' | 'feishu_root' | 'auto' | 'auto_pending' | null;
+  title_source?:
+    | 'manual'
+    | 'native_root'
+    | 'feishu_root'
+    | 'auto'
+    | 'auto_pending'
+    | null;
   last_active_at?: string | null;
 }
 
@@ -477,6 +586,7 @@ export type WsMessageOut =
   | {
       type: 'whatsapp_status';
       userId: string;
+      accountId?: string;
       status: 'connecting' | 'qr' | 'connected' | 'disconnected' | 'logged_out';
       qr?: string;
       qrDataUrl?: string;
@@ -639,6 +749,7 @@ export type BalanceTransactionSource =
 export type BalanceOperatorType = 'system' | 'admin' | 'user';
 export type BalanceReferenceType =
   | 'message'
+  | 'usage_event'
   | 'task'
   | 'subscription'
   | 'redeem_code'

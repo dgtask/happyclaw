@@ -53,6 +53,32 @@ beforeAll(() => {
       },
     }),
   );
+  fs.mkdirSync(path.join(dataDir, 'mcp-servers', 'system'), {
+    recursive: true,
+  });
+  fs.writeFileSync(
+    path.join(dataDir, 'mcp-servers', 'system', 'servers.json'),
+    JSON.stringify({
+      servers: {
+        shared: {
+          enabled: true,
+          command: 'system-shared',
+          memberAccess: 'shared',
+        },
+        platform: {
+          enabled: true,
+          command: 'system-platform',
+          memberAccess: 'admin_only',
+        },
+      },
+    }),
+  );
+  fs.writeFileSync(
+    path.join(dataDir, 'mcp-servers', 'system', 'secrets.json'),
+    JSON.stringify({
+      servers: { platform: { env: { SYSTEM_TOKEN: 'preview-secret' } } },
+    }),
+  );
 });
 
 afterAll(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -117,9 +143,11 @@ describe('buildAgentCapabilityPreview', () => {
       expect.arrayContaining([
         expect.objectContaining({
           id: 'shared',
-          source: 'managed',
+          source: 'user',
+          overrides: ['host', 'system'],
           available: false,
         }),
+        expect.objectContaining({ id: 'platform', source: 'system' }),
         expect.objectContaining({
           id: 'project',
           source: 'workspace',
@@ -128,5 +156,62 @@ describe('buildAgentCapabilityPreview', () => {
       ]),
     );
     expect(preview.mcp.disabledByToolBoundary).toBe(true);
+  });
+
+  test('marks admin-only system MCP unavailable to members and available to admins', () => {
+    const profile = {
+      id: 'credential-preview-profile',
+      owner_user_id: 'owner',
+      name: 'Credential Preview Agent',
+      identity_prompt: '',
+      include_claude_preset: true,
+      avatar_emoji: null,
+      avatar_color: null,
+      avatar_url: null,
+      identity_hash: 'hash',
+      version: 1,
+      is_default: false,
+      status: 'active' as const,
+      created_at: '',
+      updated_at: '',
+      runtime_policy: {
+        context: {
+          source: 'managed' as const,
+          auto_compact_window: 0,
+          auto_compact_percentage: 0,
+        },
+        skills: { mode: 'inherit' as const, ids: [] },
+        mcp: { mode: 'inherit' as const, ids: [] },
+        tools: { mode: 'inherit' as const },
+      },
+    };
+
+    const memberPreview = buildAgentCapabilityPreview({
+      profile,
+      ownerRole: 'member',
+    });
+    expect(memberPreview.mcp.entries).toContainEqual(
+      expect.objectContaining({
+        id: 'platform',
+        source: 'system',
+        available: false,
+        unavailableReason: 'system_admin_only',
+      }),
+    );
+    expect(memberPreview.notes).toContain(
+      '有 1 个系统 MCP 仅限管理员，普通成员 Agent 不会继承。',
+    );
+
+    const adminPreview = buildAgentCapabilityPreview({
+      profile,
+      ownerRole: 'admin',
+    });
+    expect(adminPreview.mcp.entries).toContainEqual(
+      expect.objectContaining({
+        id: 'platform',
+        source: 'system',
+        available: true,
+      }),
+    );
   });
 });

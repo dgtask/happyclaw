@@ -21,17 +21,9 @@ import type {
   AgentCapabilityPreview,
   AgentProfileRuntimePolicy,
   AgentProfileWorkspace,
-  CapabilityLayerSource,
   EffectiveCapabilityEntry,
 } from '@/types';
-
-const SOURCE_LABELS: Record<CapabilityLayerSource, string> = {
-  builtin: '内置',
-  host: '宿主机',
-  project: 'HappyClaw 项目',
-  workspace: '工作区项目',
-  managed: '系统附加',
-};
+import { capabilitySourceLabel } from '@/utils/capability-sources';
 
 export function EffectiveCapabilitiesPreview({
   profileId,
@@ -98,8 +90,8 @@ export function EffectiveCapabilitiesPreview({
             最终生效能力
           </h2>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            按实际运行顺序合并宿主机、项目上下文和 HappyClaw
-            系统附加能力，并标出同名覆盖。
+            按实际运行顺序展示宿主机自动继承、项目上下文和 HappyClaw
+            附加能力，并标出同名来源冲突。系统内置能力始终生效，不进入用户选择器。
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -153,8 +145,8 @@ export function EffectiveCapabilitiesPreview({
               </Badge>
               {preview.context.source === 'host_claude' && (
                 <span className="text-xs text-muted-foreground">
-                  CLAUDE.md {preview.context.claudeMd ? '已加载' : '缺失'} ·{' '}
-                  {preview.context.rules} 项规则
+                  提示词 {preview.context.claudeMd ? '已加载' : '缺失'} ·{' '}
+                  {preview.context.rules} 项 Rules · Skills 与 MCP 全部自动继承
                 </span>
               )}
             </PreviewRow>
@@ -234,11 +226,11 @@ function CapabilityEntriesRow({
               }
               title={
                 entry.overrides.length > 0
-                  ? `覆盖：${entry.overrides.map((source) => SOURCE_LABELS[source]).join('、')}`
+                  ? `覆盖：${entry.overrides.map(capabilitySourceLabel).join('、')}`
                   : undefined
               }
             >
-              {entry.id} · {SOURCE_LABELS[entry.source]}
+              {entry.id} · {capabilitySourceLabel(entry.source)}
             </Badge>
           ))}
         </div>
