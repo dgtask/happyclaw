@@ -52,11 +52,16 @@ const WORKSPACE_MEMORY = process.env.HAPPYCLAW_WORKSPACE_MEMORY || '/workspace/m
 const WORKSPACE_IPC = process.env.HAPPYCLAW_WORKSPACE_IPC || '/workspace/ipc';
 
 // 模型由 provider 配置经 ANTHROPIC_MODEL 注入（runtime-config 的 mergeClaudeEnvConfig
-// → host/docker spawn env）。这是硬契约：不再用官方模型（opus 等）兜底——HappyClaw 默认
-// 跑第三方 provider，兜底值在第三方端点下必然 4xx，且会误导"默认 opus"。缺失时由 main()
-// 入口 fail-fast，明确报配置错误，而不是发一个注定失败的请求。
-// 取值支持别名（opus/sonnet/haiku）或完整模型 ID；[1m] 后缀启用 1M 上下文窗口。
+// → host/docker spawn env）。取值支持别名（opus/sonnet/haiku）或完整模型 ID；
+// [1m] 后缀启用 1M 上下文窗口。
 const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL?.trim() ?? '';
+
+// 第三方 provider 一定会注入自定义 ANTHROPIC_BASE_URL（buildClaudeEnvLines 只在
+// anthropicBaseUrl 非空时写入）；官方 Claude（OAuth）走默认 api.anthropic.com，不注入。
+// 只有第三方端点把「缺模型」当硬错误——默认官方模型名在第三方端点必然 4xx，兜底注定失败，
+// 所以 main() 入口 fail-fast。官方端点缺模型时 Claude Code CLI/SDK 会用内置默认模型，
+// 属正常降级而非配置错误，不应 fail-fast（否则官方 OAuth provider 不填模型就被误报无法使用）。
+const HAS_CUSTOM_ENDPOINT = !!process.env.ANTHROPIC_BASE_URL?.trim();
 
 const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
@@ -1542,7 +1547,8 @@ async function runQuery(
       prompt: stream,
       options: {
         ...(pathToClaudeCodeExecutable && { pathToClaudeCodeExecutable }),
-        model: CLAUDE_MODEL,
+        // 官方 provider 未指定模型时省略 model，让 SDK/CLI 用内置默认模型（避免把空串传给 SDK）。
+        ...(CLAUDE_MODEL && { model: CLAUDE_MODEL }),
         cwd: WORKSPACE_GROUP,
         additionalDirectories: extraDirs,
         resume: sessionId,
@@ -1908,16 +1914,18 @@ async function runQuery(
             });
           }
         } else {
-          // Fallback: use session-level model name when SDK doesn't provide per-model breakdown
-          const prev = lastReportedModelUsage.get(CLAUDE_MODEL);
-          modelUsageSummary[CLAUDE_MODEL] = {
+          // Fallback: use session-level model name when SDK doesn't provide per-model breakdown.
+          // 官方 provider 未指定模型时 CLAUDE_MODEL 为空串，用占位标签避免空 key 落进用量记录。
+          const fallbackModelKey = CLAUDE_MODEL || 'default';
+          const prev = lastReportedModelUsage.get(fallbackModelKey);
+          modelUsageSummary[fallbackModelKey] = {
             inputTokens: delta(sdkUsage.input_tokens, prev?.inputTokens ?? 0),
             outputTokens: delta(sdkUsage.output_tokens, prev?.outputTokens ?? 0),
             cacheReadInputTokens: delta(sdkUsage.cache_read_input_tokens, prev?.cacheReadInputTokens ?? 0),
             cacheCreationInputTokens: delta(sdkUsage.cache_creation_input_tokens, prev?.cacheCreationInputTokens ?? 0),
             costUSD: delta((resultMsg.total_cost_usd as number) || 0, prev?.costUSD ?? 0),
           };
-          lastReportedModelUsage.set(CLAUDE_MODEL, {
+          lastReportedModelUsage.set(fallbackModelKey, {
             inputTokens: sdkUsage.input_tokens || 0,
             outputTokens: sdkUsage.output_tokens || 0,
             cacheReadInputTokens: sdkUsage.cache_read_input_tokens || 0,
@@ -2110,14 +2118,15 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // 模型是 provider 配置的硬契约（经 ANTHROPIC_MODEL 注入）。缺失即配置错误——
+  // 模型对第三方 provider 是硬契约（经 ANTHROPIC_MODEL 注入）：缺失即配置错误——
   // 明确 fail-fast，而不是用官方模型兜底向第三方端点发出必然失败的请求。
-  if (!CLAUDE_MODEL) {
+  // 官方 Claude（OAuth，无自定义 base URL）缺模型时不算错误，交给 SDK 用默认模型降级。
+  if (!CLAUDE_MODEL && HAS_CUSTOM_ENDPOINT) {
     writeOutput({
       status: 'error',
       result: null,
       error:
-        '未配置模型：当前 provider 缺少模型名（ANTHROPIC_MODEL 未注入）。请在 Claude 供应商设置中为该 provider 填写模型名（anthropicModel）后重试。',
+        '未配置模型：当前第三方 provider 缺少模型名（ANTHROPIC_MODEL 未注入）。第三方端点不接受默认官方模型名，请在 Claude 供应商设置中为该 provider 填写模型名（anthropicModel）后重试。',
     });
     process.exit(1);
   }
