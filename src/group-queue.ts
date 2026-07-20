@@ -70,6 +70,15 @@ interface GroupState {
   lastActivityAt: number | null;
   /** True while the runner is inside an active query turn. */
   queryInFlight: boolean;
+  /** Host-generated identity for the current logical query. It changes at
+   * every idle→running transition, including warm-runner follow-ups. */
+  queryId: string | null;
+  /** Wall-clock time for the current logical query. Used by Web reconnect
+   * snapshots so the UI can restore a run before the first stream event. */
+  queryStartedAt: number | null;
+  /** Prevent duplicate query-start broadcasts when several delivery paths
+   * observe the same reserved query. */
+  announcedQueryId: string | null;
   pendingMessages: boolean;
   pendingTasks: QueuedTask[];
   process: ChildProcess | null;
@@ -138,6 +147,12 @@ export class GroupQueue {
   private onRunnerStateChangeFn:
     | ((chatJid: string, state: 'idle' | 'running') => void)
     | null = null;
+  private onQueryStartFn:
+    | ((chatJid: string, queryId: string, startedAt: number) => void)
+    | null = null;
+  private onQueryIdleFn:
+    | ((chatJid: string, completedQueryId: string) => void)
+    | null = null;
   private userConcurrentLimitFn:
     | ((groupJid: string) => { allowed: boolean })
     | null = null;
@@ -165,6 +180,9 @@ export class GroupQueue {
         activeRunnerIsTask: false,
         lastActivityAt: null,
         queryInFlight: false,
+        queryId: null,
+        queryStartedAt: null,
+        announcedQueryId: null,
         pendingMessages: false,
         pendingTasks: [],
         process: null,
@@ -470,6 +488,47 @@ export class GroupQueue {
     fn: (chatJid: string, state: 'idle' | 'running') => void,
   ): void {
     this.onRunnerStateChangeFn = fn;
+  }
+
+  setOnQueryStart(
+    fn: (chatJid: string, queryId: string, startedAt: number) => void,
+  ): void {
+    this.onQueryStartFn = fn;
+  }
+
+  private announceQueryStart(groupJid: string, state: GroupState): boolean {
+    if (!state.queryInFlight || !state.queryId) return false;
+    if (state.announcedQueryId === state.queryId) return false;
+    const startedAt = state.queryStartedAt ?? Date.now();
+    state.queryStartedAt = startedAt;
+    state.announcedQueryId = state.queryId;
+    try {
+      this.onQueryStartFn?.(groupJid, state.queryId, startedAt);
+    } catch (err) {
+      logger.error({ groupJid, err }, 'onQueryStart callback failed');
+    }
+    return true;
+  }
+
+  /** Announce a previously reserved query once its durable follow-up has been
+   * claimed. Keeping this separate from reserveNextQuery avoids a false
+   * running flash when the durable queue turns out to be empty. */
+  announceReservedQuery(groupJid: string, expectedQueryId: string): boolean {
+    const state = this.resolveActiveState(groupJid);
+    if (
+      !state?.active ||
+      !state.queryInFlight ||
+      state.queryId !== expectedQueryId
+    ) {
+      return false;
+    }
+    return this.announceQueryStart(groupJid, state);
+  }
+
+  setOnQueryIdle(
+    fn: (chatJid: string, completedQueryId: string) => void,
+  ): void {
+    this.onQueryIdleFn = fn;
   }
 
   setUserConcurrentLimitChecker(
@@ -793,8 +852,63 @@ export class GroupQueue {
 
   markRunnerQueryIdle(groupJid: string): void {
     const state = this.resolveActiveState(groupJid);
-    if (!state?.active) return;
+    if (!state?.active || !state.queryInFlight) return;
+    const completedQueryId = state.queryId;
     state.queryInFlight = false;
+    state.queryId = null;
+    state.queryStartedAt = null;
+    state.announcedQueryId = null;
+    if (!completedQueryId) return;
+    try {
+      this.onQueryIdleFn?.(groupJid, completedQueryId);
+    } catch (err) {
+      logger.error({ groupJid, err }, 'onQueryIdle callback failed');
+    }
+  }
+
+  getActiveQueryId(groupJid: string): string | null {
+    const state = this.resolveActiveState(groupJid);
+    return state?.active && state.queryInFlight ? state.queryId : null;
+  }
+
+  /** Reserve the next logical query before asynchronous prompt expansion.
+   * This closes the idle race where a newly-arriving message could bypass a
+   * durable queued follow-up while it is being prepared for IPC injection. */
+  reserveNextQuery(groupJid: string): string | null {
+    const state = this.resolveActiveState(groupJid);
+    if (!state?.active || state.queryInFlight) return null;
+    state.queryInFlight = true;
+    state.queryId = randomUUID();
+    state.queryStartedAt = Date.now();
+    state.announcedQueryId = null;
+    return state.queryId;
+  }
+
+  releaseQueryReservation(
+    groupJid: string,
+    expectedQueryId: string,
+    notifyIdle = false,
+  ): boolean {
+    const state = this.resolveActiveState(groupJid);
+    if (
+      !state?.active ||
+      !state.queryInFlight ||
+      state.queryId !== expectedQueryId
+    ) {
+      return false;
+    }
+    state.queryInFlight = false;
+    state.queryId = null;
+    state.queryStartedAt = null;
+    state.announcedQueryId = null;
+    if (notifyIdle) {
+      try {
+        this.onQueryIdleFn?.(groupJid, expectedQueryId);
+      } catch (err) {
+        logger.error({ groupJid, err }, 'onQueryIdle callback failed');
+      }
+    }
+    return true;
   }
 
   getStuckPendingGroups(
@@ -1184,7 +1298,13 @@ export class GroupQueue {
         // until a later durable cursor advance makes it provably contiguous.
         this.isIpcDeliveryCommitEligibleFn?.(receipt);
       }
-      state.queryInFlight = true;
+      if (!state.queryInFlight || !state.queryId) {
+        state.queryInFlight = true;
+        state.queryId = randomUUID();
+        state.queryStartedAt = Date.now();
+        state.announcedQueryId = null;
+        this.announceQueryStart(groupJid, state);
+      }
       onInjected?.(receipt);
       return 'sent';
     } catch (err) {
@@ -1479,11 +1599,12 @@ export class GroupQueue {
    * Writes a _interrupt sentinel that agent-runner detects and calls
    * query.interrupt(). The container stays alive and accepts new messages.
    */
-  interruptQuery(groupJid: string): boolean {
+  interruptQuery(groupJid: string, expectedQueryId?: string): boolean {
     // Use resolveActiveState so sibling JIDs (feishu/telegram sharing the
     // same folder as a web group) are correctly resolved to the active runner.
     const state = this.resolveActiveState(groupJid);
-    if (!state) return false;
+    if (!state || !state.queryInFlight) return false;
+    if (expectedQueryId && state.queryId !== expectedQueryId) return false;
 
     // 只取消等待中的 retry 定时器（如果有），不重置 retryCount —— 不让用户
     // 中断把已积累的 backoff 进度归零。
@@ -1761,6 +1882,9 @@ export class GroupQueue {
     state.activeRunnerIsTask = false;
     state.lastActivityAt = Date.now();
     state.queryInFlight = true;
+    state.queryId = randomUUID();
+    state.queryStartedAt = Date.now();
+    state.announcedQueryId = null;
     state.pendingMessages = false;
     this.waitingGroups.delete(groupJid);
     this.activeCount++;
@@ -1781,6 +1905,7 @@ export class GroupQueue {
     );
 
     try {
+      this.announceQueryStart(groupJid, state);
       this.onRunnerStateChangeFn?.(groupJid, 'running');
     } catch (err) {
       logger.error({ groupJid, err }, 'onRunnerStateChange(running) failed');
@@ -1863,6 +1988,9 @@ export class GroupQueue {
       state.hasIpcInjectedMessages = false;
       state.lastActivityAt = null;
       state.queryInFlight = false;
+      state.queryId = null;
+      state.queryStartedAt = null;
+      state.announcedQueryId = null;
       state.process = null;
       state.containerName = null;
       state.displayName = null;
@@ -1927,7 +2055,10 @@ export class GroupQueue {
     state.active = true;
     state.activeRunnerIsTask = true;
     state.lastActivityAt = Date.now();
-    state.queryInFlight = false;
+    state.queryInFlight = groupJid.includes('#agent:');
+    state.queryId = state.queryInFlight ? randomUUID() : null;
+    state.queryStartedAt = state.queryInFlight ? Date.now() : null;
+    state.announcedQueryId = null;
     this.waitingGroups.delete(groupJid);
     this.activeCount++;
     if (isHostMode) {
@@ -1947,6 +2078,7 @@ export class GroupQueue {
     );
 
     try {
+      if (state.queryInFlight) this.announceQueryStart(groupJid, state);
       this.onRunnerStateChangeFn?.(groupJid, 'running');
     } catch (err) {
       logger.error({ groupJid, err }, 'onRunnerStateChange(running) failed');
@@ -1976,6 +2108,9 @@ export class GroupQueue {
       state.drainSentinelWritten = false;
       state.lastActivityAt = null;
       state.queryInFlight = false;
+      state.queryId = null;
+      state.queryStartedAt = null;
+      state.announcedQueryId = null;
       state.process = null;
       state.containerName = null;
       state.displayName = null;
@@ -2213,6 +2348,9 @@ export class GroupQueue {
       displayName: string | null;
       groupFolder: string | null;
       selectedProviderId: string | null;
+      queryInFlight: boolean;
+      queryId: string | null;
+      queryStartedAt: number | null;
     }>;
   } {
     const groups: Array<{
@@ -2224,6 +2362,9 @@ export class GroupQueue {
       displayName: string | null;
       groupFolder: string | null;
       selectedProviderId: string | null;
+      queryInFlight: boolean;
+      queryId: string | null;
+      queryStartedAt: number | null;
     }> = [];
 
     for (const [jid, state] of this.groups) {
@@ -2236,6 +2377,9 @@ export class GroupQueue {
         displayName: state.displayName,
         groupFolder: state.groupFolder,
         selectedProviderId: state.selectedProviderId,
+        queryInFlight: state.queryInFlight,
+        queryId: state.queryId,
+        queryStartedAt: state.queryStartedAt,
       });
     }
 

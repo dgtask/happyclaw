@@ -95,6 +95,22 @@ const GROUP_FOLDER = 'messages-acl-group';
 
 // Record queue.stopGroup calls so the owner path can assert a real reset.
 const stopGroupCalls: Array<{ jid: string; opts?: { force?: boolean } }> = [];
+const promoteFollowUpCalls: Array<{
+  chatJid: string;
+  messageId: string;
+  expectedRunId: string;
+}> = [];
+const editFollowUpCalls: Array<{
+  chatJid: string;
+  messageId: string;
+  content: string;
+}> = [];
+const reorderFollowUpCalls: Array<{
+  chatJid: string;
+  messageId: string;
+  direction: 'up' | 'down';
+}> = [];
+let activeQueryId: string | null = null;
 
 // Back getRegisteredGroups with a single persistent object (NOT a fresh {} per
 // call) so any route's persistGroupUpdate cache-sync writes to a stable map,
@@ -107,10 +123,36 @@ const testDeps = {
     stopGroup: async (jid: string, opts?: { force?: boolean }) => {
       stopGroupCalls.push({ jid, opts });
     },
+    getActiveQueryId: () => activeQueryId,
   },
   getSessions: () => ({}) as Record<string, string>,
   setLastAgentTimestamp: () => {},
   getRegisteredGroups: () => registeredGroupsCache,
+  advanceGlobalCursor: () => {},
+  promoteFollowUp: (
+    chatJid: string,
+    messageId: string,
+    expectedRunId: string,
+  ) => {
+    promoteFollowUpCalls.push({ chatJid, messageId, expectedRunId });
+    return {
+      ok: true,
+      state: 'interrupting' as const,
+      message: '正在中断当前运行。',
+    };
+  },
+  editFollowUp: (chatJid: string, messageId: string, content: string) => {
+    editFollowUpCalls.push({ chatJid, messageId, content });
+    return { ok: true, state: 'queued' as const, message: '已更新。' };
+  },
+  reorderFollowUp: (
+    chatJid: string,
+    messageId: string,
+    direction: 'up' | 'down',
+  ) => {
+    reorderFollowUpCalls.push({ chatJid, messageId, direction });
+    return { ok: true, state: 'queued' as const, message: '已排序。' };
+  },
 } as unknown as Parameters<typeof web.createAppForTest>[0];
 
 const app = web.createAppForTest(testDeps);
@@ -142,6 +184,21 @@ async function postMessage(
   return { status: res.status, body: await res.json().catch(() => ({})) };
 }
 
+async function postFollowUpAction(
+  messageId: string,
+  body: unknown,
+): Promise<{ status: number; body: any }> {
+  const res = await app.request(
+    `/api/follow-ups/${encodeURIComponent(messageId)}/action`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  );
+  return { status: res.status, body: await res.json().catch(() => ({})) };
+}
+
 beforeAll(() => {
   fs.mkdirSync(path.join(tmpDataDir, 'db'), { recursive: true });
   fs.mkdirSync(path.join(tmpDataDir, 'groups'), { recursive: true });
@@ -150,6 +207,10 @@ beforeAll(() => {
 
 beforeEach(() => {
   stopGroupCalls.length = 0;
+  promoteFollowUpCalls.length = 0;
+  editFollowUpCalls.length = 0;
+  reorderFollowUpCalls.length = 0;
+  activeQueryId = null;
   try {
     db.deleteRegisteredGroup(GROUP_JID);
   } catch {
@@ -223,5 +284,118 @@ describe('POST /api/messages — /clear interception ACL', () => {
     });
     expect(status).toBe(200);
     expect(body.cleared).toBe(true);
+  });
+});
+
+describe('POST /api/messages — active-run steering', () => {
+  test('keeps steer durable and requests a controlled interrupt', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    activeQueryId = 'run-active';
+
+    const { status, body } = await postMessage({
+      chatJid: GROUP_JID,
+      content: '先回答这条高优先级消息',
+      followUpBehavior: 'steer',
+    });
+
+    expect(status).toBe(200);
+    expect(body).toMatchObject({
+      disposition: 'steered',
+      runId: 'run-active',
+    });
+    expect(promoteFollowUpCalls).toEqual([
+      {
+        chatJid: GROUP_JID,
+        messageId: body.messageId,
+        expectedRunId: 'run-active',
+      },
+    ]);
+    expect(db.getQueuedFollowUp(GROUP_JID, body.messageId)).toMatchObject({
+      delivery_mode: 'steer',
+      delivery_status: 'queued',
+      delivery_run_id: 'run-active',
+    });
+    expect(
+      db
+        .getMessagesSince(GROUP_JID, { timestamp: '', id: '' })
+        .some((message: { id: string }) => message.id === body.messageId),
+    ).toBe(false);
+  });
+
+  test('queued send-now and direct steer target the same current run', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    activeQueryId = 'run-original';
+
+    const queued = await postMessage({
+      chatJid: GROUP_JID,
+      content: '先排队，稍后点发送',
+      followUpBehavior: 'queue',
+    });
+    expect(queued.status).toBe(200);
+    expect(queued.body).toMatchObject({
+      disposition: 'queued',
+      runId: 'run-original',
+    });
+
+    activeQueryId = 'run-current';
+    const direct = await postMessage({
+      chatJid: GROUP_JID,
+      content: '直接引导',
+      followUpBehavior: 'steer',
+    });
+    expect(direct.status).toBe(200);
+
+    const sendNow = await postFollowUpAction(queued.body.messageId, {
+      chatJid: GROUP_JID,
+      action: 'steer',
+      expectedRunId: 'run-original',
+    });
+    expect(sendNow.status).toBe(200);
+    expect(promoteFollowUpCalls).toEqual([
+      {
+        chatJid: GROUP_JID,
+        messageId: direct.body.messageId,
+        expectedRunId: 'run-current',
+      },
+      {
+        chatJid: GROUP_JID,
+        messageId: queued.body.messageId,
+        expectedRunId: 'run-current',
+      },
+    ]);
+  });
+
+  test('routes queued edit and reorder operations', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+
+    const edit = await postFollowUpAction('queued-message', {
+      chatJid: GROUP_JID,
+      action: 'edit',
+      content: '  更新后的消息  ',
+    });
+    const move = await postFollowUpAction('queued-message', {
+      chatJid: GROUP_JID,
+      action: 'move_up',
+    });
+
+    expect(edit.status).toBe(200);
+    expect(move.status).toBe(200);
+    expect(editFollowUpCalls).toEqual([
+      {
+        chatJid: GROUP_JID,
+        messageId: 'queued-message',
+        content: '更新后的消息',
+      },
+    ]);
+    expect(reorderFollowUpCalls).toEqual([
+      {
+        chatJid: GROUP_JID,
+        messageId: 'queued-message',
+        direction: 'up',
+      },
+    ]);
   });
 });

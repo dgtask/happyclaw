@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'vitest';
 import {
   buildAgentReplyCard,
+  buildFollowUpActionResultCard,
+  buildQueuedFollowUpCard,
   buildStreamingAgentCard,
 } from '../src/feishu-cards/builder.js';
 import { resolveStatusTheme } from '../src/feishu-cards/status-theme.js';
@@ -25,6 +27,7 @@ import {
   buildTimelineText,
   parseToolParam,
 } from '../src/feishu-cards/sections.js';
+import { resolveFeishuFollowUpMode } from '../src/follow-up-policy.js';
 
 // ─── Recursive schema validation helpers ───────────────────────────
 
@@ -53,7 +56,9 @@ function validateV2Shape(node: unknown, path: string[] = []): string[] {
   const issues: string[] = [];
   if (node === null || typeof node !== 'object') return issues;
   if (Array.isArray(node)) {
-    node.forEach((v, i) => issues.push(...validateV2Shape(v, [...path, String(i)])));
+    node.forEach((v, i) =>
+      issues.push(...validateV2Shape(v, [...path, String(i)])),
+    );
     return issues;
   }
   const obj = node as Record<string, unknown>;
@@ -67,7 +72,9 @@ function validateV2Shape(node: unknown, path: string[] = []): string[] {
       issues.push(`[${childPath.join('.')}] v2 removed the action container`);
     }
     if (key === 'wide_screen_mode') {
-      issues.push(`[${childPath.join('.')}] v1 property wide_screen_mode used in v2 card`);
+      issues.push(
+        `[${childPath.join('.')}] v1 property wide_screen_mode used in v2 card`,
+      );
     }
     if (key === 'padding' && typeof value === 'string') {
       const parts = value.trim().split(/\s+/);
@@ -87,7 +94,9 @@ function validateV2Shape(node: unknown, path: string[] = []): string[] {
         /^([a-z\-]+)-(50|100|200|300|400|500|600|700|800|900)$/.test(value) ||
         /^rgba\(\d+,\d+,\d+,(0|1|0?\.\d+)\)$/.test(value);
       if (!ok) {
-        issues.push(`[${childPath.join('.')}] color "${value}" is not a v2 enum`);
+        issues.push(
+          `[${childPath.join('.')}] color "${value}" is not a v2 enum`,
+        );
       }
     }
     issues.push(...validateV2Shape(value, childPath));
@@ -266,7 +275,8 @@ describe('formatters', () => {
 
   test('extractTitle: long single-line input gets truncated and body still empty', () => {
     const text =
-      'a'.repeat(60) + ' end of long single line that exceeds the 40 char title cap';
+      'a'.repeat(60) +
+      ' end of long single line that exceeds the 40 char title cap';
     const { title, bodyStartIndex } = extractTitle(text);
     expect(title.length).toBeLessThanOrEqual(40);
     expect(title.endsWith('...')).toBe(true);
@@ -311,8 +321,9 @@ describe('buildAgentReplyCard', () => {
     expect(header!.template).toBe('violet');
     expect((header!.title as Record<string, unknown>).content).toBe('已完成');
 
-    const body = card.body as { elements: Array<Record<string, unknown>> } &
-      Record<string, unknown>;
+    const body = card.body as {
+      elements: Array<Record<string, unknown>>;
+    } & Record<string, unknown>;
     expect(body.vertical_spacing).toBe('medium');
     expect(body.direction).toBe('vertical');
     const main = body.elements.find(
@@ -322,17 +333,18 @@ describe('buildAgentReplyCard', () => {
   });
 
   test('explicit title renders header.template from CardStatus', () => {
-    const cases: Array<[
-      'running' | 'done' | 'warning' | 'error',
-      string,
-    ]> = [
+    const cases: Array<['running' | 'done' | 'warning' | 'error', string]> = [
       ['running', 'blue'],
       ['done', 'violet'],
       ['warning', 'orange'],
       ['error', 'red'],
     ];
     for (const [status, template] of cases) {
-      const card = buildAgentReplyCard({ status, title: '执行结果', text: 'x' });
+      const card = buildAgentReplyCard({
+        status,
+        title: '执行结果',
+        text: 'x',
+      });
       const header = card.header as Record<string, unknown>;
       expect(header.template).toBe(template);
       expect(header.icon).toBeUndefined();
@@ -377,7 +389,8 @@ describe('buildAgentReplyCard', () => {
   test('status header never derives its title from the body first line', () => {
     // The first line is a long heading-ish sentence; it must stay in the body
     // and never be lifted into the header (issue #488 regression guard).
-    const text = '# 这是一段很长的标题文本，超过四十个字符，绝不能被提升到卡片 header 上当作标题展示\n正文细节';
+    const text =
+      '# 这是一段很长的标题文本，超过四十个字符，绝不能被提升到卡片 header 上当作标题展示\n正文细节';
     const card = buildAgentReplyCard({ status: 'warning', text });
     const header = card.header as Record<string, unknown>;
     const title = (header.title as Record<string, unknown>).content as string;
@@ -698,13 +711,13 @@ describe('buildStreamingAgentCard', () => {
 
     // Rich skeleton: STATUS_BANNER + 3 collapsible panels + MAIN_CONTENT + BUTTON + FOOTER_NOTE
     const ids = new Set(collectElementIds(card));
-      for (const required of [
-        CARD_ELEMENT_IDS.STATUS_BANNER,
-        CARD_ELEMENT_IDS.PROGRESS_PANEL,
-        CARD_ELEMENT_IDS.PROGRESS_CONTENT,
-        CARD_ELEMENT_IDS.TASK_PANEL,
-        CARD_ELEMENT_IDS.TASK_CONTENT,
-        CARD_ELEMENT_IDS.TOOLS_PANEL,
+    for (const required of [
+      CARD_ELEMENT_IDS.STATUS_BANNER,
+      CARD_ELEMENT_IDS.PROGRESS_PANEL,
+      CARD_ELEMENT_IDS.PROGRESS_CONTENT,
+      CARD_ELEMENT_IDS.TASK_PANEL,
+      CARD_ELEMENT_IDS.TASK_CONTENT,
+      CARD_ELEMENT_IDS.TOOLS_PANEL,
       CARD_ELEMENT_IDS.TOOLS_CONTENT,
       CARD_ELEMENT_IDS.THINKING_PANEL,
       CARD_ELEMENT_IDS.THINKING_CONTENT,
@@ -716,13 +729,16 @@ describe('buildStreamingAgentCard', () => {
     }
   });
 
-    test('rich streaming card contains 6 collapsible panels (ask/task/timeline included)', () => {
-      const card = buildStreamingAgentCard({ initialText: 'x' });
-      expect(countTag(card, 'collapsible_panel')).toBe(6);
+  test('rich streaming card contains 6 collapsible panels (ask/task/timeline included)', () => {
+    const card = buildStreamingAgentCard({ initialText: 'x' });
+    expect(countTag(card, 'collapsible_panel')).toBe(6);
   });
 
   test('legacy (rich:false) streaming card keeps 5-slot flat layout', () => {
-    const card = buildStreamingAgentCard({ initialText: 'legacy', rich: false });
+    const card = buildStreamingAgentCard({
+      initialText: 'legacy',
+      rich: false,
+    });
     const body = card.body as { elements: Array<Record<string, unknown>> };
     const elementIds = body.elements.map((e) => e.element_id);
     expect(elementIds).toEqual([
@@ -838,7 +854,12 @@ describe('buildToolsTimelineText', () => {
   test('renders status tags and elapsed time', () => {
     const text = buildToolsTimelineText([
       { name: 'Read', status: 'complete', durationMs: 1200 },
-      { name: 'Bash', status: 'running', durationMs: 3000, summary: 'npm test' },
+      {
+        name: 'Bash',
+        status: 'running',
+        durationMs: 3000,
+        summary: 'npm test',
+      },
       { name: 'Edit', status: 'error', durationMs: 800 },
     ]);
     expect(text).toContain('完成');
@@ -957,7 +978,10 @@ describe('collectAskQuestions', () => {
   test('single-question format', () => {
     const qs = collectAskQuestions({
       question: 'Are you sure?',
-      options: [{ label: 'Yes', value: 'y' }, { label: 'No', value: 'n' }],
+      options: [
+        { label: 'Yes', value: 'y' },
+        { label: 'No', value: 'n' },
+      ],
     });
     expect(qs).toHaveLength(1);
     expect(qs[0].question).toBe('Are you sure?');
@@ -1008,10 +1032,7 @@ describe('buildAskQuestionText', () => {
 
 describe('buildTimelineText', () => {
   test('renders bullet list for events', () => {
-    const text = buildTimelineText([
-      { text: '🔄 Read' },
-      { text: '✅ Read' },
-    ]);
+    const text = buildTimelineText([{ text: '🔄 Read' }, { text: '✅ Read' }]);
     expect(text).toContain('- 🔄 Read');
     expect(text).toContain('- ✅ Read');
   });
@@ -1038,19 +1059,62 @@ describe('buildStreamingAgentCard rich skeleton (Phase F)', () => {
     expect(ids.has(CARD_ELEMENT_IDS.TIMELINE_CONTENT)).toBe(true);
   });
 
-    test('rich skeleton now has 6 collapsible panels', () => {
-      const card = buildStreamingAgentCard({ initialText: 'x' });
-      expect(countTag(card, 'collapsible_panel')).toBe(6);
+  test('rich skeleton now has 6 collapsible panels', () => {
+    const card = buildStreamingAgentCard({ initialText: 'x' });
+    expect(countTag(card, 'collapsible_panel')).toBe(6);
+  });
+});
+
+describe('queued follow-up cards', () => {
+  test('ordinary messages queue, replies steer, and slash overrides win', () => {
+    expect(resolveFeishuFollowUpMode(undefined, false)).toBe('queue');
+    expect(resolveFeishuFollowUpMode(undefined, true)).toBe('steer');
+    expect(resolveFeishuFollowUpMode('queue', true)).toBe('queue');
+    expect(resolveFeishuFollowUpMode('steer', false)).toBe('steer');
+  });
+
+  test('offers the same send-now or delete decision without duplicate interrupt actions', () => {
+    const card = buildQueuedFollowUpCard({
+      content: 'Please inspect the failing test',
+      position: 2,
+      sourceJid: 'feishu:oc_chat',
+      targetJid: 'web:main',
+      messageId: 'msg-2',
+      expectedRunId: 'run-1',
     });
+    expect(validateV2Shape(card)).toEqual([]);
+    const serialized = JSON.stringify(card);
+    expect(serialized).toContain('steer_queued');
+    expect(serialized).not.toContain('interrupt_and_run');
+    expect(serialized).toContain('cancel_queued');
+    expect(serialized).toContain('立即发送');
+    expect(serialized).toContain('删除');
+    expect(serialized).toContain('"expectedRunId":"run-1"');
+    expect(serialized).toContain('消息已排队 · 第 2 位');
+  });
+
+  test('uses neutral stop language on the active streaming card', () => {
+    const card = buildStreamingAgentCard({ initialText: 'working' });
+    const serialized = JSON.stringify(card);
+    expect(serialized).toContain('停止回复');
+    expect(serialized).not.toContain('中断回复');
+  });
+
+  test('terminal action card removes buttons', () => {
+    const card = buildFollowUpActionResultCard('已引导当前运行。', true);
+    expect(validateV2Shape(card)).toEqual([]);
+    expect(countTag(card, 'button')).toBe(0);
+  });
 });
 
 // ─── feishu.ts:buildInteractiveCard backward-compat ─────────────
 
 describe('feishu.ts wrapper uses new builder', () => {
   test('buildInteractiveCard delegates to buildAgentReplyCard without default header', async () => {
-    const { buildInteractiveCard } = (await import('../src/feishu.js')) as unknown as {
-      buildInteractiveCard?: (t: string) => object;
-    };
+    const { buildInteractiveCard } =
+      (await import('../src/feishu.js')) as unknown as {
+        buildInteractiveCard?: (t: string) => object;
+      };
     // buildInteractiveCard is module-private; skip silently if not exported.
     if (!buildInteractiveCard) return;
     const card = buildInteractiveCard('hi') as Record<string, unknown>;

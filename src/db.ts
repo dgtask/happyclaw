@@ -31,6 +31,9 @@ import {
   InviteCode,
   InviteCodeWithCreator,
   MessageFinalizationReason,
+  FollowUpMode,
+  FollowUpStatus,
+  QueuedFollowUp,
   MonthlyUsage,
   NewMessage,
   MessageCursor,
@@ -69,7 +72,7 @@ import {
 } from './agent-profile-prompts.js';
 
 let db: InstanceType<typeof Database>;
-const CURRENT_SCHEMA_VERSION = 54;
+const CURRENT_SCHEMA_VERSION = 56;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -103,27 +106,30 @@ function stmts() {
       storeMessageInsert: db.prepare(
         `INSERT OR REPLACE INTO messages (
           id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me,
-          attachments, token_usage, turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason, task_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          attachments, token_usage, turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason, task_id,
+          delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       insertUsageInsert: db.prepare(
         `INSERT INTO usage_records (id, event_id, user_id, group_folder, agent_id, message_id, model,
           input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
+          reasoning_output_tokens,
           cost_usd, provider_estimated_cost_usd, billed_cost_usd,
           duration_ms, num_turns, source, usage_date, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       insertUsageUpsert: db.prepare(
         `INSERT INTO usage_daily_summary (user_id, model, date,
           total_input_tokens, total_output_tokens,
           total_cache_read_tokens, total_cache_creation_tokens,
-          total_cost_usd, request_count, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'))
+          total_reasoning_tokens, total_cost_usd, request_count, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'))
         ON CONFLICT(user_id, model, date) DO UPDATE SET
           total_input_tokens = total_input_tokens + excluded.total_input_tokens,
           total_output_tokens = total_output_tokens + excluded.total_output_tokens,
           total_cache_read_tokens = total_cache_read_tokens + excluded.total_cache_read_tokens,
           total_cache_creation_tokens = total_cache_creation_tokens + excluded.total_cache_creation_tokens,
+          total_reasoning_tokens = total_reasoning_tokens + excluded.total_reasoning_tokens,
           total_cost_usd = total_cost_usd + excluded.total_cost_usd,
           request_count = request_count + 1,
           updated_at = datetime('now')`,
@@ -151,9 +157,11 @@ function stmts() {
          )`,
       ),
       getMessagesSince: db.prepare(
-        `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, task_id
+        `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, task_id,
+                delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
          FROM messages
          WHERE chat_jid = ? AND (timestamp > ? OR (timestamp = ? AND id > ?)) AND is_from_me = 0
+           AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled')
          ORDER BY timestamp ASC, id ASC`,
       ),
       getExpiredSessionIds: db.prepare(
@@ -169,12 +177,14 @@ function getNewMessagesStmt(jidCount: number): any {
   if (!s) {
     const placeholders = Array(jidCount).fill('?').join(',');
     s = db.prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, task_id
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, task_id,
+              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
        FROM messages
        WHERE (timestamp > ? OR (timestamp = ? AND id > ?))
          AND chat_jid IN (${placeholders})
          AND is_from_me = 0
          AND COALESCE(source_kind, '') NOT IN ('user_command', 'scheduled_task_prompt')
+         AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled')
        ORDER BY timestamp ASC, id ASC`,
     );
     // Cap cache size to avoid unbounded growth in deployments where the
@@ -204,6 +214,11 @@ interface StoredMessageMeta {
   sourceKind?: MessageSourceKind | null;
   finalizationReason?: MessageFinalizationReason | null;
   taskId?: string | null;
+  deliveryMode?: FollowUpMode | null;
+  deliveryStatus?: FollowUpStatus | null;
+  deliveryRunId?: string | null;
+  deliveryPriority?: number | null;
+  deliveryUpdatedAt?: string | null;
 }
 
 function hasColumn(tableName: string, columnName: string): boolean {
@@ -476,6 +491,11 @@ export function initDatabase(): void {
       sdk_message_uuid TEXT,
       source_kind TEXT,
       finalization_reason TEXT,
+      delivery_mode TEXT,
+      delivery_status TEXT,
+      delivery_run_id TEXT,
+      delivery_priority INTEGER NOT NULL DEFAULT 0,
+      delivery_updated_at TEXT,
       PRIMARY KEY (id, chat_jid),
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
@@ -1007,6 +1027,7 @@ export function initDatabase(): void {
       output_tokens INTEGER NOT NULL DEFAULT 0,
       cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
       cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+      reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
       cost_usd REAL NOT NULL DEFAULT 0,
       provider_estimated_cost_usd REAL NOT NULL DEFAULT 0,
       billed_cost_usd REAL NOT NULL DEFAULT 0,
@@ -1029,6 +1050,7 @@ export function initDatabase(): void {
       output_tokens INTEGER NOT NULL DEFAULT 0,
       cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
       cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+      reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
       provider_estimated_cost_usd REAL NOT NULL DEFAULT 0,
       billed_cost_usd REAL NOT NULL DEFAULT 0,
       duration_ms INTEGER NOT NULL DEFAULT 0,
@@ -1052,6 +1074,7 @@ export function initDatabase(): void {
       total_output_tokens INTEGER NOT NULL DEFAULT 0,
       total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
       total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+      total_reasoning_tokens INTEGER NOT NULL DEFAULT 0,
       total_cost_usd REAL NOT NULL DEFAULT 0,
       request_count INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -1206,6 +1229,23 @@ export function initDatabase(): void {
   ensureColumn('messages', 'source_kind', 'TEXT');
   ensureColumn('messages', 'finalization_reason', 'TEXT');
   ensureColumn('messages', 'task_id', 'TEXT');
+  ensureColumn('messages', 'delivery_mode', 'TEXT');
+  ensureColumn('messages', 'delivery_status', 'TEXT');
+  ensureColumn('messages', 'delivery_run_id', 'TEXT');
+  ensureColumn('messages', 'delivery_priority', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('messages', 'delivery_updated_at', 'TEXT');
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_messages_follow_up_queue
+      ON messages(chat_jid, delivery_status, delivery_priority, timestamp, id);
+  `);
+  // A process may have crashed after reserving a queued message for a card
+  // action but before injecting it. Reservations are process-local, so make
+  // those rows claimable again on startup.
+  db.prepare(
+    `UPDATE messages
+     SET delivery_status = 'queued', delivery_updated_at = ?
+     WHERE delivery_status = 'promoting'`,
+  ).run(new Date().toISOString());
   ensureColumn('agents', 'source_kind', 'TEXT');
   ensureColumn('agents', 'thread_id', 'TEXT');
   ensureColumn('agents', 'root_message_id', 'TEXT');
@@ -1994,6 +2034,24 @@ export function initDatabase(): void {
   // v50 -> v51: make usage a first-class, idempotent event ledger. Historical
   // rows predate event IDs, so each row becomes one explicitly marked legacy
   // event; we do not guess which old model rows belonged to the same run.
+  // v55 -> v56: Kaboo-compatible reasoning is a fifth, independently visible
+  // token class. Historical HappyClaw rows kept Claude thinking folded into
+  // output, so they remain reasoning=0 rather than being guessed retroactively.
+  ensureColumn(
+    'usage_records',
+    'reasoning_output_tokens',
+    'INTEGER NOT NULL DEFAULT 0',
+  );
+  ensureColumn(
+    'usage_events',
+    'reasoning_output_tokens',
+    'INTEGER NOT NULL DEFAULT 0',
+  );
+  ensureColumn(
+    'usage_daily_summary',
+    'total_reasoning_tokens',
+    'INTEGER NOT NULL DEFAULT 0',
+  );
   const v51Check = getRouterStateInternal('schema_version');
   if (!v51Check || parseInt(v51Check, 10) < 51) {
     db.transaction(() => {
@@ -2022,12 +2080,14 @@ export function initDatabase(): void {
         INSERT OR IGNORE INTO usage_events (
           event_id, user_id, group_folder, agent_id, message_id,
           input_tokens, output_tokens, cache_read_input_tokens,
-          cache_creation_input_tokens, provider_estimated_cost_usd,
+          cache_creation_input_tokens, reasoning_output_tokens,
+          provider_estimated_cost_usd,
           billed_cost_usd, duration_ms, num_turns, source, created_at
         )
         SELECT event_id, user_id, group_folder, agent_id, message_id,
           input_tokens, output_tokens, cache_read_input_tokens,
-          cache_creation_input_tokens, provider_estimated_cost_usd,
+          cache_creation_input_tokens, reasoning_output_tokens,
+          provider_estimated_cost_usd,
           billed_cost_usd, duration_ms, num_turns, source, created_at
         FROM usage_records;
       `);
@@ -2255,6 +2315,11 @@ export function storeMessageDirect(
     meta?.sourceKind ?? null,
     meta?.finalizationReason ?? null,
     meta?.taskId ?? null,
+    meta?.deliveryMode ?? null,
+    meta?.deliveryStatus ?? null,
+    meta?.deliveryRunId ?? null,
+    meta?.deliveryPriority ?? 0,
+    meta?.deliveryUpdatedAt ?? null,
   );
   return effectiveMsgId;
 }
@@ -2275,6 +2340,336 @@ export function updateMessageAttachments(
   db.prepare(
     `UPDATE messages SET attachments = ? WHERE id = ? AND chat_jid = ?`,
   ).run(attachmentsJson, msgId, chatJid);
+}
+
+function normalizeQueuedFollowUpRow(
+  row: Record<string, unknown>,
+): QueuedFollowUp {
+  return {
+    id: String(row.id),
+    chat_jid: String(row.chat_jid),
+    source_jid: row.source_jid ? String(row.source_jid) : undefined,
+    sender: String(row.sender ?? ''),
+    sender_name: String(row.sender_name ?? ''),
+    content: toUtf8String(row.content, 'messages.content'),
+    timestamp: String(row.timestamp),
+    attachments: row.attachments ? String(row.attachments) : undefined,
+    delivery_mode: (row.delivery_mode === 'steer'
+      ? 'steer'
+      : 'queue') as FollowUpMode,
+    delivery_status:
+      row.delivery_status === 'promoting' ? 'promoting' : 'queued',
+    delivery_run_id: row.delivery_run_id ? String(row.delivery_run_id) : null,
+    delivery_priority: Number(row.delivery_priority ?? 0),
+  };
+}
+
+const FOLLOW_UP_SELECT = `
+  SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp,
+         attachments, delivery_mode, delivery_status, delivery_run_id,
+         delivery_priority
+  FROM messages
+`;
+
+export function setMessageFollowUp(
+  chatJid: string,
+  messageId: string,
+  input: {
+    mode: FollowUpMode;
+    status: FollowUpStatus;
+    runId?: string | null;
+    priority?: number;
+  },
+): boolean {
+  const result = db
+    .prepare(
+      `UPDATE messages
+       SET delivery_mode = ?, delivery_status = ?, delivery_run_id = ?,
+           delivery_priority = ?, delivery_updated_at = ?
+       WHERE chat_jid = ? AND id = ? AND is_from_me = 0`,
+    )
+    .run(
+      input.mode,
+      input.status,
+      input.runId ?? null,
+      input.priority ?? 0,
+      new Date().toISOString(),
+      chatJid,
+      messageId,
+    );
+  return result.changes === 1;
+}
+
+export function listQueuedFollowUps(chatJid: string): QueuedFollowUp[] {
+  const rows = db
+    .prepare(
+      `${FOLLOW_UP_SELECT}
+       WHERE chat_jid = ? AND delivery_status IN ('queued', 'promoting')
+       ORDER BY delivery_priority ASC, timestamp ASC, id ASC`,
+    )
+    .all(chatJid) as Array<Record<string, unknown>>;
+  return rows.map(normalizeQueuedFollowUpRow);
+}
+
+export function getQueuedFollowUp(
+  chatJid: string,
+  messageId: string,
+): QueuedFollowUp | null {
+  const row = db
+    .prepare(
+      `${FOLLOW_UP_SELECT}
+       WHERE chat_jid = ? AND id = ?
+         AND delivery_status IN ('queued', 'promoting')
+       LIMIT 1`,
+    )
+    .get(chatJid, messageId) as Record<string, unknown> | undefined;
+  return row ? normalizeQueuedFollowUpRow(row) : null;
+}
+
+export function getQueuedFollowUpChatJids(): string[] {
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT chat_jid FROM messages
+       WHERE delivery_status IN ('queued', 'promoting')
+       ORDER BY chat_jid`,
+    )
+    .all() as Array<{ chat_jid: string }>;
+  return rows.map((row) => row.chat_jid);
+}
+
+/**
+ * Move a queued message to the front as an explicit steer request.
+ *
+ * Steering is deliberately represented as a durable queued row until the
+ * active SDK query has acknowledged its interrupt.  This avoids injecting the
+ * message as a weak `queued_command` attachment into the turn being stopped,
+ * and also makes the hand-off recoverable if the host or runner exits between
+ * the interrupt request and the next query.
+ */
+export function prioritizeQueuedFollowUp(
+  chatJid: string,
+  messageId: string,
+  runId: string,
+): QueuedFollowUp | null {
+  const select = db.prepare(
+    `${FOLLOW_UP_SELECT}
+     WHERE chat_jid = ? AND id = ? AND delivery_status = 'queued'
+     LIMIT 1`,
+  );
+  const selectMinPriority = db.prepare(
+    `SELECT MIN(delivery_priority) AS min_priority
+     FROM messages
+     WHERE chat_jid = ? AND delivery_status IN ('queued', 'promoting')`,
+  );
+  const update = db.prepare(
+    `UPDATE messages
+     SET delivery_mode = 'steer', delivery_run_id = ?,
+         delivery_priority = ?, delivery_updated_at = ?
+     WHERE chat_jid = ? AND id = ? AND delivery_status = 'queued'`,
+  );
+  return db.transaction(() => {
+    const current = select.get(chatJid, messageId) as
+      | Record<string, unknown>
+      | undefined;
+    if (!current) return null;
+    const priorityRow = selectMinPriority.get(chatJid) as
+      | { min_priority?: number | null }
+      | undefined;
+    const minPriority = Number(priorityRow?.min_priority ?? 0);
+    const priority = Math.max(Number.MIN_SAFE_INTEGER, minPriority - 1);
+    const result = update.run(
+      runId,
+      priority,
+      new Date().toISOString(),
+      chatJid,
+      messageId,
+    );
+    if (result.changes !== 1) return null;
+    const updated = select.get(chatJid, messageId) as
+      | Record<string, unknown>
+      | undefined;
+    return updated ? normalizeQueuedFollowUpRow(updated) : null;
+  })();
+}
+
+/** Update the text of a message that is still waiting in the normal queue. */
+export function updateQueuedFollowUpContent(
+  chatJid: string,
+  messageId: string,
+  content: string,
+): QueuedFollowUp | null {
+  const normalizedContent = content.trim();
+  if (!normalizedContent) return null;
+  const result = db
+    .prepare(
+      `UPDATE messages
+       SET content = ?, delivery_updated_at = ?
+       WHERE chat_jid = ? AND id = ?
+         AND delivery_status = 'queued' AND delivery_mode = 'queue'`,
+    )
+    .run(normalizedContent, new Date().toISOString(), chatJid, messageId);
+  return result.changes === 1 ? getQueuedFollowUp(chatJid, messageId) : null;
+}
+
+/** Move a normal queued message one place while preserving durable FIFO order. */
+export function moveQueuedFollowUp(
+  chatJid: string,
+  messageId: string,
+  direction: 'up' | 'down',
+): QueuedFollowUp | null {
+  const select = db.prepare(
+    `${FOLLOW_UP_SELECT}
+     WHERE chat_jid = ? AND delivery_status = 'queued'
+       AND delivery_mode = 'queue'
+     ORDER BY delivery_priority ASC, timestamp ASC, id ASC`,
+  );
+  const update = db.prepare(
+    `UPDATE messages
+     SET delivery_priority = ?, delivery_updated_at = ?
+     WHERE chat_jid = ? AND id = ?
+       AND delivery_status = 'queued' AND delivery_mode = 'queue'`,
+  );
+
+  return db.transaction(() => {
+    const rows = select.all(chatJid) as Array<Record<string, unknown>>;
+    const currentIndex = rows.findIndex((row) => String(row.id) === messageId);
+    if (currentIndex < 0) return null;
+    const targetIndex =
+      direction === 'up' ? currentIndex - 1 : currentIndex + 1;
+    if (targetIndex < 0 || targetIndex >= rows.length) return null;
+
+    [rows[currentIndex], rows[targetIndex]] = [
+      rows[targetIndex],
+      rows[currentIndex],
+    ];
+    const updatedAt = new Date().toISOString();
+    for (const [priority, row] of rows.entries()) {
+      update.run(priority, updatedAt, chatJid, String(row.id));
+    }
+    return getQueuedFollowUp(chatJid, messageId);
+  })();
+}
+
+function transitionFollowUp(
+  chatJid: string,
+  messageId: string,
+  from: Array<'queued' | 'promoting'>,
+  to: FollowUpStatus,
+  opts?: {
+    runId?: string | null;
+    priority?: number;
+    updatedAt?: string;
+  },
+): QueuedFollowUp | null {
+  const placeholders = from.map(() => '?').join(',');
+  const update = db.prepare(
+    `UPDATE messages
+     SET delivery_status = ?,
+         delivery_run_id = COALESCE(?, delivery_run_id),
+         delivery_priority = COALESCE(?, delivery_priority),
+         delivery_updated_at = ?
+     WHERE chat_jid = ? AND id = ?
+       AND delivery_status IN (${placeholders})`,
+  );
+  const select = db.prepare(
+    `${FOLLOW_UP_SELECT} WHERE chat_jid = ? AND id = ? LIMIT 1`,
+  );
+  return db.transaction(() => {
+    const current = select.get(chatJid, messageId) as
+      | Record<string, unknown>
+      | undefined;
+    if (
+      !current ||
+      !from.includes(current.delivery_status as 'queued' | 'promoting')
+    ) {
+      return null;
+    }
+    const result = update.run(
+      to,
+      opts?.runId ?? null,
+      opts?.priority ?? null,
+      opts?.updatedAt ?? new Date().toISOString(),
+      chatJid,
+      messageId,
+      ...from,
+    );
+    return result.changes === 1 ? normalizeQueuedFollowUpRow(current) : null;
+  })();
+}
+
+export function claimNextQueuedFollowUp(
+  chatJid: string,
+  runId: string,
+): QueuedFollowUp | null {
+  const select = db.prepare(
+    `${FOLLOW_UP_SELECT}
+     WHERE chat_jid = ? AND delivery_status = 'queued'
+     ORDER BY delivery_priority ASC, timestamp ASC, id ASC
+     LIMIT 1`,
+  );
+  const update = db.prepare(
+    `UPDATE messages
+     SET delivery_status = 'promoting', delivery_run_id = ?,
+         delivery_updated_at = ?
+     WHERE chat_jid = ? AND id = ? AND delivery_status = 'queued'`,
+  );
+  return db.transaction(() => {
+    const row = select.get(chatJid) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    const result = update.run(
+      runId,
+      new Date().toISOString(),
+      chatJid,
+      String(row.id),
+    );
+    return result.changes === 1 ? normalizeQueuedFollowUpRow(row) : null;
+  })();
+}
+
+export function releaseQueuedFollowUp(
+  chatJid: string,
+  messageId: string,
+  runId: string,
+  updatedAt?: string,
+): QueuedFollowUp | null {
+  return transitionFollowUp(
+    chatJid,
+    messageId,
+    ['queued', 'promoting'],
+    'released',
+    {
+      runId,
+      updatedAt,
+    },
+  );
+}
+
+export function beginPromotingFollowUp(
+  chatJid: string,
+  messageId: string,
+): QueuedFollowUp | null {
+  return transitionFollowUp(chatJid, messageId, ['queued'], 'promoting');
+}
+
+export function restorePromotingFollowUp(
+  chatJid: string,
+  messageId: string,
+): QueuedFollowUp | null {
+  return transitionFollowUp(chatJid, messageId, ['promoting'], 'queued');
+}
+
+export function cancelQueuedFollowUp(
+  chatJid: string,
+  messageId: string,
+  updatedAt?: string,
+): QueuedFollowUp | null {
+  return transitionFollowUp(
+    chatJid,
+    messageId,
+    ['queued', 'promoting'],
+    'cancelled',
+    { updatedAt },
+  );
 }
 
 /**
@@ -2334,6 +2729,7 @@ export function rebuildMessageTokenUsageFromLedger(
         COALESCE(SUM(output_tokens), 0) AS outputTokens,
         COALESCE(SUM(cache_read_input_tokens), 0) AS cacheReadInputTokens,
         COALESCE(SUM(cache_creation_input_tokens), 0) AS cacheCreationInputTokens,
+        COALESCE(SUM(reasoning_output_tokens), 0) AS reasoningTokens,
         COALESCE(SUM(provider_estimated_cost_usd), 0) AS costUSD,
         COALESCE(SUM(duration_ms), 0) AS durationMs,
         COALESCE(SUM(num_turns), 0) AS numTurns
@@ -2346,6 +2742,7 @@ export function rebuildMessageTokenUsageFromLedger(
         COALESCE(SUM(output_tokens), 0) AS outputTokens,
         COALESCE(SUM(cache_read_input_tokens), 0) AS cacheReadInputTokens,
         COALESCE(SUM(cache_creation_input_tokens), 0) AS cacheCreationInputTokens,
+        COALESCE(SUM(reasoning_output_tokens), 0) AS reasoningTokens,
         COALESCE(SUM(provider_estimated_cost_usd), 0) AS costUSD
        FROM usage_records WHERE group_folder = ? AND message_id = ?
        GROUP BY model ORDER BY model`,
@@ -2359,6 +2756,7 @@ export function rebuildMessageTokenUsageFromLedger(
         outputTokens: Number(row.outputTokens) || 0,
         cacheReadInputTokens: Number(row.cacheReadInputTokens) || 0,
         cacheCreationInputTokens: Number(row.cacheCreationInputTokens) || 0,
+        reasoningTokens: Number(row.reasoningTokens) || 0,
         costUSD: Number(row.costUSD) || 0,
       },
     ]),
@@ -2368,6 +2766,7 @@ export function rebuildMessageTokenUsageFromLedger(
     outputTokens: Number(total.outputTokens) || 0,
     cacheReadInputTokens: Number(total.cacheReadInputTokens) || 0,
     cacheCreationInputTokens: Number(total.cacheCreationInputTokens) || 0,
+    reasoningTokens: Number(total.reasoningTokens) || 0,
     costUSD: Number(total.costUSD) || 0,
     durationMs: Number(total.durationMs) || 0,
     numTurns: Number(total.numTurns) || 0,
@@ -2394,6 +2793,7 @@ export function getTokenUsageStats(
   output_tokens: number;
   cache_read_tokens: number;
   cache_creation_tokens: number;
+  reasoning_tokens: number;
   cost_usd: number;
   message_count: number;
 }> {
@@ -2415,6 +2815,7 @@ export function getTokenUsageStats(
       json_extract(m.token_usage, '$.outputTokens') as output_tokens,
       json_extract(m.token_usage, '$.cacheReadInputTokens') as cache_read_tokens,
       json_extract(m.token_usage, '$.cacheCreationInputTokens') as cache_creation_tokens,
+      json_extract(m.token_usage, '$.reasoningTokens') as reasoning_tokens,
       json_extract(m.token_usage, '$.costUSD') as cost_usd
     FROM messages m
     WHERE m.token_usage IS NOT NULL
@@ -2430,6 +2831,7 @@ export function getTokenUsageStats(
     output_tokens: number;
     cache_read_tokens: number;
     cache_creation_tokens: number;
+    reasoning_tokens: number;
     cost_usd: number;
   }>;
 
@@ -2441,6 +2843,7 @@ export function getTokenUsageStats(
     output_tokens: number;
     cache_read_tokens: number;
     cache_creation_tokens: number;
+    reasoning_tokens: number;
     cost_usd: number;
     message_count: number;
   };
@@ -2453,6 +2856,7 @@ export function getTokenUsageStats(
     outputTokens: number,
     cacheReadTokens: number,
     cacheCreationTokens: number,
+    reasoningTokens: number,
     costUsd: number,
   ): void {
     const key = `${date}|${model}`;
@@ -2462,6 +2866,7 @@ export function getTokenUsageStats(
       existing.output_tokens += outputTokens;
       existing.cache_read_tokens += cacheReadTokens;
       existing.cache_creation_tokens += cacheCreationTokens;
+      existing.reasoning_tokens += reasoningTokens;
       existing.cost_usd += costUsd;
       existing.message_count += 1;
     } else {
@@ -2472,6 +2877,7 @@ export function getTokenUsageStats(
         output_tokens: outputTokens,
         cache_read_tokens: cacheReadTokens,
         cache_creation_tokens: cacheCreationTokens,
+        reasoning_tokens: reasoningTokens,
         cost_usd: costUsd,
         message_count: 1,
       });
@@ -2488,6 +2894,7 @@ export function getTokenUsageStats(
             outputTokens: number;
             cacheReadInputTokens?: number;
             cacheCreationInputTokens?: number;
+            reasoningTokens?: number;
             costUSD: number;
           }
         >;
@@ -2499,6 +2906,7 @@ export function getTokenUsageStats(
             usage.outputTokens || 0,
             usage.cacheReadInputTokens || 0,
             usage.cacheCreationInputTokens || 0,
+            usage.reasoningTokens || 0,
             usage.costUSD || 0,
           );
         }
@@ -2515,6 +2923,7 @@ export function getTokenUsageStats(
           row.output_tokens || 0,
           row.cache_read_tokens || 0,
           row.cache_creation_tokens || 0,
+          row.reasoning_tokens || 0,
           row.cost_usd || 0,
         );
       }
@@ -2526,6 +2935,7 @@ export function getTokenUsageStats(
         row.output_tokens || 0,
         row.cache_read_tokens || 0,
         row.cache_creation_tokens || 0,
+        row.reasoning_tokens || 0,
         row.cost_usd || 0,
       );
     }
@@ -2545,6 +2955,7 @@ export function getTokenUsageSummary(
   totalOutputTokens: number;
   totalCacheReadTokens: number;
   totalCacheCreationTokens: number;
+  totalReasoningTokens: number;
   totalCostUSD: number;
   totalMessages: number;
   totalActiveDays: number;
@@ -2567,6 +2978,7 @@ export function getTokenUsageSummary(
       COALESCE(SUM(json_extract(token_usage, '$.outputTokens')), 0) as total_output,
       COALESCE(SUM(json_extract(token_usage, '$.cacheReadInputTokens')), 0) as total_cache_read,
       COALESCE(SUM(json_extract(token_usage, '$.cacheCreationInputTokens')), 0) as total_cache_creation,
+      COALESCE(SUM(json_extract(token_usage, '$.reasoningTokens')), 0) as total_reasoning,
       COALESCE(SUM(json_extract(token_usage, '$.costUSD')), 0) as total_cost,
       COUNT(*) as total_messages,
       COUNT(DISTINCT date(timestamp)) as total_active_days
@@ -2580,6 +2992,7 @@ export function getTokenUsageSummary(
     total_output: number;
     total_cache_read: number;
     total_cache_creation: number;
+    total_reasoning: number;
     total_cost: number;
     total_messages: number;
     total_active_days: number;
@@ -2590,6 +3003,7 @@ export function getTokenUsageSummary(
     totalOutputTokens: row.total_output,
     totalCacheReadTokens: row.total_cache_read,
     totalCacheCreationTokens: row.total_cache_creation,
+    totalReasoningTokens: row.total_reasoning,
     totalCostUSD: row.total_cost,
     totalMessages: row.total_messages,
     totalActiveDays: row.total_active_days,
@@ -2637,6 +3051,7 @@ export function insertUsageRecord(record: {
   outputTokens: number;
   cacheReadInputTokens: number;
   cacheCreationInputTokens: number;
+  reasoningTokens?: number;
   costUSD: number;
   durationMs?: number;
   numTurns?: number;
@@ -2652,6 +3067,7 @@ export function insertUsageRecord(record: {
     outputTokens: record.outputTokens,
     cacheReadInputTokens: record.cacheReadInputTokens,
     cacheCreationInputTokens: record.cacheCreationInputTokens,
+    reasoningTokens: record.reasoningTokens || 0,
     providerEstimatedCostUSD: record.costUSD,
     billedCostUSD: 0,
     durationMs: record.durationMs,
@@ -2664,6 +3080,7 @@ export function insertUsageRecord(record: {
         outputTokens: record.outputTokens,
         cacheReadInputTokens: record.cacheReadInputTokens,
         cacheCreationInputTokens: record.cacheCreationInputTokens,
+        reasoningTokens: record.reasoningTokens || 0,
         providerEstimatedCostUSD: record.costUSD,
         billedCostUSD: 0,
       },
@@ -2678,8 +3095,88 @@ export interface UsageModelRecordInput {
   outputTokens: number;
   cacheReadInputTokens: number;
   cacheCreationInputTokens: number;
+  reasoningTokens?: number;
   providerEstimatedCostUSD: number;
   billedCostUSD: number;
+}
+
+export interface UsagePricingBucketTotals {
+  bucketStart: string;
+  bucketEnd: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  reasoningTokens: number;
+}
+
+export function getRecordedUsageEventCost(
+  eventId: string,
+): { providerEstimatedCostUSD: number; billedCostUSD: number } | null {
+  const row = db
+    .prepare(
+      `SELECT provider_estimated_cost_usd AS providerEstimatedCostUSD,
+        billed_cost_usd AS billedCostUSD
+       FROM usage_events WHERE event_id = ? LIMIT 1`,
+    )
+    .get(eventId) as Record<string, number> | undefined;
+  return row
+    ? {
+        providerEstimatedCostUSD: Number(row.providerEstimatedCostUSD) || 0,
+        billedCostUSD: Number(row.billedCostUSD) || 0,
+      }
+    : null;
+}
+
+/**
+ * Return the existing raw-model usage in Kaboo's UTC 30-minute pricing bucket.
+ * Cost is intentionally excluded: callers recompute both the old and new
+ * bucket headline from tokens so an SDK-reported legacy cost cannot influence
+ * Kaboo-aligned accounting.
+ */
+export function getUsagePricingBucketTotals(input: {
+  userId: string;
+  groupFolder: string;
+  source: string;
+  model: string;
+  createdAt: string;
+}): UsagePricingBucketTotals {
+  const timestamp = new Date(input.createdAt);
+  const safeTimestamp = Number.isFinite(timestamp.getTime())
+    ? timestamp
+    : new Date();
+  const bucketStartMs =
+    Math.floor(safeTimestamp.getTime() / (30 * 60 * 1000)) * (30 * 60 * 1000);
+  const bucketStart = new Date(bucketStartMs).toISOString();
+  const bucketEnd = new Date(bucketStartMs + 30 * 60 * 1000).toISOString();
+  const row = db
+    .prepare(
+      `SELECT COALESCE(SUM(input_tokens), 0) AS inputTokens,
+        COALESCE(SUM(output_tokens), 0) AS outputTokens,
+        COALESCE(SUM(cache_read_input_tokens), 0) AS cacheReadInputTokens,
+        COALESCE(SUM(cache_creation_input_tokens), 0) AS cacheCreationInputTokens,
+        COALESCE(SUM(reasoning_output_tokens), 0) AS reasoningTokens
+       FROM usage_records
+       WHERE user_id = ? AND group_folder = ? AND source = ? AND model = ?
+         AND created_at >= ? AND created_at < ?`,
+    )
+    .get(
+      input.userId,
+      input.groupFolder,
+      input.source,
+      input.model,
+      bucketStart,
+      bucketEnd,
+    ) as Record<string, number>;
+  return {
+    bucketStart,
+    bucketEnd,
+    inputTokens: Number(row.inputTokens) || 0,
+    outputTokens: Number(row.outputTokens) || 0,
+    cacheReadInputTokens: Number(row.cacheReadInputTokens) || 0,
+    cacheCreationInputTokens: Number(row.cacheCreationInputTokens) || 0,
+    reasoningTokens: Number(row.reasoningTokens) || 0,
+  };
 }
 
 export interface UsageEventRecordInput {
@@ -2692,6 +3189,7 @@ export interface UsageEventRecordInput {
   outputTokens: number;
   cacheReadInputTokens: number;
   cacheCreationInputTokens: number;
+  reasoningTokens?: number;
   providerEstimatedCostUSD: number;
   billedCostUSD: number;
   durationMs?: number;
@@ -2717,8 +3215,10 @@ export function recordUsageEventBatch(input: UsageEventRecordInput): {
   if (!input.groupFolder.trim())
     throw new Error('usage groupFolder is required');
 
-  const nonNegative = (value: number) =>
-    Number.isFinite(value) ? Math.max(0, value) : 0;
+  const nonNegative = (value: number | undefined) => {
+    const numeric = value ?? 0;
+    return Number.isFinite(numeric) ? Math.max(0, numeric) : 0;
+  };
   const createdAt = input.createdAt || new Date().toISOString();
   const localDate = toLocalDateString(createdAt);
   const source = input.source?.trim() || 'agent';
@@ -2731,6 +3231,7 @@ export function recordUsageEventBatch(input: UsageEventRecordInput): {
           outputTokens: input.outputTokens,
           cacheReadInputTokens: input.cacheReadInputTokens,
           cacheCreationInputTokens: input.cacheCreationInputTokens,
+          reasoningTokens: input.reasoningTokens,
           providerEstimatedCostUSD: input.providerEstimatedCostUSD,
           billedCostUSD: input.billedCostUSD,
         },
@@ -2742,9 +3243,10 @@ export function recordUsageEventBatch(input: UsageEventRecordInput): {
         `INSERT OR IGNORE INTO usage_events (
           event_id, user_id, group_folder, agent_id, message_id,
           input_tokens, output_tokens, cache_read_input_tokens,
-          cache_creation_input_tokens, provider_estimated_cost_usd,
+          cache_creation_input_tokens, reasoning_output_tokens,
+          provider_estimated_cost_usd,
           billed_cost_usd, duration_ms, num_turns, source, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.eventId,
@@ -2756,6 +3258,7 @@ export function recordUsageEventBatch(input: UsageEventRecordInput): {
         nonNegative(input.outputTokens),
         nonNegative(input.cacheReadInputTokens),
         nonNegative(input.cacheCreationInputTokens),
+        nonNegative(input.reasoningTokens),
         nonNegative(input.providerEstimatedCostUSD),
         nonNegative(input.billedCostUSD),
         nonNegative(input.durationMs ?? 0),
@@ -2782,6 +3285,7 @@ export function recordUsageEventBatch(input: UsageEventRecordInput): {
         nonNegative(modelUsage.outputTokens),
         nonNegative(modelUsage.cacheReadInputTokens),
         nonNegative(modelUsage.cacheCreationInputTokens),
+        nonNegative(modelUsage.reasoningTokens),
         estimated,
         estimated,
         billed,
@@ -2799,6 +3303,7 @@ export function recordUsageEventBatch(input: UsageEventRecordInput): {
         nonNegative(modelUsage.outputTokens),
         nonNegative(modelUsage.cacheReadInputTokens),
         nonNegative(modelUsage.cacheCreationInputTokens),
+        nonNegative(modelUsage.reasoningTokens),
         estimated,
       );
     }
@@ -2810,12 +3315,14 @@ export function recordUsageEventBatch(input: UsageEventRecordInput): {
         nonNegative(input.inputTokens) +
         nonNegative(input.cacheReadInputTokens) +
         nonNegative(input.cacheCreationInputTokens);
+      const billableOutput =
+        nonNegative(input.outputTokens) + nonNegative(input.reasoningTokens);
       incrementUsageBoth(
         input.userId,
         month,
         localDate,
         billableInput,
-        nonNegative(input.outputTokens),
+        billableOutput,
         nonNegative(input.billedCostUSD),
       );
     }
@@ -2858,6 +3365,7 @@ export function getUsageDailyStats(
   output_tokens: number;
   cache_read_tokens: number;
   cache_creation_tokens: number;
+  reasoning_tokens: number;
   cost_usd: number;
   request_count: number;
 }> {
@@ -2883,6 +3391,7 @@ export function getUsageDailyStats(
       total_output_tokens as output_tokens,
       total_cache_read_tokens as cache_read_tokens,
       total_cache_creation_tokens as cache_creation_tokens,
+      total_reasoning_tokens as reasoning_tokens,
       total_cost_usd as cost_usd,
       request_count
     FROM usage_daily_summary
@@ -2898,6 +3407,7 @@ export function getUsageDailyStats(
     output_tokens: number;
     cache_read_tokens: number;
     cache_creation_tokens: number;
+    reasoning_tokens: number;
     cost_usd: number;
     request_count: number;
   }>;
@@ -2915,6 +3425,7 @@ export function getUsageDailySummary(
   totalOutputTokens: number;
   totalCacheReadTokens: number;
   totalCacheCreationTokens: number;
+  totalReasoningTokens: number;
   totalCostUSD: number;
   totalMessages: number;
   totalActiveDays: number;
@@ -2941,6 +3452,7 @@ export function getUsageDailySummary(
       COALESCE(SUM(total_output_tokens), 0) as total_output,
       COALESCE(SUM(total_cache_read_tokens), 0) as total_cache_read,
       COALESCE(SUM(total_cache_creation_tokens), 0) as total_cache_creation,
+      COALESCE(SUM(total_reasoning_tokens), 0) as total_reasoning,
       COALESCE(SUM(total_cost_usd), 0) as total_cost,
       COALESCE(SUM(request_count), 0) as total_messages,
       COUNT(DISTINCT date) as total_active_days
@@ -2953,6 +3465,7 @@ export function getUsageDailySummary(
     total_output: number;
     total_cache_read: number;
     total_cache_creation: number;
+    total_reasoning: number;
     total_cost: number;
     total_messages: number;
     total_active_days: number;
@@ -2963,6 +3476,7 @@ export function getUsageDailySummary(
     totalOutputTokens: row.total_output,
     totalCacheReadTokens: row.total_cache_read,
     totalCacheCreationTokens: row.total_cache_creation,
+    totalReasoningTokens: row.total_reasoning,
     totalCostUSD: row.total_cost,
     totalMessages: row.total_messages,
     totalActiveDays: row.total_active_days,
@@ -3019,6 +3533,7 @@ export interface UsageAttributionItem {
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+  reasoningTokens: number;
   totalTokens: number;
   providerEstimatedCostUSD: number;
   billedCostUSD: number;
@@ -3032,6 +3547,7 @@ export function getUsageAnalytics(filters: UsageQueryFilters): {
     outputTokens: number;
     cacheReadTokens: number;
     cacheCreationTokens: number;
+    reasoningTokens: number;
     totalTokens: number;
     providerEstimatedCostUSD: number;
     billedCostUSD: number;
@@ -3050,6 +3566,7 @@ export function getUsageAnalytics(filters: UsageQueryFilters): {
     output_tokens: number;
     cache_read_tokens: number;
     cache_creation_tokens: number;
+    reasoning_tokens: number;
     provider_estimated_cost_usd: number;
     cost_usd: number;
     billed_cost_usd: number;
@@ -3062,6 +3579,7 @@ export function getUsageAnalytics(filters: UsageQueryFilters): {
     output_tokens: number;
     cache_read_tokens: number;
     cache_creation_tokens: number;
+    reasoning_tokens: number;
     provider_estimated_cost_usd: number;
     cost_usd: number;
     billed_cost_usd: number;
@@ -3081,6 +3599,7 @@ export function getUsageAnalytics(filters: UsageQueryFilters): {
     COALESCE(SUM(r.output_tokens), 0) AS output_tokens,
     COALESCE(SUM(r.cache_read_input_tokens), 0) AS cache_read_tokens,
     COALESCE(SUM(r.cache_creation_input_tokens), 0) AS cache_creation_tokens,
+    COALESCE(SUM(r.reasoning_output_tokens), 0) AS reasoning_tokens,
     COALESCE(SUM(r.provider_estimated_cost_usd), 0) AS provider_cost,
     COALESCE(SUM(r.billed_cost_usd), 0) AS billed_cost,
     COUNT(DISTINCT r.event_id) AS run_count,
@@ -3114,6 +3633,7 @@ export function getUsageAnalytics(filters: UsageQueryFilters): {
       output_tokens: Number(row.output_tokens) || 0,
       cache_read_tokens: Number(row.cache_read_tokens) || 0,
       cache_creation_tokens: Number(row.cache_creation_tokens) || 0,
+      reasoning_tokens: Number(row.reasoning_tokens) || 0,
       provider_estimated_cost_usd: Number(row.provider_cost) || 0,
       cost_usd: Number(row.provider_cost) || 0,
       billed_cost_usd: Number(row.billed_cost) || 0,
@@ -3135,6 +3655,7 @@ export function getUsageAnalytics(filters: UsageQueryFilters): {
       output_tokens: Number(row.output_tokens) || 0,
       cache_read_tokens: Number(row.cache_read_tokens) || 0,
       cache_creation_tokens: Number(row.cache_creation_tokens) || 0,
+      reasoning_tokens: Number(row.reasoning_tokens) || 0,
       provider_estimated_cost_usd: Number(row.provider_cost) || 0,
       cost_usd: Number(row.provider_cost) || 0,
       billed_cost_usd: Number(row.billed_cost) || 0,
@@ -3176,6 +3697,7 @@ export function getUsageAnalytics(filters: UsageQueryFilters): {
       const output = Number(row.output_tokens) || 0;
       const cacheRead = Number(row.cache_read_tokens) || 0;
       const cacheCreation = Number(row.cache_creation_tokens) || 0;
+      const reasoning = Number(row.reasoning_tokens) || 0;
       const key = String(row.key);
       return {
         key,
@@ -3184,7 +3706,8 @@ export function getUsageAnalytics(filters: UsageQueryFilters): {
         outputTokens: output,
         cacheReadTokens: cacheRead,
         cacheCreationTokens: cacheCreation,
-        totalTokens: input + output + cacheRead + cacheCreation,
+        reasoningTokens: reasoning,
+        totalTokens: input + output + cacheRead + cacheCreation + reasoning,
         providerEstimatedCostUSD: Number(row.provider_cost) || 0,
         billedCostUSD: Number(row.billed_cost) || 0,
         runCount: Number(row.run_count) || 0,
@@ -3197,14 +3720,20 @@ export function getUsageAnalytics(filters: UsageQueryFilters): {
   const outputTokens = Number(summaryRow.output_tokens) || 0;
   const cacheReadTokens = Number(summaryRow.cache_read_tokens) || 0;
   const cacheCreationTokens = Number(summaryRow.cache_creation_tokens) || 0;
+  const reasoningTokens = Number(summaryRow.reasoning_tokens) || 0;
   return {
     summary: {
       inputTokens,
       outputTokens,
       cacheReadTokens,
       cacheCreationTokens,
+      reasoningTokens,
       totalTokens:
-        inputTokens + outputTokens + cacheReadTokens + cacheCreationTokens,
+        inputTokens +
+        outputTokens +
+        cacheReadTokens +
+        cacheCreationTokens +
+        reasoningTokens,
       providerEstimatedCostUSD: Number(summaryRow.provider_cost) || 0,
       billedCostUSD: Number(summaryRow.billed_cost) || 0,
       runCount: Number(summaryRow.run_count) || 0,
@@ -3264,6 +3793,7 @@ export function getUsageRecordsPage(
         r.input_tokens AS inputTokens, r.output_tokens AS outputTokens,
         r.cache_read_input_tokens AS cacheReadTokens,
         r.cache_creation_input_tokens AS cacheCreationTokens,
+        r.reasoning_output_tokens AS reasoningTokens,
         r.provider_estimated_cost_usd AS providerEstimatedCostUSD,
         r.billed_cost_usd AS billedCostUSD, r.duration_ms AS durationMs,
         r.num_turns AS numTurns, r.source, r.created_at AS createdAt
@@ -8389,7 +8919,8 @@ export function getMessagesPage(
   const sql = before
     ? `
       SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
-             turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
+             turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
+             delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
       FROM messages
       WHERE chat_jid = ? AND timestamp < ?
       ORDER BY timestamp DESC
@@ -8397,7 +8928,8 @@ export function getMessagesPage(
     `
     : `
       SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
-             turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
+             turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
+             delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
       FROM messages
       WHERE chat_jid = ?
       ORDER BY timestamp DESC
@@ -8424,7 +8956,8 @@ export function getMessagesAfter(
   const rows = db
     .prepare(
       `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
+              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
+              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
        FROM messages
        WHERE chat_jid = ? AND timestamp > ?
        ORDER BY timestamp ASC
@@ -8449,13 +8982,15 @@ export function getMessagesPageMulti(
   const placeholders = chatJids.map(() => '?').join(',');
   const sql = before
     ? `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
+              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
+              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
        FROM messages
        WHERE chat_jid IN (${placeholders}) AND timestamp < ?
        ORDER BY timestamp DESC
        LIMIT ?`
     : `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
+              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
+              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
        FROM messages
        WHERE chat_jid IN (${placeholders})
        ORDER BY timestamp DESC
@@ -8484,7 +9019,8 @@ export function getMessagesAfterMulti(
   const rows = db
     .prepare(
       `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
+              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
+              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
        FROM messages
        WHERE chat_jid IN (${placeholders}) AND timestamp > ?
        ORDER BY timestamp ASC

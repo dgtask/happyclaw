@@ -109,6 +109,7 @@ usage.get('/stats', (c) => {
     totalOutputTokens: data.summary.outputTokens,
     totalCacheReadTokens: data.summary.cacheReadTokens,
     totalCacheCreationTokens: data.summary.cacheCreationTokens,
+    totalReasoningTokens: data.summary.reasoningTokens,
     totalCostUSD: data.summary.providerEstimatedCostUSD,
     totalMessages: data.summary.runCount,
     totalActiveDays: data.summary.activeDays,
@@ -127,7 +128,7 @@ usage.get('/stats', (c) => {
     billing: {
       enabled: billingEnabled,
       applicable: billingApplicable,
-      providerCostSemantics: 'sdk-estimate',
+      providerCostSemantics: 'kaboo-utc-30m-rounded-estimate',
       billedCostSemantics: 'actual-charge',
     },
     scope: {
@@ -212,6 +213,7 @@ usage.get('/export.csv', (c) => {
     'outputTokens',
     'cacheReadTokens',
     'cacheCreationTokens',
+    'reasoningTokens',
     'providerEstimatedCostUSD',
     'billedCostUSD',
     'durationMs',

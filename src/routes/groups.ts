@@ -1398,7 +1398,7 @@ groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
     // ── 立即 abort 飞书流式卡片 ──
     const session = getStreamingSession(jid);
     if (session?.isActive()) {
-      session.abort('已中断').catch(() => {});
+      session.abort('已停止').catch(() => {});
     }
 
     // Persist interrupt as a system marker so refresh/state-restore can

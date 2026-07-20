@@ -18,11 +18,30 @@ import {
   TerminalSquare,
   Loader2,
   Upload,
+  Clock3,
+  CornerUpLeft,
+  Square,
+  Pencil,
+  ChevronUp,
+  ChevronDown,
+  Check,
+  Trash2,
 } from 'lucide-react';
 import { useFileStore } from '../../stores/files';
-import { useChatStore } from '../../stores/chat';
+import {
+  useChatStore,
+  type FollowUpMode,
+  type FollowUpQueueAction,
+  type QueuedFollowUp,
+} from '../../stores/chat';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { useMediaQuery } from '../../hooks/useMediaQuery';
+import {
+  alternateFollowUpMode,
+  FOLLOW_UP_MODE_KEY,
+  FOLLOW_UP_MODE_CHANGED_EVENT,
+  getDefaultFollowUpMode,
+} from '../../lib/follow-up-preferences';
 
 interface PendingFile {
   /** Display name: relative path for folder uploads, file name otherwise */
@@ -48,12 +67,22 @@ interface MessageInputProps {
   onSend: (
     content: string,
     attachments?: Array<{ data: string; mimeType: string }>,
+    followUpBehavior?: FollowUpMode,
   ) => Promise<boolean> | boolean;
   groupJid?: string;
   disabled?: boolean;
   contextLabel?: string;
   onResetSession?: () => void;
   onToggleTerminal?: () => void;
+  /** Stop the active run when the composer has no follow-up to send. */
+  onStop?: () => Promise<boolean> | boolean;
+  isRunning?: boolean;
+  queuedFollowUps?: QueuedFollowUp[];
+  onFollowUpAction?: (
+    item: QueuedFollowUp,
+    action: FollowUpQueueAction,
+    content?: string,
+  ) => Promise<boolean> | boolean;
 }
 
 export function MessageInput({
@@ -63,6 +92,10 @@ export function MessageInput({
   contextLabel,
   onResetSession,
   onToggleTerminal,
+  onStop,
+  isRunning = false,
+  queuedFollowUps = [],
+  onFollowUpAction,
 }: MessageInputProps) {
   const [content, setContent] = useState('');
   const [showActions, setShowActions] = useState(false);
@@ -70,7 +103,19 @@ export function MessageInput({
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [stopping, setStopping] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
+  const [followUpMode, setFollowUpMode] = useState<FollowUpMode>(() =>
+    getDefaultFollowUpMode(),
+  );
+  const [actingOn, setActingOn] = useState<Set<string>>(() => new Set());
+  const [editingFollowUpId, setEditingFollowUpId] = useState<string | null>(
+    null,
+  );
+  const [editingFollowUpContent, setEditingFollowUpContent] = useState('');
+  const [savingFollowUpId, setSavingFollowUpId] = useState<string | null>(null);
+  const editingFollowUpInitialContentRef = useRef('');
+  const editingFollowUpContentRef = useRef('');
   const dragCounterRef = useRef(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -91,6 +136,30 @@ export function MessageInput({
 
   // iOS keyboard adaptation
   useKeyboardHeight();
+
+  useEffect(() => {
+    const handlePreferenceChange = (event: Event) => {
+      const mode = (event as CustomEvent<FollowUpMode>).detail;
+      setFollowUpMode(mode === 'steer' ? 'steer' : 'queue');
+    };
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === FOLLOW_UP_MODE_KEY) {
+        setFollowUpMode(event.newValue === 'steer' ? 'steer' : 'queue');
+      }
+    };
+    window.addEventListener(
+      FOLLOW_UP_MODE_CHANGED_EVENT,
+      handlePreferenceChange,
+    );
+    window.addEventListener('storage', handleStorage);
+    return () => {
+      window.removeEventListener(
+        FOLLOW_UP_MODE_CHANGED_EVENT,
+        handlePreferenceChange,
+      );
+      window.removeEventListener('storage', handleStorage);
+    };
+  }, []);
 
   // Restore draft when groupJid changes (including initial mount)
   useEffect(() => {
@@ -175,6 +244,19 @@ export function MessageInput({
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (composingRef.current || e.nativeEvent.isComposing) return;
+    if (
+      e.key === 'Enter' &&
+      e.shiftKey &&
+      (e.metaKey || e.ctrlKey) &&
+      !isMobile
+    ) {
+      if (Date.now() - compositionEndTimeRef.current < 100) return;
+      e.preventDefault();
+      void handleSend(
+        isRunning ? alternateFollowUpMode(followUpMode) : undefined,
+      );
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey && !isMobile) {
       if (Date.now() - compositionEndTimeRef.current < 100) return;
       e.preventDefault();
@@ -182,7 +264,7 @@ export function MessageInput({
     }
   };
 
-  const handleSend = async () => {
+  const handleSend = async (modeOverride?: FollowUpMode) => {
     const trimmed = content.trim();
     const hasPending = pendingFiles.length > 0;
     const hasImages = pendingImages.length > 0;
@@ -207,7 +289,11 @@ export function MessageInput({
 
     let ok = false;
     try {
-      ok = await onSend(message, attachments);
+      ok = await onSend(
+        message,
+        attachments,
+        modeOverride ?? (isRunning ? followUpMode : undefined),
+      );
     } catch {
       ok = false;
     }
@@ -233,6 +319,92 @@ export function MessageInput({
     }
     setSending(false);
   };
+
+  const handleFollowUpAction = async (
+    item: QueuedFollowUp,
+    action: FollowUpQueueAction,
+    nextContent?: string,
+  ): Promise<boolean> => {
+    if (!onFollowUpAction || actingOn.has(item.id)) return false;
+    setActingOn((current) => new Set(current).add(item.id));
+    try {
+      return await onFollowUpAction(item, action, nextContent);
+    } finally {
+      setActingOn((current) => {
+        const next = new Set(current);
+        next.delete(item.id);
+        return next;
+      });
+    }
+  };
+
+  const beginEditingFollowUp = (item: QueuedFollowUp) => {
+    setEditingFollowUpId(item.id);
+    setEditingFollowUpContent(item.content);
+    editingFollowUpInitialContentRef.current = item.content;
+    editingFollowUpContentRef.current = item.content;
+  };
+
+  const saveFollowUpEdit = async (item: QueuedFollowUp) => {
+    const nextContent = editingFollowUpContentRef.current.trim();
+    if (!nextContent) return;
+    setSavingFollowUpId(item.id);
+    const saved = await handleFollowUpAction(item, 'edit', nextContent);
+    setSavingFollowUpId(null);
+    if (saved) {
+      setEditingFollowUpId(null);
+      setEditingFollowUpContent('');
+      editingFollowUpInitialContentRef.current = '';
+      editingFollowUpContentRef.current = '';
+    }
+  };
+
+  // A run can finish while the user is editing the next queued message. The
+  // dispatcher is then allowed to claim that item, so it disappears from the
+  // queue before Save can be clicked. Never silently discard what the user
+  // typed: move an unsaved edit back into the main composer and explain why.
+  useEffect(() => {
+    if (!editingFollowUpId || savingFollowUpId === editingFollowUpId) return;
+    if (queuedFollowUps.some((item) => item.id === editingFollowUpId)) return;
+
+    const recovered = editingFollowUpContentRef.current.trim();
+    const initial = editingFollowUpInitialContentRef.current.trim();
+    setEditingFollowUpId(null);
+    setEditingFollowUpContent('');
+    editingFollowUpInitialContentRef.current = '';
+    editingFollowUpContentRef.current = '';
+
+    if (!recovered || recovered === initial) return;
+    const nextContent = content.trim()
+      ? `${content.trimEnd()}\n\n${recovered}`
+      : recovered;
+    setContent(nextContent);
+    debouncedSaveDraft(nextContent);
+    setSendError('这条消息已开始处理，未保存的修改已移到输入框');
+    const timer = window.setTimeout(() => setSendError(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [
+    content,
+    debouncedSaveDraft,
+    editingFollowUpId,
+    queuedFollowUps,
+    savingFollowUpId,
+  ]);
+
+  const handleStop = async () => {
+    if (!onStop || stopping || disabled) return;
+    setStopping(true);
+    try {
+      const stopped = await onStop();
+      if (!stopped) setStopping(false);
+    } catch {
+      setStopping(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!isRunning) setStopping(false);
+  }, [isRunning]);
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!groupJid) return;
@@ -598,9 +770,10 @@ export function MessageInput({
   };
 
   const hasContent = content.trim().length > 0;
-  const canSend =
-    (hasContent || pendingFiles.length > 0 || pendingImages.length > 0) &&
-    !sending;
+  const hasPayload =
+    hasContent || pendingFiles.length > 0 || pendingImages.length > 0;
+  const canSend = hasPayload && !sending;
+  const showStop = isRunning && !hasPayload && !sending && !!onStop;
 
   const progressPercent =
     uploadProgress && uploadProgress.totalBytes > 0
@@ -654,6 +827,158 @@ export function MessageInput({
                 className="h-full bg-primary rounded-full transition-all duration-300 ease-out"
                 style={{ width: `${progressPercent}%` }}
               />
+            </div>
+          </div>
+        )}
+
+        {queuedFollowUps.length > 0 && (
+          <div className="mb-2 overflow-hidden rounded-xl border border-border bg-muted/30">
+            <div className="flex items-center gap-2 border-b border-border/70 px-3 py-2 text-xs text-muted-foreground">
+              <Clock3 className="h-3.5 w-3.5" />
+              <span>
+                {queuedFollowUps.some((item) => item.delivery_mode === 'steer')
+                  ? '正在停止当前回复，随后发送引导消息'
+                  : `${queuedFollowUps.length} 条消息已排队`}
+              </span>
+            </div>
+            <div className="max-h-56 divide-y divide-border/70 overflow-y-auto">
+              {queuedFollowUps.map((item, index) => {
+                const busy = actingOn.has(item.id);
+                const steering = item.delivery_mode === 'steer';
+                const locked = steering || item.delivery_status === 'promoting';
+                const editing = editingFollowUpId === item.id;
+                return (
+                  <div
+                    key={item.id}
+                    className="flex min-w-0 items-start gap-2 px-3 py-2"
+                  >
+                    <span className="mt-1.5 shrink-0 text-[11px] font-medium tabular-nums text-muted-foreground">
+                      {index + 1}
+                    </span>
+                    {editing ? (
+                      <div className="min-w-0 flex-1 space-y-2">
+                        <textarea
+                          value={editingFollowUpContent}
+                          onChange={(event) => {
+                            editingFollowUpContentRef.current =
+                              event.target.value;
+                            setEditingFollowUpContent(event.target.value);
+                          }}
+                          rows={2}
+                          autoFocus
+                          className="w-full resize-none rounded-lg border border-border bg-surface px-2.5 py-2 text-xs leading-5 text-foreground outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                          aria-label="编辑排队消息"
+                        />
+                        <div className="flex justify-end gap-1">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditingFollowUpId(null);
+                              setEditingFollowUpContent('');
+                              editingFollowUpInitialContentRef.current = '';
+                              editingFollowUpContentRef.current = '';
+                            }}
+                            className="inline-flex min-h-8 items-center gap-1 rounded-md px-2 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+                          >
+                            <X className="h-3.5 w-3.5" />
+                            取消
+                          </button>
+                          <button
+                            type="button"
+                            disabled={busy || !editingFollowUpContent.trim()}
+                            onClick={() => void saveFollowUpEdit(item)}
+                            className="inline-flex min-h-8 items-center gap-1 rounded-md bg-primary px-2 text-[11px] font-medium text-white hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {busy ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Check className="h-3.5 w-3.5" />
+                            )}
+                            保存
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="min-w-0 flex-1">
+                        <span
+                          className="block whitespace-pre-wrap break-words pt-1 text-xs leading-5 text-foreground/80"
+                          title={item.content}
+                        >
+                          {item.content}
+                        </span>
+                        <div className="mt-1 flex flex-wrap items-center justify-end gap-0.5">
+                          <button
+                            type="button"
+                            disabled={busy || locked || index === 0}
+                            onClick={() =>
+                              void handleFollowUpAction(item, 'move_up')
+                            }
+                            className="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-35"
+                            aria-label={`上移：${item.content}`}
+                            title="上移"
+                          >
+                            <ChevronUp className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={
+                              busy ||
+                              locked ||
+                              index === queuedFollowUps.length - 1
+                            }
+                            onClick={() =>
+                              void handleFollowUpAction(item, 'move_down')
+                            }
+                            className="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-35"
+                            aria-label={`下移：${item.content}`}
+                            title="下移"
+                          >
+                            <ChevronDown className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={busy || locked}
+                            onClick={() => beginEditingFollowUp(item)}
+                            className="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-35"
+                            aria-label={`编辑：${item.content}`}
+                            title="编辑"
+                          >
+                            <Pencil className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={busy || locked}
+                            onClick={() =>
+                              void handleFollowUpAction(item, 'steer')
+                            }
+                            className="inline-flex min-h-8 shrink-0 items-center gap-1 rounded-md px-2 text-[11px] font-medium text-primary transition-colors hover:bg-brand-50 disabled:cursor-not-allowed disabled:opacity-50"
+                            aria-label={`立即发送：${item.content}`}
+                          >
+                            {busy || locked ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <CornerUpLeft className="h-3.5 w-3.5" />
+                            )}
+                            {locked ? '发送中' : '发送'}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={busy || locked}
+                            onClick={() =>
+                              void handleFollowUpAction(item, 'cancel')
+                            }
+                            className="flex size-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                            aria-label={`删除排队消息：${item.content}`}
+                            title="删除"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}
@@ -857,18 +1182,29 @@ export function MessageInput({
             {/* Spacer */}
             <div className="flex-1" />
 
-            {/* Right: send button */}
+            {/* Right: one contextual primary action, matching Codex. */}
             <button
-              onClick={handleSend}
-              disabled={!canSend || disabled || sending}
+              type="button"
+              onClick={() => (showStop ? void handleStop() : void handleSend())}
+              disabled={
+                showStop
+                  ? disabled || stopping
+                  : !canSend || disabled || sending
+              }
+              title={showStop ? '停止当前运行' : '发送消息'}
+              aria-label={showStop ? '停止当前运行' : '发送消息'}
               className={`w-10 h-10 rounded-full flex items-center justify-center transition-all cursor-pointer active:scale-90 ${
-                canSend && !disabled && !sending
-                  ? 'bg-primary text-white hover:bg-primary/90 max-lg:shadow-[0_2px_8px_rgba(249,115,22,0.3)]'
-                  : 'bg-muted text-muted-foreground'
-              }`}
+                showStop && !disabled && !stopping
+                  ? 'bg-foreground text-background hover:bg-foreground/90'
+                  : canSend && !disabled && !sending
+                    ? 'bg-primary text-white hover:bg-primary/90 max-lg:shadow-[0_2px_8px_rgba(249,115,22,0.3)]'
+                    : 'bg-muted text-muted-foreground'
+              } focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2`}
             >
-              {sending ? (
+              {sending || stopping ? (
                 <Loader2 className="w-4.5 h-4.5 animate-spin" />
+              ) : showStop ? (
+                <Square className="w-4 h-4 fill-current" />
               ) : (
                 <ArrowUp className="w-4.5 h-4.5" />
               )}

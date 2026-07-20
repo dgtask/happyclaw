@@ -71,6 +71,7 @@ import {
   latestIpcInputMessage,
   parseIpcReceipt,
   requeueIpcInputMessages,
+  type IpcDeliveryReceipt,
   type IpcInputMessage,
 } from './ipc-delivery.js';
 import {
@@ -79,6 +80,16 @@ import {
   resolveLegacyAutoCompactWindow,
 } from './context-window.js';
 import { resolveClaudeProviderRuntime } from './provider-runtime.js';
+import {
+  createResultUsageState,
+  extractResultUsage,
+  type SdkModelUsage,
+  type SdkResultUsage,
+} from './result-usage.js';
+import {
+  AssistantUsageCollector,
+  type AssistantUsageBatch,
+} from './assistant-usage.js';
 
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
 const WORKSPACE_GROUP =
@@ -1574,6 +1585,7 @@ async function runQuery(
   contextOverflow?: boolean;
   unrecoverableTranscriptError?: boolean;
   interruptedDuringQuery: boolean;
+  cancelledIpcReceipts?: IpcDeliveryReceipt[];
   sessionResumeFailed?: boolean;
   pipedMessagesDuringQuery: IpcInputMessage[];
   suspectTruncatedTail?: string;
@@ -1629,6 +1641,7 @@ async function runQuery(
   let ipcPolling = true;
   let closedDuringQuery = false;
   let interruptedDuringQuery = false;
+  let cancelledIpcReceipts: IpcDeliveryReceipt[] = [];
   let suppressOutputAfterInterrupt = false;
   let visibleOutputStarted = false;
   // After a result is received, allow a short window for the host to write _drain
@@ -1666,27 +1679,79 @@ async function runQuery(
   let sawPendingBackgroundTasks = false;
   let backgroundSummaryForceAttempts = 0;
   const MAX_BACKGROUND_SUMMARY_FORCE_ATTEMPTS = 2;
-  // Usage delta 化基线：SDK result.usage 是 query 级累计值，单 query 多 result
-  // 时需做差上报，否则主进程按事件入账会重复计费。
-  let lastReportedUsage = {
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadInputTokens: 0,
-    cacheCreationInputTokens: 0,
-    costUSD: 0,
-    durationMs: 0,
-    numTurns: 0,
-  };
-  const lastReportedModelUsage = new Map<
-    string,
-    {
-      inputTokens: number;
-      outputTokens: number;
-      cacheReadInputTokens: number;
-      cacheCreationInputTokens: number;
-      costUSD: number;
+  // SDK scopes vary by implementation: the official SDK exposes cumulative
+  // root/model totals, while compatible proxies may reset the root per result.
+  // Assistant message usage is the primary Kaboo-compatible source; this
+  // stateful result normalizer is only the fallback when no assistant usage
+  // snapshot was observed.
+  const resultUsageState = createResultUsageState();
+  const assistantUsageCollector = new AssistantUsageCollector();
+  let assistantBatchFlushedSinceLastResult = false;
+  const emitResultUsage = (
+    resultMessage: Record<string, unknown>,
+    fallbackEventId: string,
+  ): void => {
+    const resultUuid =
+      typeof resultMessage.uuid === 'string' ? resultMessage.uuid.trim() : '';
+    // SDK result UUID survives delivery retries and gives the host's event
+    // ledger a stronger idempotency key than a process-local generated turn.
+    const eventId = resultUuid ? `sdk-result:${resultUuid}` : fallbackEventId;
+    const fallbackUsage = extractResultUsage(
+      {
+        eventId,
+        usage: resultMessage.usage as SdkResultUsage | undefined,
+        totalCostUSD: resultMessage.total_cost_usd as number | undefined,
+        durationMs: resultMessage.duration_ms as number | undefined,
+        numTurns: resultMessage.num_turns as number | undefined,
+        modelUsage: resultMessage.modelUsage as
+          | Record<string, SdkModelUsage>
+          | undefined,
+        fallbackModelKey: CLAUDE_PROVIDER_RUNTIME.usageModelKey,
+      },
+      resultUsageState,
+    );
+    const assistantBatches: AssistantUsageBatch[] = [];
+    for (;;) {
+      const batch = assistantUsageCollector.drain(newSessionId || sessionId);
+      if (!batch) break;
+      assistantBatches.push(batch);
     }
-  >();
+    if (assistantBatches.length > 0) {
+      assistantBatchFlushedSinceLastResult = true;
+      assistantBatches.forEach((assistantBatch, index) => {
+        // Result duration/turn count describe the whole SDK result, so attach
+        // them only to the final per-message event instead of multiplying them.
+        const isLast = index === assistantBatches.length - 1;
+        const usage = {
+          eventId: assistantBatch.eventId,
+          batchIndex: index,
+          batchCount: assistantBatches.length,
+          ...assistantBatch.tokens,
+          costUSD: isLast ? fallbackUsage?.costUSD || 0 : 0,
+          durationMs: isLast ? fallbackUsage?.durationMs || 0 : 0,
+          numTurns: isLast ? fallbackUsage?.numTurns || 0 : 0,
+        };
+        emit({
+          status: 'stream',
+          result: null,
+          streamEvent: { eventType: 'usage', usage },
+        });
+        log(
+          `Usage: input=${usage.inputTokens} output=${usage.outputTokens} reasoning=${usage.reasoningTokens} cacheRead=${usage.cacheReadInputTokens} cacheCreate=${usage.cacheCreationInputTokens} cost=$${usage.costUSD} turns=${usage.numTurns}`,
+        );
+      });
+      return;
+    }
+    if (assistantBatchFlushedSinceLastResult || !fallbackUsage) return;
+    emit({
+      status: 'stream',
+      result: null,
+      streamEvent: { eventType: 'usage', usage: fallbackUsage },
+    });
+    log(
+      `Usage: input=${fallbackUsage.inputTokens} output=${fallbackUsage.outputTokens} reasoning=${fallbackUsage.reasoningTokens} cacheRead=${fallbackUsage.cacheReadInputTokens} cacheCreate=${fallbackUsage.cacheCreationInputTokens} cost=$${fallbackUsage.costUSD} turns=${fallbackUsage.numTurns}`,
+    );
+  };
 
   // 收尾阶段中止挂起的工具调用：当 stream 准备关闭（_close/_drain/post-result-timeout）时，
   // SDK 可能仍卡在最终回复之后的某个工具调用上，光 stream.end() 不会让它退出。
@@ -1710,6 +1775,7 @@ async function runQuery(
     if (shouldClose()) {
       log('Close sentinel detected during query, ending stream');
       closedDuringQuery = true;
+      emitResultUsage({}, containerInput.turnId || generateTurnId());
       interruptQueryForShutdown('Close sentinel detected during query');
       stream.end();
       ipcPolling = false;
@@ -1719,12 +1785,24 @@ async function runQuery(
     if (shouldInterrupt()) {
       log('Interrupt sentinel detected, interrupting current query');
       interruptedDuringQuery = true;
-      if (!visibleOutputStarted && resultCount === 0) {
-        suppressOutputAfterInterrupt = true;
-        log(
-          'Interrupt arrived before visible output, suppressing query output',
-        );
-      }
+      const cancelledInputs = ipcDeliveryTracker.cancelCurrentTurn();
+      cancelledIpcReceipts = cancelledInputs
+        .map((message) => message.receipt)
+        .filter((receipt): receipt is IpcDeliveryReceipt => !!receipt);
+      log(
+        `Cancelled ${cancelledInputs.length} IPC input message(s) owned by the superseded turn`,
+      );
+      suppressOutputAfterInterrupt = true;
+      log(
+        visibleOutputStarted || resultCount > 0
+          ? 'Interrupt arrived after output started; suppressing all later output from the superseded turn'
+          : 'Interrupt arrived before visible output; suppressing query output',
+      );
+      // The SDK may abort without producing a Result. Flush already observed
+      // assistant API calls now so a deliberate stop/steer cannot erase their
+      // real token usage. A later Result only advances fallback high-water
+      // state and is suppressed by assistantBatchFlushedSinceLastResult.
+      emitResultUsage({}, containerInput.turnId || generateTurnId());
       lastInterruptRequestedAt = Date.now();
       queryRef
         ?.interrupt()
@@ -1752,6 +1830,7 @@ async function runQuery(
     // 这保证了终端预热等场景下容器不会在查询完成后立即退出。
     if (
       resultReceivedAt &&
+      !ipcDeliveryTracker.hasPendingTurns &&
       Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS
     ) {
       log(
@@ -1899,6 +1978,13 @@ async function runQuery(
   if (shouldInterrupt()) {
     log('Interrupt sentinel detected before query start, skipping query');
     interruptedDuringQuery = true;
+    const cancelledInputs = ipcDeliveryTracker.cancelCurrentTurn();
+    cancelledIpcReceipts = cancelledInputs
+      .map((message) => message.receipt)
+      .filter((receipt): receipt is IpcDeliveryReceipt => !!receipt);
+    log(
+      `Cancelled ${cancelledInputs.length} IPC input message(s) before the superseded turn started`,
+    );
     suppressOutputAfterInterrupt = true;
     ipcPolling = false;
     // 这条 early-return 在下方 try 块之前，不被 finally 覆盖，需就地关闭 watcher（close 幂等）。
@@ -1909,6 +1995,7 @@ async function runQuery(
       lastAssistantUuid,
       closedDuringQuery,
       interruptedDuringQuery,
+      cancelledIpcReceipts,
       pipedMessagesDuringQuery,
     };
   }
@@ -2077,9 +2164,14 @@ async function runQuery(
         'Interrupt sentinel already present when query started, interrupting immediately',
       );
       interruptedDuringQuery = true;
-      if (!visibleOutputStarted && resultCount === 0) {
-        suppressOutputAfterInterrupt = true;
-      }
+      const cancelledInputs = ipcDeliveryTracker.cancelCurrentTurn();
+      cancelledIpcReceipts = cancelledInputs
+        .map((message) => message.receipt)
+        .filter((receipt): receipt is IpcDeliveryReceipt => !!receipt);
+      log(
+        `Cancelled ${cancelledInputs.length} IPC input message(s) as the superseded turn started`,
+      );
+      suppressOutputAfterInterrupt = true;
       q.interrupt().catch((err: unknown) =>
         log(`Immediate interrupt call failed: ${err}`),
       );
@@ -2227,9 +2319,26 @@ async function runQuery(
       if (message.type !== 'system') {
         visibleOutputStarted = true;
       }
+      // Collect Claude's per-API-call assistant usage before any presentation
+      // suppression. A stopped/steered reply may be hidden, but its provider
+      // usage is still real. The collector deduplicates repeated message IDs
+      // and keeps the largest final snapshot, matching Kaboo's transcript
+      // parser contract.
+      if (message.type === 'assistant') {
+        assistantUsageCollector.ingest(
+          message as unknown as Record<string, unknown>,
+        );
+      }
       if (suppressOutputAfterInterrupt && message.type !== 'system') {
         if (message.type === 'result') {
           resultCount++;
+          // Deliberately suppress the superseded reply, not the provider bill.
+          // SDK error/interrupted results can still carry real usage.
+          emitResultUsage(
+            message as unknown as Record<string, unknown>,
+            containerInput.turnId || generateTurnId(),
+          );
+          assistantBatchFlushedSinceLastResult = false;
           resultReceivedAt = Date.now();
         }
         log(`[msg #${messageCount}] suppressed after early interrupt`);
@@ -2344,6 +2453,7 @@ async function runQuery(
         log(
           `Result #${resultCount}: subtype=${resultSubtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`,
         );
+        const resultMsg = message as unknown as Record<string, unknown>;
 
         // SDK 在某些失败场景会返回 error_* subtype 且不抛异常。
         // 不能把这类结果当 success(null)，否则前端会一直停留在"思考中"。
@@ -2354,6 +2464,7 @@ async function runQuery(
           (resultSubtype === 'error_during_execution' ||
             resultSubtype.startsWith('error'))
         ) {
+          emitResultUsage(resultMsg, containerInput.turnId || generateTurnId());
           // If session never initialized (no system/init), resume itself failed — report it
           // so the caller can retry with a fresh session instead of crashing.
           if (!newSessionId) {
@@ -2390,6 +2501,7 @@ async function runQuery(
               finalizationReason: 'error',
             });
           }
+          emitResultUsage(resultMsg, containerInput.turnId || generateTurnId());
           processor.resetFullTextAccumulator();
           return {
             newSessionId,
@@ -2404,6 +2516,7 @@ async function runQuery(
           log(
             `Unrecoverable transcript error in result: ${textResult.slice(0, 200)}`,
           );
+          emitResultUsage(resultMsg, containerInput.turnId || generateTurnId());
           processor.resetFullTextAccumulator();
           return {
             newSessionId,
@@ -2425,7 +2538,6 @@ async function runQuery(
         // 主进程据此决定流式卡片是定稿「已完成」还是保持「后台任务运行中/自动续写中」。
         // 事后补发的 status 事件到达时卡片可能已定稿轮换（提示会被静默吞掉），
         // 这正是"卡片显示已完成但后台还在跑"的可见性 bug 的根源。
-        const resultMsg = message as Record<string, unknown>;
         const sdkUsage = resultMsg.usage as Record<string, number> | undefined;
         const suspectTruncated =
           emitOutput &&
@@ -2494,6 +2606,8 @@ async function runQuery(
         const ipcReceipts = inputTurnCompleted
           ? ipcDeliveryTracker.completeNextTurn()
           : undefined;
+        const queryIdle =
+          inputTurnCompleted && !ipcDeliveryTracker.hasPendingTurns;
         const completedTurnId = containerInput.turnId || generateTurnId();
         emit({
           status: 'success',
@@ -2504,8 +2618,14 @@ async function runQuery(
           finalizationReason: suspectTruncated ? 'truncated' : 'completed',
           pendingBgTasks,
           inputTurnCompleted,
+          queryIdle,
           ...(ipcReceipts && ipcReceipts.length > 0 ? { ipcReceipts } : {}),
         });
+        // Keep the usage event on the same turn ID as the result it charges.
+        // The previous implementation rotated turnId first, so Web received a
+        // usage event labelled as the following turn.
+        emitResultUsage(resultMsg, completedTurnId);
+        assistantBatchFlushedSinceLastResult = false;
         // After emitting an sdk_final result, rotate turnId so that if
         // another result is emitted within the same query (e.g. user sent
         // a follow-up via IPC mid-query), it won't overwrite this one (#214).
@@ -2515,141 +2635,6 @@ async function runQuery(
         // 否则第二条回复会重复前一 turn 的内容前缀（与 turnId 轮转对称）。
         assistantTextTracker.reset();
         canonicalAssistantUuid = undefined;
-
-        // Emit usage stream event with token counts and cost.
-        // SDK result.usage / total_cost_usd 是 query 级累计值——单 query 多 result 时
-        //（mid-query follow-up、后台任务唤醒的汇总 turn）每条 result 都携带全量累计，
-        // 直接上报会让主进程按事件入账造成重复计费（实测 4 result 场景虚增 4 倍）。
-        // 这里对上次已上报的累计值做差，只上报本 turn 的增量。
-        //（resultMsg / sdkUsage 已在上方 emit 前置计算处声明）
-        const sdkModelUsage = resultMsg.modelUsage as
-          | Record<string, Record<string, number>>
-          | undefined;
-        if (sdkUsage) {
-          const delta = (cur: number, prev: number) =>
-            Math.max(0, (cur || 0) - (prev || 0));
-          const modelUsageSummary: Record<
-            string,
-            {
-              inputTokens: number;
-              outputTokens: number;
-              cacheReadInputTokens: number;
-              cacheCreationInputTokens: number;
-              costUSD: number;
-            }
-          > = {};
-          if (sdkModelUsage && Object.keys(sdkModelUsage).length > 0) {
-            for (const [model, mu] of Object.entries(sdkModelUsage)) {
-              const prev = lastReportedModelUsage.get(model);
-              modelUsageSummary[model] = {
-                inputTokens: delta(mu.inputTokens, prev?.inputTokens ?? 0),
-                outputTokens: delta(mu.outputTokens, prev?.outputTokens ?? 0),
-                cacheReadInputTokens: delta(
-                  mu.cacheReadInputTokens,
-                  prev?.cacheReadInputTokens ?? 0,
-                ),
-                cacheCreationInputTokens: delta(
-                  mu.cacheCreationInputTokens,
-                  prev?.cacheCreationInputTokens ?? 0,
-                ),
-                costUSD: delta(mu.costUSD, prev?.costUSD ?? 0),
-              };
-              lastReportedModelUsage.set(model, {
-                inputTokens: mu.inputTokens || 0,
-                outputTokens: mu.outputTokens || 0,
-                cacheReadInputTokens: mu.cacheReadInputTokens || 0,
-                cacheCreationInputTokens: mu.cacheCreationInputTokens || 0,
-                costUSD: mu.costUSD || 0,
-              });
-            }
-          } else {
-            // Fallback: use a stable non-empty key when the official provider
-            // lets the SDK choose its default model and no breakdown is returned.
-            const fallbackModelKey = CLAUDE_PROVIDER_RUNTIME.usageModelKey;
-            const prev = lastReportedModelUsage.get(fallbackModelKey);
-            modelUsageSummary[fallbackModelKey] = {
-              inputTokens: delta(sdkUsage.input_tokens, prev?.inputTokens ?? 0),
-              outputTokens: delta(
-                sdkUsage.output_tokens,
-                prev?.outputTokens ?? 0,
-              ),
-              cacheReadInputTokens: delta(
-                sdkUsage.cache_read_input_tokens,
-                prev?.cacheReadInputTokens ?? 0,
-              ),
-              cacheCreationInputTokens: delta(
-                sdkUsage.cache_creation_input_tokens,
-                prev?.cacheCreationInputTokens ?? 0,
-              ),
-              costUSD: delta(
-                (resultMsg.total_cost_usd as number) || 0,
-                prev?.costUSD ?? 0,
-              ),
-            };
-            lastReportedModelUsage.set(fallbackModelKey, {
-              inputTokens: sdkUsage.input_tokens || 0,
-              outputTokens: sdkUsage.output_tokens || 0,
-              cacheReadInputTokens: sdkUsage.cache_read_input_tokens || 0,
-              cacheCreationInputTokens:
-                sdkUsage.cache_creation_input_tokens || 0,
-              costUSD: (resultMsg.total_cost_usd as number) || 0,
-            });
-          }
-          emit({
-            status: 'stream',
-            result: null,
-            streamEvent: {
-              eventType: 'usage',
-              usage: {
-                eventId: completedTurnId,
-                inputTokens: delta(
-                  sdkUsage.input_tokens,
-                  lastReportedUsage.inputTokens,
-                ),
-                outputTokens: delta(
-                  sdkUsage.output_tokens,
-                  lastReportedUsage.outputTokens,
-                ),
-                cacheReadInputTokens: delta(
-                  sdkUsage.cache_read_input_tokens,
-                  lastReportedUsage.cacheReadInputTokens,
-                ),
-                cacheCreationInputTokens: delta(
-                  sdkUsage.cache_creation_input_tokens,
-                  lastReportedUsage.cacheCreationInputTokens,
-                ),
-                costUSD: delta(
-                  (resultMsg.total_cost_usd as number) || 0,
-                  lastReportedUsage.costUSD,
-                ),
-                durationMs: delta(
-                  (resultMsg.duration_ms as number) || 0,
-                  lastReportedUsage.durationMs,
-                ),
-                numTurns: delta(
-                  (resultMsg.num_turns as number) || 0,
-                  lastReportedUsage.numTurns,
-                ),
-                modelUsage:
-                  Object.keys(modelUsageSummary).length > 0
-                    ? modelUsageSummary
-                    : undefined,
-              },
-            },
-          });
-          lastReportedUsage = {
-            inputTokens: sdkUsage.input_tokens || 0,
-            outputTokens: sdkUsage.output_tokens || 0,
-            cacheReadInputTokens: sdkUsage.cache_read_input_tokens || 0,
-            cacheCreationInputTokens: sdkUsage.cache_creation_input_tokens || 0,
-            costUSD: (resultMsg.total_cost_usd as number) || 0,
-            durationMs: (resultMsg.duration_ms as number) || 0,
-            numTurns: (resultMsg.num_turns as number) || 0,
-          };
-          log(
-            `Usage: input=${sdkUsage.input_tokens} output=${sdkUsage.output_tokens} cost=$${resultMsg.total_cost_usd} turns=${resultMsg.num_turns}`,
-          );
-        }
 
         // ── 标记结果已收到 ──
         // pollIpcDuringQuery 会在 POST_RESULT_TIMEOUT_MS 后关闭 stream，
@@ -2683,10 +2668,19 @@ async function runQuery(
               displayLevel: 'primary',
             },
           });
-        } else {
+        } else if (!ipcDeliveryTracker.hasPendingTurns) {
           sawPendingBackgroundTasks = false;
           backgroundSummaryForceAttempts = 0;
           resultReceivedAt = Date.now();
+        } else {
+          // A steer was accepted before this result. The SDK will start that
+          // turn in the same query, so arming the post-result timeout here can
+          // kill it a few seconds later (the exact race that dropped queued
+          // follow-ups in conversation agents).
+          resultReceivedAt = null;
+          log(
+            `Result #${resultCount} emitted; keeping stream open for ${ipcDeliveryTracker.pendingTurnCount} accepted follow-up turn(s)`,
+          );
         }
       }
     }
@@ -2702,6 +2696,7 @@ async function runQuery(
       lastAssistantUuid,
       closedDuringQuery,
       interruptedDuringQuery,
+      cancelledIpcReceipts,
       pipedMessagesDuringQuery,
       suspectTruncatedTail,
     };
@@ -2731,6 +2726,7 @@ async function runQuery(
         closedDuringQuery,
         contextOverflow: true,
         interruptedDuringQuery,
+        cancelledIpcReceipts,
         pipedMessagesDuringQuery,
       };
     }
@@ -2744,6 +2740,7 @@ async function runQuery(
         closedDuringQuery,
         unrecoverableTranscriptError: true,
         interruptedDuringQuery,
+        cancelledIpcReceipts,
         pipedMessagesDuringQuery,
       };
     }
@@ -2760,6 +2757,7 @@ async function runQuery(
         lastAssistantUuid,
         closedDuringQuery,
         interruptedDuringQuery,
+        cancelledIpcReceipts,
         pipedMessagesDuringQuery,
       };
     }
@@ -2781,6 +2779,7 @@ async function runQuery(
         lastAssistantUuid,
         closedDuringQuery,
         interruptedDuringQuery,
+        cancelledIpcReceipts,
         pipedMessagesDuringQuery,
       };
     }
@@ -2801,6 +2800,7 @@ async function runQuery(
         lastAssistantUuid,
         closedDuringQuery,
         interruptedDuringQuery,
+        cancelledIpcReceipts,
         pipedMessagesDuringQuery,
       };
     }
@@ -3155,8 +3155,18 @@ async function main(): Promise<void> {
         writeOutput({
           status: 'stream',
           result: null,
-          streamEvent: { eventType: 'status', statusText: 'interrupted' },
+          streamEvent: {
+            eventType: 'status',
+            statusText: 'interrupted',
+            turnId: containerInput.turnId,
+            sessionId,
+          },
           newSessionId: sessionId, // 确保主进程持久化 session ID
+          turnId: containerInput.turnId,
+          sessionId,
+          ...(queryResult.cancelledIpcReceipts?.length
+            ? { ipcReceipts: queryResult.cancelledIpcReceipts }
+            : {}),
         });
         // 清理可能残留的 _interrupt / _drain 文件
         try {
@@ -3172,13 +3182,13 @@ async function main(): Promise<void> {
         clearInterruptRequested();
         consecutiveCompactions = 0;
 
-        // Claude Code-style 排队行为：被中断的 query 已经消费了 pipe 进来的消息，
-        // 但这些消息尚未得到回复。将它们写回 IPC 目录作为新文件，通过 waitForIpcMessage
-        // 正常路径走下一个 query，避免 MCP server "Already connected" 问题 (#421)。
+        // 当前 turn 已由 cancelCurrentTurn() 从未确认列表移除，不能重放；否则热
+        // runner 的旧用户输入会抢在 steer 后再次执行。这里只回放当前 turn 之后
+        // 已经被 SDK 接受、但尚未获得结果的后续 turn（若有）。
         if (queryResult.pipedMessagesDuringQuery.length > 0) {
           const piped = queryResult.pipedMessagesDuringQuery;
           log(
-            `Query interrupted; re-enqueueing ${piped.length} queued message(s) to IPC`,
+            `Query interrupted; re-enqueueing ${piped.length} later accepted message(s) to IPC`,
           );
           requeueIpcInputMessages(IPC_INPUT_DIR, piped);
         }

@@ -24,6 +24,7 @@ import {
   buildStreamingAgentCard,
 } from './feishu-cards/builder.js';
 import type { CardStatus, ToolCallStat } from './feishu-cards/types.js';
+import { formatFeishuUsageNote } from './feishu-usage-display.js';
 import {
   CARD_ELEMENT_IDS,
   statusHeadline,
@@ -450,15 +451,28 @@ function buildAuxiliaryElements(aux: AuxiliaryState): {
       .slice(0, 8);
     const lines = tasks.map((task) => {
       const icon =
-        task.status === 'running' ? '🔄' : task.status === 'completed' ? '✅' : task.status === 'backgrounded' ? '🌙' : '❌';
-      const type = task.subagentType ? ` <font color='grey'>${task.subagentType}</font>` : '';
+        task.status === 'running'
+          ? '🔄'
+          : task.status === 'completed'
+            ? '✅'
+            : task.status === 'backgrounded'
+              ? '🌙'
+              : '❌';
+      const type = task.subagentType
+        ? ` <font color='grey'>${task.subagentType}</font>`
+        : '';
       const last = task.lastToolName ? ` [${task.lastToolName}]` : '';
-      const summary = task.summary ? `\n  <font color='grey'>${task.summary.slice(0, 160)}</font>` : '';
+      const summary = task.summary
+        ? `\n  <font color='grey'>${task.summary.slice(0, 160)}</font>`
+        : '';
       return `${icon} **${task.title.slice(0, 80)}**${type}${last}${summary}`;
     });
     before.push({
       tag: 'markdown',
-      content: `🤖 **子 Agent / Task**\n${lines.join('\n')}`.slice(0, MAX_ELEMENT_CHARS),
+      content: `🤖 **子 Agent / Task**\n${lines.join('\n')}`.slice(
+        0,
+        MAX_ELEMENT_CHARS,
+      ),
       text_size: 'notation',
     });
   }
@@ -670,40 +684,13 @@ function buildSchema2Card(
   };
 }
 
-// ─── Usage Note Formatter ─────────────────────────────────────
-
-function formatUsageNote(usage: {
-  inputTokens: number;
-  outputTokens: number;
-  costUSD: number;
-  durationMs: number;
-  numTurns: number;
-  cacheReadInputTokens?: number;
-}): string {
-  const fmt = (n: number) =>
-    n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n);
-  const parts: string[] = [];
-  let tokenPart = `${fmt(usage.inputTokens)} / ${fmt(usage.outputTokens)} tokens`;
-  if (usage.cacheReadInputTokens && usage.cacheReadInputTokens > 0) {
-    tokenPart += ` (+${fmt(usage.cacheReadInputTokens)} cached)`;
-  }
-  parts.push(tokenPart);
-  if (usage.costUSD > 0) parts.push(`$${usage.costUSD.toFixed(4)}`);
-  if (usage.durationMs > 0)
-    parts.push(`${(usage.durationMs / 1000).toFixed(1)}s`);
-  if (usage.numTurns > 1) parts.push(`${usage.numTurns} turns`);
-  return `💰 ${parts.join(' · ')}`;
-}
-
 /**
  * Pick the primary model name from a per-model usage breakdown — the model that
  * produced the most output tokens (the one that actually generated the reply,
  * not a cheap summarizer/router model). Falls back to the first key.
  */
 function pickPrimaryModel(
-  modelUsage:
-    | Record<string, { outputTokens?: number }>
-    | undefined,
+  modelUsage: Record<string, { outputTokens?: number }> | undefined,
 ): string | undefined {
   if (!modelUsage) return undefined;
   const entries = Object.entries(modelUsage);
@@ -1204,10 +1191,7 @@ class StreamingModeBackend {
    * Replace a whole element (structure + content) via cardElement.update().
    * Used to toggle collapsible_panel expanded state mid-stream.
    */
-  async replaceElement(
-    elementId: string,
-    elementJson: object,
-  ): Promise<void> {
+  async replaceElement(elementId: string, elementJson: object): Promise<void> {
     if (!this.cardId) return;
     return this.enqueue(async () => {
       await this.client.cardkit.v1.cardElement.update({
@@ -1414,10 +1398,7 @@ class MultiCardManager {
     // states render the tail across as many cards as needed so nothing is
     // dropped and no single card overflows.
     const activeText = this.activeView(text);
-    if (
-      state !== 'streaming' &&
-      byteLen(activeText) > FREEZE_SLICE_BYTES
-    ) {
+    if (state !== 'streaming' && byteLen(activeText) > FREEZE_SLICE_BYTES) {
       await this.renderTerminalTail(
         activeText,
         state,
@@ -1517,7 +1498,10 @@ class MultiCardManager {
     footerNote?: string,
   ): boolean {
     const activeText = this.activeView(fullText);
-    const { contentElements } = buildCardContent(activeText, splitCodeBlockSafe);
+    const { contentElements } = buildCardContent(
+      activeText,
+      splitCodeBlockSafe,
+    );
     const auxCount = auxiliaryState
       ? (() => {
           const { before, after } = buildAuxiliaryElements(auxiliaryState);
@@ -1702,25 +1686,25 @@ export class StreamingCardController {
   private creationPromise: Promise<void> | null = null;
 
   // Streaming state
-    private thinking = false;
-    private thinkingText = '';
-    private toolCalls = new Map<string, ToolCallState>();
-    private tasks = new Map<string, TaskRunState>();
-    private startTime = 0;
+  private thinking = false;
+  private thinkingText = '';
+  private toolCalls = new Map<string, ToolCallState>();
+  private tasks = new Map<string, TaskRunState>();
+  private startTime = 0;
   private backendMode: 'streaming' | 'v1' | 'legacy' = 'v1';
 
   // Auxiliary display state
-    private systemStatus: string | null = null;
-    /** 挂起完成状态：本 turn 回复已送达但后台任务/截断续写未结束，卡片保持
-     * 打开等待追加。pendingTasks=null 表示截断自动续写中。任何新 turn 活动
-     * （append/appendThinking/startTool）自动清除。 */
-    private heldOpen: { pendingTasks: number | null } | null = null;
-    private activeHook: { hookName: string; hookEvent: string } | null = null;
-    private todos: Array<{ id: string; content: string; status: string }> | null =
-      null;
-    private recentEvents: Array<{ text: string }> = [];
-    private traceUrl: string | null = null;
-    private stateVersion = 0;
+  private systemStatus: string | null = null;
+  /** 挂起完成状态：本 turn 回复已送达但后台任务/截断续写未结束，卡片保持
+   * 打开等待追加。pendingTasks=null 表示截断自动续写中。任何新 turn 活动
+   * （append/appendThinking/startTool）自动清除。 */
+  private heldOpen: { pendingTasks: number | null } | null = null;
+  private activeHook: { hookName: string; hookEvent: string } | null = null;
+  private todos: Array<{ id: string; content: string; status: string }> | null =
+    null;
+  private recentEvents: Array<{ text: string }> = [];
+  private traceUrl: string | null = null;
+  private stateVersion = 0;
 
   constructor(opts: StreamingCardOptions) {
     this.client = opts.client;
@@ -1918,46 +1902,46 @@ export class StreamingCardController {
   /**
    * Set the todo list for progress panel display.
    */
-    setTodos(
-      todos: Array<{ id: string; content: string; status: string }>,
-    ): void {
-      this.todos = todos;
-      this.stateVersion++;
+  setTodos(
+    todos: Array<{ id: string; content: string; status: string }>,
+  ): void {
+    this.todos = todos;
+    this.stateVersion++;
     if (this.state === 'streaming') {
-        this.backendMode === 'streaming'
-          ? this.scheduleAuxFlush()
-          : this.schedulePatch();
-      }
+      this.backendMode === 'streaming'
+        ? this.scheduleAuxFlush()
+        : this.schedulePatch();
     }
+  }
 
-    updateTask(
-      taskId: string,
-      patch: Partial<Omit<TaskRunState, 'id' | 'updatedAt'>>,
-    ): void {
-      const existing = this.tasks.get(taskId);
-      const next: TaskRunState = {
-        id: taskId,
-        title: patch.title || existing?.title || 'Task',
-        status: patch.status || existing?.status || 'running',
-        subagentType: patch.subagentType ?? existing?.subagentType,
-        lastToolName: patch.lastToolName ?? existing?.lastToolName,
-        summary: patch.summary ?? existing?.summary,
-        updatedAt: Date.now(),
-      };
-      this.tasks.set(taskId, next);
-      this.stateVersion++;
-      if (this.state === 'streaming') {
-        this.backendMode === 'streaming'
-          ? this.scheduleAuxFlush()
-          : this.schedulePatch();
-      }
+  updateTask(
+    taskId: string,
+    patch: Partial<Omit<TaskRunState, 'id' | 'updatedAt'>>,
+  ): void {
+    const existing = this.tasks.get(taskId);
+    const next: TaskRunState = {
+      id: taskId,
+      title: patch.title || existing?.title || 'Task',
+      status: patch.status || existing?.status || 'running',
+      subagentType: patch.subagentType ?? existing?.subagentType,
+      lastToolName: patch.lastToolName ?? existing?.lastToolName,
+      summary: patch.summary ?? existing?.summary,
+      updatedAt: Date.now(),
+    };
+    this.tasks.set(taskId, next);
+    this.stateVersion++;
+    if (this.state === 'streaming') {
+      this.backendMode === 'streaming'
+        ? this.scheduleAuxFlush()
+        : this.schedulePatch();
     }
+  }
 
   /**
    * Push a recent event to the call trace log (FIFO, max MAX_RECENT_EVENTS).
    * Does NOT trigger schedulePatch — piggybacks on other events.
    */
-    pushRecentEvent(text: string): void {
+  pushRecentEvent(text: string): void {
     this.recentEvents.push({ text });
     if (this.recentEvents.length > MAX_RECENT_EVENTS) {
       this.recentEvents = this.recentEvents.slice(-MAX_RECENT_EVENTS);
@@ -1992,12 +1976,12 @@ export class StreamingCardController {
    * Append text to the streaming card.
    * Creates the card on first call, then patches on subsequent calls.
    */
-    append(text: string): void {
-      this.heldOpen = null; // 新 turn 文本到达，退出挂起态
-      this.accumulatedText = text;
-      this.thinking = false; // Text arrived, no longer just thinking
+  append(text: string): void {
+    this.heldOpen = null; // 新 turn 文本到达，退出挂起态
+    this.accumulatedText = text;
+    this.thinking = false; // Text arrived, no longer just thinking
 
-      if (this.state === 'idle') {
+    if (this.state === 'idle') {
       this.state = 'creating';
       this.creationPromise = this.createInitialCard();
       this.creationPromise.catch((err) => {
@@ -2045,11 +2029,11 @@ export class StreamingCardController {
     this.auxFlushCtrl?.dispose();
 
     try {
-        if (this.backendMode === 'streaming' && this.streamingBackend) {
-          await this.finalizeStreamingCard('completed');
-        } else if (this.messageId || this.multiCard) {
-          await this.patchCard('completed', this.traceFooterLink());
-        }
+      if (this.backendMode === 'streaming' && this.streamingBackend) {
+        await this.finalizeStreamingCard('completed');
+      } else if (this.messageId || this.multiCard) {
+        await this.patchCard('completed', this.traceFooterLink());
+      }
     } catch (err) {
       // Revert state so abort() doesn't bail on the 'completed' check
       this.state = prevState;
@@ -2069,6 +2053,7 @@ export class StreamingCardController {
     numTurns: number;
     cacheReadInputTokens?: number;
     cacheCreationInputTokens?: number;
+    reasoningTokens?: number;
     modelUsage?: Record<string, { outputTokens?: number }>;
   }): Promise<void> {
     if (this.state !== 'completed') return;
@@ -2087,7 +2072,7 @@ export class StreamingCardController {
       } else if (this.messageId || this.multiCard) {
         // For CardKit v1 / legacy: skip if multiCard has split content
         if (this.multiCard && this.multiCard.getCardCount() > 1) return;
-        const note = this.mergeFooterNote(formatUsageNote(usage));
+        const note = this.mergeFooterNote(formatFeishuUsageNote(usage));
         if (!note) return;
         await this.patchCard('completed', note);
       }
@@ -2360,26 +2345,26 @@ export class StreamingCardController {
       isThinking: this.thinking,
       toolCalls: this.toolCalls,
       systemStatus: this.systemStatus,
-        activeHook: this.activeHook,
-        todos: this.todos,
-        recentEvents: this.recentEvents,
-        tasks: this.tasks,
-      };
-    }
+      activeHook: this.activeHook,
+      todos: this.todos,
+      recentEvents: this.recentEvents,
+      tasks: this.tasks,
+    };
+  }
 
-    setTraceUrl(url: string | null): void {
-      this.traceUrl = url;
-    }
+  setTraceUrl(url: string | null): void {
+    this.traceUrl = url;
+  }
 
-    private traceFooterLink(): string | undefined {
-      return this.traceUrl ? `[查看完整运行轨迹](${this.traceUrl})` : undefined;
-    }
+  private traceFooterLink(): string | undefined {
+    return this.traceUrl ? `[查看完整运行轨迹](${this.traceUrl})` : undefined;
+  }
 
-    private mergeFooterNote(note?: string): string | undefined {
-      const trace = this.traceFooterLink();
-      if (note && trace) return `${note}\n${trace}`;
-      return note || trace;
-    }
+  private mergeFooterNote(note?: string): string | undefined {
+    const trace = this.traceFooterLink();
+    if (note && trace) return `${note}\n${trace}`;
+    return note || trace;
+  }
 
   // ─── Streaming Mode Methods ──────────────────────────────
 
@@ -2457,7 +2442,9 @@ export class StreamingCardController {
         ? `: ${primary.toolInputSummary.slice(0, 40)}`
         : '';
       const extra =
-        running.length > 1 ? ` <text_tag color='blue'>+${running.length - 1}</text_tag>` : '';
+        running.length > 1
+          ? ` <text_tag color='blue'>+${running.length - 1}</text_tag>`
+          : '';
       return `\`${name}\`${summary}${extra}`;
     }
     if (phase === 'hook') {
@@ -2482,9 +2469,9 @@ export class StreamingCardController {
 
   private buildRichPanelPatches(): {
     statusBanner: string;
-      progressContent?: string;
-      taskContent: string;
-      toolsContent: string;
+    progressContent?: string;
+    taskContent: string;
+    toolsContent: string;
     thinkingContent?: string;
     askContent?: string;
     timelineContent?: string;
@@ -2516,22 +2503,45 @@ export class StreamingCardController {
           )
         : undefined;
 
-      const now = Date.now();
-      const taskViews = Array.from(this.tasks.values())
-        .sort((a, b) => b.updatedAt - a.updatedAt)
-        .slice(0, 10);
-      const taskContent = taskViews.length > 0
-        ? taskViews.map((task) => {
-            const tagColor = task.status === 'running' ? 'blue' : task.status === 'completed' ? 'green' : task.status === 'backgrounded' ? 'grey' : 'red';
-            const tagText = task.status === 'running' ? '运行' : task.status === 'completed' ? '完成' : task.status === 'backgrounded' ? '后台' : '失败';
-            const type = task.subagentType ? ` <font color='grey'>${task.subagentType}</font>` : '';
-            const last = task.lastToolName ? ` <font color='grey'>[${task.lastToolName}]</font>` : '';
-            const summary = task.summary ? `\n  <font color='grey'>${task.summary.slice(0, 180)}</font>` : '';
-            return `<text_tag color='${tagColor}'>${tagText}</text_tag> **${task.title.slice(0, 80)}**${type}${last}${summary}`;
-          }).join('\n')
-        : '<font color=\'grey\'>暂无子任务</font>';
+    const now = Date.now();
+    const taskViews = Array.from(this.tasks.values())
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, 10);
+    const taskContent =
+      taskViews.length > 0
+        ? taskViews
+            .map((task) => {
+              const tagColor =
+                task.status === 'running'
+                  ? 'blue'
+                  : task.status === 'completed'
+                    ? 'green'
+                    : task.status === 'backgrounded'
+                      ? 'grey'
+                      : 'red';
+              const tagText =
+                task.status === 'running'
+                  ? '运行'
+                  : task.status === 'completed'
+                    ? '完成'
+                    : task.status === 'backgrounded'
+                      ? '后台'
+                      : '失败';
+              const type = task.subagentType
+                ? ` <font color='grey'>${task.subagentType}</font>`
+                : '';
+              const last = task.lastToolName
+                ? ` <font color='grey'>[${task.lastToolName}]</font>`
+                : '';
+              const summary = task.summary
+                ? `\n  <font color='grey'>${task.summary.slice(0, 180)}</font>`
+                : '';
+              return `<text_tag color='${tagColor}'>${tagText}</text_tag> **${task.title.slice(0, 80)}**${type}${last}${summary}`;
+            })
+            .join('\n')
+        : "<font color='grey'>暂无子任务</font>";
 
-      // Filter out AskUserQuestion from the tools timeline — it gets its own panel.
+    // Filter out AskUserQuestion from the tools timeline — it gets its own panel.
     const toolViews: ToolCallView[] = Array.from(this.toolCalls.values())
       .filter((tc) => tc.name !== 'AskUserQuestion')
       .map((tc) => ({
@@ -2558,16 +2568,14 @@ export class StreamingCardController {
 
     const timelineContent =
       this.recentEvents.length > 0
-        ? buildTimelineText(
-            this.recentEvents.map((e) => ({ text: e.text })),
-          )
+        ? buildTimelineText(this.recentEvents.map((e) => ({ text: e.text })))
         : undefined;
 
     return {
-        statusBanner,
-        progressContent,
-        taskContent,
-        toolsContent,
+      statusBanner,
+      progressContent,
+      taskContent,
+      toolsContent,
       thinkingContent,
       askContent,
       timelineContent,
@@ -2714,6 +2722,7 @@ export class StreamingCardController {
       numTurns: number;
       cacheReadInputTokens?: number;
       cacheCreationInputTokens?: number;
+      reasoningTokens?: number;
       modelUsage?: Record<string, { outputTokens?: number }>;
     },
   ): object {
@@ -2732,12 +2741,12 @@ export class StreamingCardController {
       ([name, count]) => ({ name, count }),
     );
     const thinking = this.thinkingText.trim() || undefined;
-      return buildAgentReplyCard({
-        status,
-        text: this.accumulatedText || '...',
-        thinking,
-        footer: this.traceFooterLink(),
-        meta: {
+    return buildAgentReplyCard({
+      status,
+      text: this.accumulatedText || '...',
+      thinking,
+      footer: this.traceFooterLink(),
+      meta: {
         toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
         durationMs: usage?.durationMs,
         model: pickPrimaryModel(usage?.modelUsage),
@@ -2745,6 +2754,7 @@ export class StreamingCardController {
         outputTokens: usage?.outputTokens,
         cacheReadInputTokens: usage?.cacheReadInputTokens,
         cacheCreationInputTokens: usage?.cacheCreationInputTokens,
+        reasoningTokens: usage?.reasoningTokens,
         costUSD: usage?.costUSD,
         numTurns: usage?.numTurns,
       },

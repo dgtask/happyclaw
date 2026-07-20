@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronDown, ChevronUp, OctagonX } from 'lucide-react';
+import { ChevronDown, ChevronUp } from 'lucide-react';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { resolveAgentDisplayIdentity } from '../../utils/agent-identity';
@@ -858,16 +858,6 @@ function StreamingContent({
           />
         </div>
       )}
-
-      {/* Interrupted indicator */}
-      {streaming.interrupted && (
-        <div className="mt-3 pt-3 border-t border-border">
-          <div className="flex items-center gap-1.5 text-[13px] text-amber-600">
-            <OctagonX className="w-3.5 h-3.5" />
-            <span>已中断</span>
-          </div>
-        </div>
-      )}
     </>
   );
 }
@@ -1092,7 +1082,7 @@ export function StreamingDisplay({
             <span className="w-1.5 h-1.5 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.15s]" />
             <span className="w-1.5 h-1.5 bg-brand-400 rounded-full animate-bounce" />
             <span className="text-sm text-muted-foreground ml-1">
-              正在思考...
+              正在准备...
             </span>
           </div>
         </div>
@@ -1136,7 +1126,7 @@ export function StreamingDisplay({
                 <span className="w-2 h-2 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.15s]" />
                 <span className="w-2 h-2 bg-brand-400 rounded-full animate-bounce" />
                 <span className="text-sm text-muted-foreground ml-1">
-                  正在思考...
+                  正在准备...
                 </span>
               </div>
             </div>

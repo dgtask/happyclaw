@@ -62,7 +62,7 @@ describe('schema v51 usage event migration', () => {
     raw.close();
 
     db.initDatabase();
-    expect(db.getRouterState('schema_version')).toBe('54');
+    expect(db.getRouterState('schema_version')).toBe('56');
     expect(db.getUsageUsers()).toEqual([
       { id: 'real-owner', username: 'real-owner' },
     ]);
@@ -83,12 +83,13 @@ describe('schema v51 usage event migration', () => {
     expect(
       probe
         .prepare(
-          "SELECT cache_read_input_tokens, cache_creation_input_tokens FROM usage_events WHERE event_id = 'legacy:old-row'",
+          "SELECT cache_read_input_tokens, cache_creation_input_tokens, reasoning_output_tokens FROM usage_events WHERE event_id = 'legacy:old-row'",
         )
         .get(),
     ).toEqual({
       cache_read_input_tokens: 20,
       cache_creation_input_tokens: 5,
+      reasoning_output_tokens: 0,
     });
     probe.close();
 

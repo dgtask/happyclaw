@@ -142,7 +142,7 @@ export function SettingsPage() {
     'host-integration': '宿主机集成',
     billing: '计费管理',
     profile: '个人资料',
-    preferences: '外观与通知',
+    preferences: '常规',
     'my-channels': '消息渠道',
     security: '安全与设备',
     groups: '会话管理',

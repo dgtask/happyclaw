@@ -27,7 +27,8 @@ vi.mock('../src/logger.js', () => ({
 }));
 
 const db = await import('../src/db.js');
-const { recordUsageEvent } = await import('../src/usage-service.js');
+const { deriveUsageEventId, recordUsageEvent } =
+  await import('../src/usage-service.js');
 
 const dbPath = path.join(store, 'messages.db');
 let probe: InstanceType<typeof Database>;
@@ -60,6 +61,30 @@ beforeAll(() => {
     created_at: now,
     updated_at: now,
   });
+  db.createUser({
+    id: 'model-mismatch-user',
+    username: 'model-mismatch-user',
+    password_hash: 'x',
+    display_name: 'Model mismatch user',
+    role: 'member',
+    status: 'active',
+    permissions: [],
+    must_change_password: false,
+    created_at: now,
+    updated_at: now,
+  });
+  db.createUser({
+    id: 'reasoning-user',
+    username: 'reasoning-user',
+    password_hash: 'x',
+    display_name: 'Reasoning user',
+    role: 'member',
+    status: 'active',
+    permissions: [],
+    must_change_password: false,
+    created_at: now,
+    updated_at: now,
+  });
 });
 
 afterAll(() => {
@@ -69,6 +94,46 @@ afterAll(() => {
 });
 
 describe('v51 usage event accounting', () => {
+  test('does not include non-authoritative SDK costs in fallback identity', () => {
+    const base = {
+      userId: 'member-usage',
+      groupFolder: 'identity-workspace',
+      usage: {
+        inputTokens: 1_000,
+        outputTokens: 100,
+        cacheReadInputTokens: 50,
+        cacheCreationInputTokens: 25,
+        costUSD: 1,
+        durationMs: 10,
+        numTurns: 1,
+        modelUsage: {
+          'claude-sonnet-4-5': {
+            inputTokens: 1_000,
+            outputTokens: 100,
+            cacheReadInputTokens: 50,
+            cacheCreationInputTokens: 25,
+            costUSD: 1,
+          },
+        },
+      },
+    };
+    expect(deriveUsageEventId(base)).toBe(
+      deriveUsageEventId({
+        ...base,
+        usage: {
+          ...base.usage,
+          costUSD: 999,
+          modelUsage: {
+            'claude-sonnet-4-5': {
+              ...base.usage.modelUsage['claude-sonnet-4-5'],
+              costUSD: 500,
+            },
+          },
+        },
+      }),
+    );
+  });
+
   test('returns an exact N-calendar-day window', () => {
     expect(db.getUsageDateWindow(7, new Date(2026, 6, 16, 12))).toMatchObject({
       from: '2026-07-10',
@@ -163,7 +228,7 @@ describe('v51 usage event accounting', () => {
     expect(monthly.message_count).toBe(1);
   });
 
-  test('the unified service records zero-cost tokens in quota ledgers', () => {
+  test('counts sub-cent tokens while applying Kaboo bucket rounding', () => {
     recordUsageEvent({
       eventId: 'zero-cost-service-event',
       userId: 'zero-cost-user',
@@ -200,6 +265,150 @@ describe('v51 usage event accounting', () => {
     ).toBe(0);
   });
 
+  test('persists Kaboo reasoning separately while conserving totals, quota and cost', () => {
+    const result = recordUsageEvent({
+      eventId: 'reasoning-split-event',
+      userId: 'reasoning-user',
+      groupFolder: 'reasoning-workspace',
+      source: 'web',
+      createdAt: '2026-07-16T04:00:00.000Z',
+      usage: {
+        eventId: 'reasoning-split-event',
+        inputTokens: 0,
+        outputTokens: 250,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        reasoningTokens: 750,
+        costUSD: 999,
+        durationMs: 10,
+        numTurns: 1,
+        modelUsage: {
+          'claude-sonnet-4-5': {
+            inputTokens: 0,
+            outputTokens: 250,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            reasoningTokens: 750,
+            costUSD: 999,
+          },
+        },
+      },
+    });
+    // $0.015 at Sonnet output/reasoning rates, rounded once like Kaboo.
+    expect(result.providerEstimatedCostUSD).toBe(0.02);
+    const event = probe
+      .prepare(
+        `SELECT output_tokens, reasoning_output_tokens,
+          provider_estimated_cost_usd
+         FROM usage_events WHERE event_id = ?`,
+      )
+      .get('reasoning-split-event') as any;
+    expect(event).toMatchObject({
+      output_tokens: 250,
+      reasoning_output_tokens: 750,
+      provider_estimated_cost_usd: 0.02,
+    });
+    const analytics = db.getUsageAnalytics({
+      from: '2026-07-16',
+      to: '2026-07-16',
+      userId: 'reasoning-user',
+    });
+    expect(analytics.summary).toMatchObject({
+      outputTokens: 250,
+      reasoningTokens: 750,
+      totalTokens: 1_000,
+    });
+    const monthly = probe
+      .prepare(
+        "SELECT total_output_tokens FROM monthly_usage WHERE user_id = 'reasoning-user' AND month = '2026-07'",
+      )
+      .get() as any;
+    expect(monthly.total_output_tokens).toBe(1_000);
+  });
+
+  test('carries sub-cent usage inside one UTC half-hour model bucket', () => {
+    const make = (eventId: string, createdAt: string) =>
+      recordUsageEvent({
+        eventId,
+        userId: 'member-usage',
+        groupFolder: 'workspace-cent-carry',
+        source: 'web',
+        createdAt,
+        usage: {
+          eventId,
+          inputTokens: 1_633,
+          outputTokens: 0,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          costUSD: 999,
+          durationMs: 1,
+          numTurns: 1,
+          modelUsage: {
+            'unlisted-model': {
+              inputTokens: 1_633,
+              outputTokens: 0,
+              cacheReadInputTokens: 0,
+              cacheCreationInputTokens: 0,
+              costUSD: 999,
+            },
+          },
+        },
+      });
+    // Each event is $0.004899 at the Kaboo Sonnet fallback. Per-event
+    // rounding would lose both; one bucket rounds their $0.009798 total to 1¢.
+    expect(make('cent-carry-1', '2026-07-16T06:01:00.000Z')).toMatchObject({
+      providerEstimatedCostUSD: 0,
+      billedCostUSD: 0,
+    });
+    expect(make('cent-carry-2', '2026-07-16T06:20:00.000Z')).toMatchObject({
+      providerEstimatedCostUSD: 0.01,
+      billedCostUSD: 0.01,
+    });
+    expect(
+      db.getUsageAnalytics({
+        from: '2026-07-16',
+        to: '2026-07-16',
+        groupFolder: 'workspace-cent-carry',
+      }).summary.providerEstimatedCostUSD,
+    ).toBe(0.01);
+  });
+
+  test('does not carry rounding residual across UTC half-hour boundaries', () => {
+    const record = (eventId: string, createdAt: string) =>
+      recordUsageEvent({
+        eventId,
+        userId: 'member-usage',
+        groupFolder: 'workspace-cent-boundary',
+        source: 'web',
+        createdAt,
+        usage: {
+          eventId,
+          inputTokens: 1_633,
+          outputTokens: 0,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          costUSD: 999,
+          durationMs: 1,
+          numTurns: 1,
+          modelUsage: {
+            'unlisted-model': {
+              inputTokens: 1_633,
+              outputTokens: 0,
+              cacheReadInputTokens: 0,
+              cacheCreationInputTokens: 0,
+              costUSD: 999,
+            },
+          },
+        },
+      });
+    expect(record('cent-boundary-1', '2026-07-16T06:29:59.999Z')).toMatchObject(
+      { providerEstimatedCostUSD: 0 },
+    );
+    expect(record('cent-boundary-2', '2026-07-16T06:30:00.000Z')).toMatchObject(
+      { providerEstimatedCostUSD: 0 },
+    );
+  });
+
   test('custom Agent uses the same idempotent analytics and balance path', () => {
     const options = {
       eventId: 'custom-agent-paid-turn',
@@ -211,17 +420,18 @@ describe('v51 usage event accounting', () => {
       createdAt: '2026-07-16T04:00:00.000Z',
       usage: {
         eventId: 'custom-agent-paid-turn',
-        inputTokens: 40,
-        outputTokens: 10,
+        inputTokens: 1_000_000,
+        outputTokens: 100_000,
         cacheReadInputTokens: 0,
         cacheCreationInputTokens: 0,
+        // Compatibility-only SDK estimate. Kaboo token pricing is $4.50.
         costUSD: 1.25,
         durationMs: 25,
         numTurns: 1,
         modelUsage: {
           'paid-model': {
-            inputTokens: 40,
-            outputTokens: 10,
+            inputTokens: 1_000_000,
+            outputTokens: 100_000,
             cacheReadInputTokens: 0,
             cacheCreationInputTokens: 0,
             costUSD: 1.25,
@@ -257,13 +467,15 @@ describe('v51 usage event accounting', () => {
       .all() as any[];
     expect(charges).toHaveLength(2);
     expect(charges[0].reference_type).toBe('usage_event');
-    expect(charges[0].amount_usd).toBeCloseTo(-1.25);
-    expect(charges[1].amount_usd).toBeCloseTo(-0.5);
+    expect(charges[0].amount_usd).toBeCloseTo(-4.5);
+    expect(charges[1].amount_usd).toBeCloseTo(-4.5);
     expect(
       (
         probe
           .prepare(
-            "SELECT COUNT(*) AS count FROM billing_audit_log WHERE event_type = 'balance_deducted'",
+            `SELECT COUNT(*) AS count FROM billing_audit_log
+             WHERE event_type = 'balance_deducted'
+               AND json_extract(details, '$.usageEventId') LIKE 'custom-agent-paid-turn%'`,
           )
           .get() as any
       ).count,
@@ -277,7 +489,7 @@ describe('v51 usage event accounting', () => {
     ).toBe(2);
   });
 
-  test('reconciles root cost when a provider omits per-model costs', () => {
+  test('prices root tokens when the SDK omits model costs', () => {
     recordUsageEvent({
       eventId: 'root-cost-only',
       userId: 'member-usage',
@@ -286,24 +498,25 @@ describe('v51 usage event accounting', () => {
       createdAt: '2026-07-16T05:00:00.000Z',
       usage: {
         eventId: 'root-cost-only',
-        inputTokens: 100,
-        outputTokens: 10,
+        inputTokens: 1_000_000,
+        outputTokens: 100_000,
         cacheReadInputTokens: 0,
         cacheCreationInputTokens: 0,
+        // Must not enter analytics or billing.
         costUSD: 2,
         durationMs: 10,
         numTurns: 1,
         modelUsage: {
           'missing-cost-a': {
-            inputTokens: 75,
-            outputTokens: 5,
+            inputTokens: 750_000,
+            outputTokens: 50_000,
             cacheReadInputTokens: 0,
             cacheCreationInputTokens: 0,
             costUSD: 0,
           },
           'missing-cost-b': {
-            inputTokens: 25,
-            outputTokens: 5,
+            inputTokens: 250_000,
+            outputTokens: 50_000,
             cacheReadInputTokens: 0,
             cacheCreationInputTokens: 0,
             costUSD: 0,
@@ -317,14 +530,114 @@ describe('v51 usage event accounting', () => {
       userId: 'member-usage',
       groupFolder: 'workspace-root-cost',
     });
-    expect(analytics.summary.providerEstimatedCostUSD).toBeCloseTo(2);
-    expect(analytics.summary.billedCostUSD).toBeCloseTo(2);
+    expect(analytics.summary.providerEstimatedCostUSD).toBeCloseTo(4.5);
+    expect(analytics.summary.billedCostUSD).toBeCloseTo(4.5);
     expect(
       analytics.attributions.models.reduce(
         (sum, item) => sum + item.providerEstimatedCostUSD,
         0,
       ),
-    ).toBeCloseTo(2);
+    ).toBeCloseTo(4.5);
+  });
+
+  test('rebuilds event and quota roots from authoritative model usage', () => {
+    const result = recordUsageEvent({
+      eventId: 'model-token-mismatch',
+      userId: 'model-mismatch-user',
+      groupFolder: 'workspace-model-mismatch',
+      source: 'main-agent',
+      createdAt: '2026-07-16T05:30:00.000Z',
+      usage: {
+        eventId: 'model-token-mismatch',
+        inputTokens: 1_000_000,
+        outputTokens: 100_000,
+        cacheReadInputTokens: 200_000,
+        cacheCreationInputTokens: 100_000,
+        costUSD: 999,
+        durationMs: 10,
+        numTurns: 1,
+        modelUsage: {
+          'claude-opus-4-5-20251101': {
+            inputTokens: 600_000,
+            outputTokens: 60_000,
+            cacheReadInputTokens: 50_000,
+            cacheCreationInputTokens: 50_000,
+            costUSD: 500,
+          },
+          'claude-haiku-4-5': {
+            inputTokens: 200_000,
+            outputTokens: 40_000,
+            cacheReadInputTokens: 150_000,
+            cacheCreationInputTokens: 25_000,
+            costUSD: 499,
+          },
+        },
+      },
+    });
+
+    expect(result.providerEstimatedCostUSD).toBe(5.29);
+    expect(result.billedCostUSD).toBe(5.29);
+    const event = probe
+      .prepare(
+        `SELECT input_tokens, output_tokens, cache_read_input_tokens,
+          cache_creation_input_tokens, provider_estimated_cost_usd,
+          billed_cost_usd
+         FROM usage_events WHERE event_id = 'model-token-mismatch'`,
+      )
+      .get() as any;
+    expect(event).toMatchObject({
+      input_tokens: 800_000,
+      output_tokens: 100_000,
+      cache_read_input_tokens: 200_000,
+      cache_creation_input_tokens: 75_000,
+      provider_estimated_cost_usd: 5.29,
+      billed_cost_usd: 5.29,
+    });
+    const modelTotals = probe
+      .prepare(
+        `SELECT SUM(input_tokens) AS input_tokens,
+          SUM(output_tokens) AS output_tokens,
+          SUM(cache_read_input_tokens) AS cache_read_input_tokens,
+          SUM(cache_creation_input_tokens) AS cache_creation_input_tokens,
+          SUM(provider_estimated_cost_usd) AS provider_estimated_cost_usd,
+          SUM(billed_cost_usd) AS billed_cost_usd
+         FROM usage_records WHERE event_id = 'model-token-mismatch'`,
+      )
+      .get() as any;
+    expect(modelTotals).toMatchObject({
+      input_tokens: event.input_tokens,
+      output_tokens: event.output_tokens,
+      cache_read_input_tokens: event.cache_read_input_tokens,
+      cache_creation_input_tokens: event.cache_creation_input_tokens,
+    });
+    // SQLite stores USD as REAL, so SUM may expose an IEEE-754 tail.
+    expect(modelTotals.provider_estimated_cost_usd).toBeCloseTo(
+      event.provider_estimated_cost_usd,
+    );
+    expect(modelTotals.billed_cost_usd).toBeCloseTo(event.billed_cost_usd);
+    expect(
+      (
+        probe
+          .prepare(
+            `SELECT COUNT(*) AS count FROM usage_records
+             WHERE event_id = 'model-token-mismatch' AND model = 'unknown'`,
+          )
+          .get() as any
+      ).count,
+    ).toBe(0);
+    const monthly = probe
+      .prepare(
+        `SELECT total_input_tokens, total_output_tokens, total_cost_usd
+         FROM monthly_usage
+         WHERE user_id = 'model-mismatch-user' AND month = '2026-07'`,
+      )
+      .get() as any;
+    expect(monthly).toMatchObject({
+      // Quota input includes uncached input plus cache read and creation.
+      total_input_tokens: 1_075_000,
+      total_output_tokens: 100_000,
+      total_cost_usd: 5.29,
+    });
   });
 
   test('rebuilds a message snapshot from all incremental events', () => {

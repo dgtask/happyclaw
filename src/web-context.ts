@@ -1,7 +1,7 @@
 // Shared state and utilities for web server
 
 import { WebSocket } from 'ws';
-import { RegisteredGroup, UserRole } from './types.js';
+import { FollowUpActionResult, RegisteredGroup, UserRole } from './types.js';
 import { GroupQueue } from './group-queue.js';
 import type {
   AuthUser,
@@ -196,6 +196,27 @@ export interface WebDeps {
     effectiveGroup: RegisteredGroup;
     isHome: boolean;
   };
+  promoteFollowUp?: (
+    chatJid: string,
+    messageId: string,
+    expectedRunId: string,
+  ) => Promise<FollowUpActionResult> | FollowUpActionResult;
+  cancelFollowUp?: (chatJid: string, messageId: string) => FollowUpActionResult;
+  editFollowUp?: (
+    chatJid: string,
+    messageId: string,
+    content: string,
+  ) => FollowUpActionResult;
+  reorderFollowUp?: (
+    chatJid: string,
+    messageId: string,
+    direction: 'up' | 'down',
+  ) => FollowUpActionResult;
+  interruptAndRunFollowUp?: (
+    chatJid: string,
+    messageId: string,
+    expectedRunId: string,
+  ) => FollowUpActionResult;
 }
 
 export type Variables = {

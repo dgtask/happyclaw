@@ -161,6 +161,7 @@ function buildDailyData(
       inputTokens: 0,
       cacheReadTokens: 0,
       cacheCreationTokens: 0,
+      reasoningTokens: 0,
       outputTokens: 0,
       totalTokens: 0,
       providerEstimatedCostUSD: 0,
@@ -176,6 +177,7 @@ function buildDailyData(
       point.inputTokens = row.inputTokens;
       point.cacheReadTokens = row.cacheReadTokens;
       point.cacheCreationTokens = row.cacheCreationTokens;
+      point.reasoningTokens = row.reasoningTokens;
       point.outputTokens = row.outputTokens;
       point.totalTokens = row.totalTokens;
       point.providerEstimatedCostUSD = row.providerEstimatedCostUSD;
@@ -191,12 +193,14 @@ function buildDailyData(
     point.inputTokens += row.input_tokens;
     point.cacheReadTokens += row.cache_read_tokens;
     point.cacheCreationTokens += row.cache_creation_tokens;
+    point.reasoningTokens += row.reasoning_tokens;
     point.outputTokens += row.output_tokens;
     point.totalTokens +=
       row.input_tokens +
       row.cache_read_tokens +
       row.cache_creation_tokens +
-      row.output_tokens;
+      row.output_tokens +
+      row.reasoning_tokens;
     point.providerEstimatedCostUSD += row.provider_estimated_cost_usd;
     if (row.billed_cost_usd !== null) {
       point.billedCostUSD = (point.billedCostUSD || 0) + row.billed_cost_usd;
@@ -250,7 +254,8 @@ function buildAttributionRows(
       item.input_tokens +
       item.cache_read_tokens +
       item.cache_creation_tokens +
-      item.output_tokens;
+      item.output_tokens +
+      item.reasoning_tokens;
     existing.estimatedCost += item.provider_estimated_cost_usd;
     if (item.billed_cost_usd !== null) {
       existing.billedCost = (existing.billedCost || 0) + item.billed_cost_usd;
@@ -299,6 +304,7 @@ function buildFallbackCsv(rows: UsageBreakdown[]): string {
     '缓存读取 Token',
     '缓存写入 Token',
     '输出 Token',
+    '推理 Token',
     '模型估算费用 USD',
     '账单扣费 USD',
     'Agent 运行次数',
@@ -316,6 +322,7 @@ function buildFallbackCsv(rows: UsageBreakdown[]): string {
       row.cache_read_tokens,
       row.cache_creation_tokens,
       row.output_tokens,
+      row.reasoning_tokens,
       row.provider_estimated_cost_usd,
       row.billed_cost_usd,
       row.run_count,
@@ -793,12 +800,12 @@ export function UsagePage() {
                     Token 构成
                   </h2>
                   <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                    四类互斥，不重复相加。缓存读取占全部输入的{' '}
+                    五类互斥，不重复相加。缓存读取占全部输入的{' '}
                     {cacheReadShare.toFixed(1)}%；公式：缓存读取 ÷（普通输入 +
                     缓存读取 + 缓存写入）。
                   </p>
                 </div>
-                <dl className="grid min-w-0 grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-4">
+                <dl className="grid min-w-0 grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-5">
                   <TokenValue
                     label="普通输入"
                     value={visibleSummary.inputTokens}
@@ -815,6 +822,10 @@ export function UsagePage() {
                     label="输出"
                     value={visibleSummary.outputTokens}
                   />
+                  <TokenValue
+                    label="推理"
+                    value={visibleSummary.reasoningTokens}
+                  />
                 </dl>
               </div>
             </section>
@@ -827,8 +838,8 @@ export function UsagePage() {
                       每日趋势
                     </h2>
                     <p className="mt-0.5 text-xs text-muted-foreground">
-                      费用均为模型/API 估算值；运行次数按完成的 Agent
-                      用量事件计数。
+                      费用按咖宝模型价格在 UTC 30
+                      分钟桶内统一取整；运行次数按完成的 Agent 用量事件计数。
                     </p>
                   </div>
                   <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
@@ -940,7 +951,8 @@ export function UsagePage() {
             <aside className="flex items-start gap-2 rounded-xl border border-border bg-muted/20 p-4 text-xs leading-5 text-muted-foreground">
               <Info className="mt-0.5 size-4 shrink-0" />
               <p>
-                模型估算费用来自运行时上报的模型成本，可能与套餐倍率、赠送额度或实际账单扣费不同。
+                模型估算费用按咖宝价格表和 UTC 30
+                分钟模型桶计算，可能与套餐倍率、赠送额度或实际账单扣费不同。
                 {billingFeatureEnabled && (
                   <>
                     需要核对余额和交易时，请前往{' '}
@@ -1112,6 +1124,7 @@ function UsageTrendTable({
                 <th className="px-3 py-3 text-right font-medium">缓存读取</th>
                 <th className="px-3 py-3 text-right font-medium">缓存写入</th>
                 <th className="px-3 py-3 text-right font-medium">输出</th>
+                <th className="px-3 py-3 text-right font-medium">推理</th>
                 <th className="px-3 py-3 text-right font-medium">合计</th>
               </>
             )}
@@ -1147,6 +1160,7 @@ function UsageTrendTable({
                   <NumberCell value={formatTokens(row.cacheReadTokens)} />
                   <NumberCell value={formatTokens(row.cacheCreationTokens)} />
                   <NumberCell value={formatTokens(row.outputTokens)} />
+                  <NumberCell value={formatTokens(row.reasoningTokens)} />
                   <NumberCell value={formatTokens(row.totalTokens)} strong />
                 </>
               )}

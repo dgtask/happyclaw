@@ -86,10 +86,19 @@ describe('agent-runner IPC delivery turn tracker', () => {
     tracker.acceptTurn([message('1')]);
     tracker.acceptTurn([message('2')]);
 
+    expect(tracker.pendingTurnCount).toBe(3);
+    expect(tracker.hasPendingTurns).toBe(true);
     expect(tracker.completeNextTurn()).toEqual([]); // initial non-IPC prompt
+    // The first result completed, but two accepted steer turns are still
+    // waiting in the same SDK stream. The runner must not arm its 5s close
+    // timeout or tell the host to release a durable queued message yet.
+    expect(tracker.pendingTurnCount).toBe(2);
+    expect(tracker.hasPendingTurns).toBe(true);
     expect(tracker.completeNextTurn().map((r) => r.cursor.id)).toEqual(['1']);
     expect(tracker.unacknowledgedMessages.map((m) => m.text)).toEqual(['2']);
     expect(tracker.completeNextTurn().map((r) => r.cursor.id)).toEqual(['2']);
+    expect(tracker.pendingTurnCount).toBe(0);
+    expect(tracker.hasPendingTurns).toBe(false);
   });
 
   test('pending background, truncation, error and interrupt are not completions', () => {
@@ -135,6 +144,22 @@ describe('agent-runner IPC delivery turn tracker', () => {
     expect(replayed.map((item) => item.receipt)).toEqual(
       pending.map((item) => item.receipt),
     );
+  });
+
+  test('intentional interrupt cancels the current warm-runner turn but preserves later turns', () => {
+    const current = message('superseded');
+    const laterOne = message('later-1');
+    const laterTwo = message('later-2');
+    const tracker = new IpcTurnDeliveryTracker([current]);
+    tracker.acceptTurn([laterOne]);
+    tracker.acceptTurn([laterTwo]);
+
+    expect(tracker.cancelCurrentTurn()).toEqual([current]);
+    expect(tracker.unacknowledgedMessages).toEqual([laterOne, laterTwo]);
+    expect(tracker.pendingTurnCount).toBe(2);
+
+    expect(tracker.completeNextTurn()).toEqual([laterOne.receipt]);
+    expect(tracker.unacknowledgedMessages).toEqual([laterTwo]);
   });
 
   test('parses and preserves the exact covered cursor set for a batch', () => {

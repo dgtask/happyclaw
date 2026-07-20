@@ -121,6 +121,35 @@ export class IpcTurnDeliveryTracker {
     this.turns.push([...messages]);
   }
 
+  /** Number of accepted user-input turns that have not produced a healthy SDK
+   * result yet. A result can complete the current turn while a steer message is
+   * already queued inside the same SDK stream; callers must keep that stream
+   * alive until this reaches zero. */
+  get pendingTurnCount(): number {
+    return this.turns.length;
+  }
+
+  get hasPendingTurns(): boolean {
+    return this.turns.length > 0;
+  }
+
+  /**
+   * Intentionally cancel only the input turn currently owned by the aborted
+   * SDK query. Later accepted turns remain unacknowledged and can be requeued.
+   *
+   * This distinction matters for warm runners: their initial IPC message is
+   * part of `unacknowledgedMessages`. Requeueing that message after a user
+   * steer would replay the superseded prompt before the steering prompt.
+   */
+  cancelCurrentTurn(): IpcInputMessage[] {
+    const cancelled = this.turns.shift() ?? [];
+    for (const message of cancelled) {
+      const index = this.unacknowledgedMessages.indexOf(message);
+      if (index >= 0) this.unacknowledgedMessages.splice(index, 1);
+    }
+    return cancelled;
+  }
+
   completeNextTurn(): IpcDeliveryReceipt[] {
     const completed = this.turns.shift() ?? [];
     for (const message of completed) {

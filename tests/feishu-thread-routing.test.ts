@@ -4,7 +4,9 @@ import { StreamingCardController } from '../src/feishu-streaming-card.js';
 
 describe('parseFeishuRouteTarget', () => {
   test('parses thread/root metadata and marks thread replies', () => {
-    expect(parseFeishuRouteTarget('oc_123#thread:omt_thread#root:om_root')).toEqual({
+    expect(
+      parseFeishuRouteTarget('oc_123#thread:omt_thread#root:om_root'),
+    ).toEqual({
       raw: 'oc_123#thread:omt_thread#root:om_root',
       chatId: 'oc_123',
       threadId: 'omt_thread',
@@ -26,7 +28,9 @@ describe('parseFeishuRouteTarget', () => {
 
 describe('StreamingCardController Feishu thread reply', () => {
   test('passes reply_in_thread when creating the initial streaming card', async () => {
-    const reply = vi.fn().mockResolvedValue({ data: { message_id: 'om_card' } });
+    const reply = vi
+      .fn()
+      .mockResolvedValue({ data: { message_id: 'om_card' } });
     const client = {
       cardkit: {
         v1: {
@@ -59,12 +63,16 @@ describe('StreamingCardController Feishu thread reply', () => {
 
   test('preserves trace link when usage patch updates a legacy completed card', async () => {
     const patch = vi.fn().mockResolvedValue({});
-    const create = vi.fn().mockResolvedValue({ data: { message_id: 'om_card' } });
+    const create = vi
+      .fn()
+      .mockResolvedValue({ data: { message_id: 'om_card' } });
     const client = {
       cardkit: {
         v1: {
           card: {
-            create: vi.fn().mockRejectedValue(new Error('streaming unavailable')),
+            create: vi
+              .fn()
+              .mockRejectedValue(new Error('streaming unavailable')),
           },
           cardElement: {},
         },
@@ -95,6 +103,6 @@ describe('StreamingCardController Feishu thread reply', () => {
     const finalContent = patch.mock.calls.at(-1)?.[0]?.data?.content;
     expect(finalContent).toContain('查看完整运行轨迹');
     expect(finalContent).toContain('happy.example/chat/main');
-    expect(finalContent).toContain('10 / 5 tokens');
+    expect(finalContent).toContain('15 tokens（输入 10 · 输出 5）');
   });
 });

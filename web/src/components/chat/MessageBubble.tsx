@@ -24,6 +24,13 @@ import { mediumTap } from '../../hooks/useHaptic';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { formatThinkingDuration } from '../../utils/thinking-duration';
 import { resolveAgentDisplayIdentity } from '../../utils/agent-identity';
+import { getPresentedMessageContent } from '../../lib/message-presentation';
+import { getMessageDisplayTimestamp } from '../../lib/message-timeline';
+import {
+  getAuthoritativeTokenBreakdown,
+  getPrimaryModelUsage,
+  parseTokenUsage,
+} from '../../lib/token-usage-presentation';
 
 const ShareImageDialog = lazy(() =>
   import('./ShareImageDialog').then((m) => ({ default: m.ShareImageDialog })),
@@ -101,39 +108,13 @@ function ReasoningBlock({
 
 /** Parse and display token usage for AI messages */
 function TokenUsageDisplay({ tokenUsageJson }: { tokenUsageJson: string }) {
-  const usage = (() => {
-    try {
-      return JSON.parse(tokenUsageJson) as {
-        inputTokens?: number;
-        outputTokens?: number;
-        cacheReadInputTokens?: number;
-        cacheCreationInputTokens?: number;
-        costUSD?: number;
-        durationMs?: number;
-        numTurns?: number;
-        modelUsage?: Record<
-          string,
-          { inputTokens: number; outputTokens: number; costUSD: number }
-        >;
-      };
-    } catch {
-      return null;
-    }
-  })();
+  const usage = parseTokenUsage(tokenUsageJson);
 
   if (!usage) return null;
 
-  const models = usage.modelUsage ? Object.entries(usage.modelUsage) : [];
   // 主模型 = 费用最高的（即用户指定的模型），内部模型不向用户展示
-  models.sort((a, b) => (b[1].costUSD || 0) - (a[1].costUSD || 0));
-  const primary = models.length > 0 ? models[0] : null;
-  const primaryInput = primary
-    ? primary[1].inputTokens
-    : usage.inputTokens || 0;
-  const primaryOutput = primary
-    ? primary[1].outputTokens
-    : usage.outputTokens || 0;
-  const totalTokens = primaryInput + primaryOutput;
+  const primary = getPrimaryModelUsage(usage);
+  const breakdown = getAuthoritativeTokenBreakdown(usage);
 
   const formatNum = (n: number): string => {
     if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -143,7 +124,7 @@ function TokenUsageDisplay({ tokenUsageJson }: { tokenUsageJson: string }) {
 
   const summaryContent = (
     <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-default">
-      <span>{formatNum(totalTokens)} tokens</span>
+      <span>{formatNum(breakdown.totalTokens)} tokens</span>
       {usage.durationMs ? (
         <>
           <span className="opacity-40">·</span>
@@ -153,7 +134,7 @@ function TokenUsageDisplay({ tokenUsageJson }: { tokenUsageJson: string }) {
     </span>
   );
 
-  const hasDetails = primary || (usage.cacheReadInputTokens || 0) > 0;
+  const hasDetails = breakdown.totalTokens > 0 || primary !== null;
 
   if (!hasDetails) {
     return <div className="mt-1.5">{summaryContent}</div>;
@@ -167,18 +148,27 @@ function TokenUsageDisplay({ tokenUsageJson }: { tokenUsageJson: string }) {
           <TooltipContent side="bottom" align="start">
             <div className="text-xs space-y-0.5">
               {primary && (
-                <div className="opacity-70 font-medium mb-1">{primary[0]}</div>
-              )}
-              {primary && (
-                <div>
-                  In {formatNum(primaryInput)} / Out {formatNum(primaryOutput)}
+                <div className="opacity-70 font-medium mb-1">
+                  主模型：{primary[0]}
                 </div>
               )}
-              {(usage.cacheReadInputTokens || 0) > 0 && (
+              <div>
+                输入 {formatNum(breakdown.inputTokens)} / 输出{' '}
+                {formatNum(breakdown.outputTokens)}
+              </div>
+              {(breakdown.cacheReadInputTokens > 0 ||
+                breakdown.cacheCreationInputTokens > 0 ||
+                breakdown.reasoningTokens > 0) && (
                 <div className="opacity-70">
-                  Read {formatNum(usage.cacheReadInputTokens || 0)}
-                  {(usage.cacheCreationInputTokens || 0) > 0 &&
-                    ` / Write ${formatNum(usage.cacheCreationInputTokens || 0)}`}
+                  缓存读取 {formatNum(breakdown.cacheReadInputTokens)} /
+                  缓存写入 {formatNum(breakdown.cacheCreationInputTokens)} /
+                  推理 {formatNum(breakdown.reasoningTokens)}
+                </div>
+              )}
+              {primary && (
+                <div className="opacity-70">
+                  主模型输入 {formatNum(primary[1].inputTokens || 0)} / 输出{' '}
+                  {formatNum(primary[1].outputTokens || 0)}
                 </div>
               )}
             </div>
@@ -230,7 +220,12 @@ export const MessageBubble = memo(
     });
     const { mode: displayMode } = useDisplayMode();
     const isUser = !message.is_from_me;
-    const time = new Date(message.timestamp)
+    const presentedContent = getPresentedMessageContent(message);
+    const presentedMessage =
+      presentedContent === message.content
+        ? message
+        : { ...message, content: presentedContent };
+    const time = new Date(getMessageDisplayTimestamp(message))
       .toLocaleString('zh-CN', {
         year: 'numeric',
         month: '2-digit',
@@ -258,16 +253,16 @@ export const MessageBubble = memo(
     );
 
     // Check if content is empty (only whitespace) and we have images
-    const hasOnlyImages = !message.content.trim() && images.length > 0;
+    const hasOnlyImages = !presentedContent.trim() && images.length > 0;
 
     const handleCopy = async () => {
       try {
-        await navigator.clipboard.writeText(message.content);
+        await navigator.clipboard.writeText(presentedContent);
         setCopied(true);
         setTimeout(() => setCopied(false), 1500);
       } catch {
         const textarea = document.createElement('textarea');
-        textarea.value = message.content;
+        textarea.value = presentedContent;
         textarea.style.position = 'fixed';
         textarea.style.opacity = '0';
         document.body.appendChild(textarea);
@@ -465,13 +460,13 @@ export const MessageBubble = memo(
             <div className="min-w-0 overflow-hidden [&>div>*:first-child]:!mt-0">
               {isAI ? (
                 <MarkdownRenderer
-                  content={message.content}
+                  content={presentedContent}
                   groupJid={message.chat_jid}
                   variant="chat"
                 />
               ) : (
                 <p className="text-[15px] leading-relaxed whitespace-pre-wrap break-words text-foreground">
-                  {message.content}
+                  {presentedContent}
                 </p>
               )}
             </div>
@@ -491,7 +486,7 @@ export const MessageBubble = memo(
           )}
           {contextMenu && (
             <MessageContextMenu
-              content={message.content}
+              content={presentedContent}
               position={contextMenu}
               onClose={() => setContextMenu(null)}
               chatJid={message.chat_jid}
@@ -503,7 +498,7 @@ export const MessageBubble = memo(
             <Suspense>
               <ShareImageDialog
                 onClose={() => setShowShareDialog(false)}
-                message={message}
+                message={presentedMessage}
                 agentName={agentIdentity.name}
                 agentAvatarUrl={agentAvatarUrl}
                 agentAvatarEmoji={agentAvatarEmoji}
@@ -541,7 +536,7 @@ export const MessageBubble = memo(
               {!hasOnlyImages && (
                 <div className="bg-muted text-foreground px-4 py-2.5 rounded-2xl rounded-tr-sm">
                   <p className="text-[15px] leading-relaxed whitespace-pre-wrap break-words">
-                    {message.content}
+                    {presentedContent}
                   </p>
                 </div>
               )}
@@ -572,7 +567,7 @@ export const MessageBubble = memo(
           )}
           {contextMenu && (
             <MessageContextMenu
-              content={message.content}
+              content={presentedContent}
               position={contextMenu}
               onClose={() => setContextMenu(null)}
               chatJid={message.chat_jid}
@@ -657,7 +652,7 @@ export const MessageBubble = memo(
               {!hasOnlyImages && (
                 <div className="max-w-none overflow-hidden">
                   <MarkdownRenderer
-                    content={message.content}
+                    content={presentedContent}
                     groupJid={message.chat_jid}
                     variant="chat"
                   />
@@ -713,7 +708,7 @@ export const MessageBubble = memo(
         )}
         {contextMenu && (
           <MessageContextMenu
-            content={message.content}
+            content={presentedContent}
             position={contextMenu}
             onClose={() => setContextMenu(null)}
             chatJid={message.chat_jid}
@@ -725,7 +720,7 @@ export const MessageBubble = memo(
           <Suspense>
             <ShareImageDialog
               onClose={() => setShowShareDialog(false)}
-              message={message}
+              message={presentedMessage}
               agentName={agentIdentity.name}
               agentAvatarUrl={agentAvatarUrl}
               agentAvatarEmoji={agentAvatarEmoji}

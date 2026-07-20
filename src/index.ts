@@ -27,6 +27,14 @@ import {
   shouldSkipRetryAfterLateError,
   type IpcReplyTurnTracker,
 } from './reply-delivery.js';
+import {
+  buildInterruptedReply,
+  buildSteeredReply,
+  buildStoppedReply,
+} from './reply-finalization.js';
+export { buildInterruptedReply } from './reply-finalization.js';
+import { SteeringTransitionRegistry } from './steering-transition.js';
+import { resolveFeishuFollowUpMode } from './follow-up-policy.js';
 import { discardStartupTypedIpcDeliveries } from './ipc-delivery-recovery.js';
 import {
   DeferredOutOfBandCursorLedger,
@@ -127,6 +135,17 @@ import {
   listEnabledChannelAccounts,
   updateChannelAccountAuthStatus,
   updateChannelAccountStatus,
+  cancelQueuedFollowUp,
+  claimNextQueuedFollowUp,
+  getQueuedFollowUp,
+  getQueuedFollowUpChatJids,
+  listQueuedFollowUps,
+  moveQueuedFollowUp,
+  prioritizeQueuedFollowUp,
+  releaseQueuedFollowUp,
+  restorePromotingFollowUp,
+  setMessageFollowUp,
+  updateQueuedFollowUpContent,
 } from './db.js';
 import {
   buildSessionMountUpdate,
@@ -147,7 +166,10 @@ import {
   extractChatId,
   type StreamingSession,
 } from './im-channel.js';
-import { parseChannelAddress } from './channel-address.js';
+import {
+  channelConversationJid,
+  parseChannelAddress,
+} from './channel-address.js';
 import {
   matchesChannelAccountAuthorization,
   matchesChannelPairTarget,
@@ -278,6 +300,9 @@ import {
   StreamEvent,
   SubAgent,
   ChannelAccount,
+  FollowUpMode,
+  QueuedFollowUp,
+  FollowUpActionResult,
 } from './types.js';
 import {
   buildNativeThreadRouteJid,
@@ -315,6 +340,7 @@ import {
   shutdownWebServer,
   getActiveStreamingTexts,
   clearStreamingSnapshot,
+  broadcastFollowUpUpdate,
 } from './web.js';
 import { installSkillForUser, deleteSkillForUser } from './routes/skills.js';
 import { verifyPairingCode } from './telegram-pairing.js';
@@ -1030,6 +1056,8 @@ function mergeHeldUsage(
           cacheCreationInputTokens:
             (prev.cacheCreationInputTokens || 0) +
             (mu.cacheCreationInputTokens || 0),
+          reasoningTokens:
+            (prev.reasoningTokens || 0) + (mu.reasoningTokens || 0),
           costUSD: (prev.costUSD || 0) + (mu.costUSD || 0),
         }
       : { ...mu };
@@ -1042,6 +1070,7 @@ function mergeHeldUsage(
     cacheCreationInputTokens:
       (base.cacheCreationInputTokens || 0) +
       (next.cacheCreationInputTokens || 0),
+    reasoningTokens: (base.reasoningTokens || 0) + (next.reasoningTokens || 0),
     costUSD: (base.costUSD || 0) + (next.costUSD || 0),
     durationMs: (base.durationMs || 0) + (next.durationMs || 0),
     numTurns: (base.numTurns || 0) + (next.numTurns || 0),
@@ -1053,6 +1082,381 @@ function mergeHeldUsage(
 // activeRouteUpdaters（用户消息注入时必经），Sub-Agent 注入点不走 route updater，
 // 由 web.ts / 消息循环在注入成功回调里显式触发。
 const activeHeldCardFinalizers = new Map<string, () => void>();
+
+interface PreparedFollowUp {
+  messages: NewMessage[];
+  replyText?: string;
+}
+
+function resolveFollowUpRuntime(chatJid: string): {
+  baseChatJid: string;
+  agentId: string | null;
+  effectiveGroup: RegisteredGroup;
+} | null {
+  const marker = '#agent:';
+  const markerIndex = chatJid.indexOf(marker);
+  const baseChatJid =
+    markerIndex >= 0 ? chatJid.slice(0, markerIndex) : chatJid;
+  const agentId =
+    markerIndex >= 0 ? chatJid.slice(markerIndex + marker.length) : null;
+  let group = registeredGroups[baseChatJid] ?? getRegisteredGroup(baseChatJid);
+  if (!group && agentId) {
+    const agent = getAgent(agentId);
+    if (agent) {
+      group =
+        registeredGroups[agent.chat_jid] ?? getRegisteredGroup(agent.chat_jid);
+    }
+  }
+  if (!group) return null;
+  return {
+    baseChatJid,
+    agentId,
+    effectiveGroup: resolveEffectiveGroup(group).effectiveGroup,
+  };
+}
+
+async function prepareFollowUp(
+  item: QueuedFollowUp,
+): Promise<PreparedFollowUp> {
+  const runtime = resolveFollowUpRuntime(item.chat_jid);
+  if (!runtime) return { messages: [item] };
+  const expandContext = buildExpandContext(
+    item.chat_jid,
+    runtime.effectiveGroup,
+    runtime.effectiveGroup.created_by,
+  );
+  if (!expandContext) return { messages: [item] };
+  const { toSend, replies } = await expandMessagesIfNeeded(
+    [item],
+    expandContext,
+    undefined,
+    persistPluginExpansion,
+  );
+  return {
+    messages: toSend,
+    replyText: replies[0]?.text,
+  };
+}
+
+function completeFollowUpReply(
+  item: QueuedFollowUp,
+  replyText: string,
+): boolean {
+  const runId = item.delivery_run_id || crypto.randomUUID();
+  const deliveryUpdatedAt = new Date().toISOString();
+  const released = releaseQueuedFollowUp(
+    item.chat_jid,
+    item.id,
+    runId,
+    deliveryUpdatedAt,
+  );
+  if (!released) return false;
+  const sourceJid = item.source_jid || item.chat_jid;
+  sendPluginExpanderReply(
+    item.chat_jid,
+    replyText,
+    getChannelType(sourceJid) ? sourceJid : null,
+  );
+  completeOutOfBandMessage(item.chat_jid, {
+    timestamp: item.timestamp,
+    id: item.id,
+  });
+  broadcastFollowUpUpdate(item.chat_jid, {
+    id: item.id,
+    delivery_status: 'released',
+    delivery_run_id: runId,
+    delivery_updated_at: deliveryUpdatedAt,
+  });
+  return true;
+}
+
+function enqueueReleasedFollowUp(item: QueuedFollowUp): void {
+  const runtime = resolveFollowUpRuntime(item.chat_jid);
+  if (runtime?.agentId) {
+    queue.enqueueTask(item.chat_jid, `follow-up:${item.id}`, async () => {
+      await processAgentConversation(runtime.baseChatJid, runtime.agentId!);
+    });
+    return;
+  }
+  queue.enqueueMessageCheck(item.chat_jid);
+}
+
+function injectPreparedFollowUp(
+  item: QueuedFollowUp,
+  prepared: PreparedFollowUp,
+  runId: string,
+): 'sent' | 'no_active' | 'cancelled' {
+  if (!getQueuedFollowUp(item.chat_jid, item.id)) return 'cancelled';
+  const sourceJid = item.source_jid || item.chat_jid;
+  const deliveryTarget = createIpcDeliveryTarget(item.chat_jid, [item]);
+  const images = collectMessageImages(item.chat_jid, prepared.messages);
+  const runtime = resolveFollowUpRuntime(item.chat_jid);
+  const result = queue.sendMessage(
+    item.chat_jid,
+    formatMessages(prepared.messages),
+    images.length > 0 ? images : undefined,
+    (receipt) => {
+      if (runtime?.agentId) {
+        activeHeldCardFinalizers.get(item.chat_jid)?.();
+      } else if (runtime) {
+        activeRouteUpdaters.get(runtime.effectiveGroup.folder)?.(
+          sourceJid,
+          receipt?.deliveryId,
+          receipt?.cursor,
+        );
+      }
+    },
+    sourceJid,
+    undefined,
+    deliveryTarget,
+  );
+
+  if (result === 'sent') {
+    const deliveryUpdatedAt = new Date().toISOString();
+    const released = releaseQueuedFollowUp(
+      item.chat_jid,
+      item.id,
+      runId,
+      deliveryUpdatedAt,
+    );
+    if (!released) {
+      logger.error(
+        { chatJid: item.chat_jid, messageId: item.id, runId },
+        'Follow-up was injected but its durable queue claim could not be released',
+      );
+    }
+    if (deliveryTarget) {
+      advanceNextPullCursorOnly(item.chat_jid, deliveryTarget.cursor);
+    }
+    broadcastFollowUpUpdate(
+      item.chat_jid,
+      released
+        ? {
+            id: item.id,
+            delivery_status: 'released',
+            delivery_run_id: runId,
+            delivery_updated_at: deliveryUpdatedAt,
+          }
+        : undefined,
+    );
+    return 'sent';
+  }
+
+  // The runner disappeared between preparation and injection. Make the row
+  // visible to the normal cold-start reader so it can be recovered safely.
+  const deliveryUpdatedAt = new Date().toISOString();
+  const released = releaseQueuedFollowUp(
+    item.chat_jid,
+    item.id,
+    runId,
+    deliveryUpdatedAt,
+  );
+  broadcastFollowUpUpdate(
+    item.chat_jid,
+    released
+      ? {
+          id: item.id,
+          delivery_status: 'released',
+          delivery_run_id: runId,
+          delivery_updated_at: deliveryUpdatedAt,
+        }
+      : undefined,
+  );
+  enqueueReleasedFollowUp(item);
+  return 'no_active';
+}
+
+async function dispatchNextQueuedFollowUp(chatJid: string): Promise<void> {
+  const reservedRunId = queue.reserveNextQuery(chatJid);
+  if (!reservedRunId) return;
+  const item = claimNextQueuedFollowUp(chatJid, reservedRunId);
+  if (!item) {
+    queue.releaseQueryReservation(chatJid, reservedRunId);
+    return;
+  }
+  queue.announceReservedQuery(chatJid, reservedRunId);
+  item.delivery_run_id = reservedRunId;
+  item.delivery_status = 'promoting';
+  broadcastFollowUpUpdate(chatJid);
+
+  try {
+    const prepared = await prepareFollowUp(item);
+    if (!getQueuedFollowUp(chatJid, item.id)) {
+      queue.releaseQueryReservation(chatJid, reservedRunId, true);
+      return;
+    }
+    if (prepared.replyText && prepared.messages.length === 0) {
+      completeFollowUpReply(item, prepared.replyText);
+      queue.releaseQueryReservation(chatJid, reservedRunId, true);
+      return;
+    }
+    const result = injectPreparedFollowUp(item, prepared, reservedRunId);
+    if (result !== 'sent') {
+      queue.releaseQueryReservation(chatJid, reservedRunId);
+    }
+  } catch (err) {
+    restorePromotingFollowUp(chatJid, item.id);
+    queue.releaseQueryReservation(chatJid, reservedRunId);
+    broadcastFollowUpUpdate(chatJid);
+    logger.error(
+      { err, chatJid, messageId: item.id },
+      'Failed to prepare queued follow-up',
+    );
+    const retryTimer = setTimeout(() => {
+      void dispatchNextQueuedFollowUp(chatJid);
+    }, 1_000);
+    retryTimer.unref();
+  }
+}
+
+function dispatchQueuedFollowUpFamily(completedChatJid: string): void {
+  // A running workspace may be addressed through a sibling Web/IM JID that
+  // resolves to the same serialized runner. Try the completing JID first, then
+  // every durable queue. reserveNextQuery() atomically lets only the first JID
+  // from this runner family claim the next turn.
+  const candidates = new Set([
+    completedChatJid,
+    ...getQueuedFollowUpChatJids(),
+  ]);
+  for (const chatJid of candidates) {
+    void dispatchNextQueuedFollowUp(chatJid);
+  }
+}
+
+function promoteFollowUp(
+  chatJid: string,
+  messageId: string,
+  expectedRunId: string,
+): FollowUpActionResult {
+  // Resolve the run at click time. A queued card can outlive the run it was
+  // created under; explicitly sending it now must behave like a fresh direct
+  // steer, not fail because its original run id became stale.
+  const activeRunId = queue.getActiveQueryId(chatJid);
+  const item = prioritizeQueuedFollowUp(
+    chatJid,
+    messageId,
+    activeRunId ?? expectedRunId,
+  );
+  if (!item) {
+    return { ok: false, message: '这条排队消息已被处理或取消。' };
+  }
+  broadcastFollowUpUpdate(chatJid);
+  if (!activeRunId) {
+    dispatchQueuedFollowUpFamily(chatJid);
+    return {
+      ok: true,
+      state: 'queued',
+      message: '当前回复已结束，这条消息将作为下一轮优先发送。',
+      item,
+    };
+  }
+  return interruptAndRunFollowUp(chatJid, messageId, activeRunId);
+}
+
+function cancelFollowUp(
+  chatJid: string,
+  messageId: string,
+): FollowUpActionResult {
+  const deliveryUpdatedAt = new Date().toISOString();
+  const item = cancelQueuedFollowUp(chatJid, messageId, deliveryUpdatedAt);
+  if (!item) return { ok: false, message: '这条排队消息已被处理或取消。' };
+  broadcastFollowUpUpdate(chatJid, {
+    id: messageId,
+    delivery_status: 'cancelled',
+    delivery_run_id: item.delivery_run_id,
+    delivery_updated_at: deliveryUpdatedAt,
+  });
+  return { ok: true, state: 'cancelled', message: '已取消排队消息。', item };
+}
+
+function editFollowUp(
+  chatJid: string,
+  messageId: string,
+  content: string,
+): FollowUpActionResult {
+  const item = updateQueuedFollowUpContent(chatJid, messageId, content);
+  if (!item) return { ok: false, message: '这条消息已开始发送，无法再编辑。' };
+  broadcastFollowUpUpdate(chatJid);
+  return { ok: true, state: 'queued', message: '已更新排队消息。', item };
+}
+
+function reorderFollowUp(
+  chatJid: string,
+  messageId: string,
+  direction: 'up' | 'down',
+): FollowUpActionResult {
+  const item = moveQueuedFollowUp(chatJid, messageId, direction);
+  if (!item) return { ok: false, message: '消息顺序已变化，请刷新后重试。' };
+  broadcastFollowUpUpdate(chatJid);
+  return { ok: true, state: 'queued', message: '已调整排队顺序。', item };
+}
+
+// Claude Agent SDK reports both an explicit Stop and a follow-up steer as the
+// same `status: interrupted` event. Keep the product intent beside the queue
+// interrupt so the stream finalizer can present the two transitions correctly.
+// The registry also guards the SDK race where the superseded turn's buffered
+// final arrives after interrupt() has already been requested.
+const steeringTransitions = new SteeringTransitionRegistry();
+
+function markSteeringInterrupt(chatJid: string): void {
+  steeringTransitions.mark(chatJid);
+}
+
+function clearSteeringInterrupt(chatJid: string): void {
+  steeringTransitions.clear(chatJid);
+}
+
+function resolveSteeringInterrupt(chatJid: string, turnId?: string): boolean {
+  return steeringTransitions.resolveInterrupted(chatJid, turnId);
+}
+
+function interruptAndRunFollowUp(
+  chatJid: string,
+  messageId: string,
+  _expectedRunId: string,
+): FollowUpActionResult {
+  const first = listQueuedFollowUps(chatJid)[0];
+  if (!first || first.id !== messageId) {
+    return {
+      ok: false,
+      state: 'queued',
+      message: '为保证消息顺序，只能中断后立即执行队首消息。',
+      item: getQueuedFollowUp(chatJid, messageId) ?? undefined,
+    };
+  }
+  const activeRunId = queue.getActiveQueryId(chatJid);
+  if (activeRunId) markSteeringInterrupt(chatJid);
+  if (!activeRunId || !queue.interruptQuery(chatJid, activeRunId)) {
+    clearSteeringInterrupt(chatJid);
+    // The query can become idle after the caller observed activeRunId but
+    // before this interrupt reaches GroupQueue.  Kick the durable dispatcher
+    // so the newly queued steer cannot be stranded in that race window.
+    dispatchQueuedFollowUpFamily(chatJid);
+    return {
+      ok: true,
+      state: 'queued',
+      message: '当前回复已结束，这条消息将作为下一轮优先发送。',
+      item: getQueuedFollowUp(chatJid, messageId) ?? undefined,
+    };
+  }
+  broadcastFollowUpUpdate(chatJid);
+  return {
+    ok: true,
+    state: 'interrupting',
+    message: '正在根据这条消息调整当前任务。',
+    item: first,
+  };
+}
+
+function recoverDurableFollowUps(): void {
+  for (const chatJid of getQueuedFollowUpChatJids()) {
+    const recoveryRunId = `recovery:${crypto.randomUUID()}`;
+    const item = claimNextQueuedFollowUp(chatJid, recoveryRunId);
+    if (!item) continue;
+    releaseQueuedFollowUp(chatJid, item.id, recoveryRunId);
+    enqueueReleasedFollowUp(item);
+  }
+}
 
 // ── IPC send_message 跨重试去重 ──
 // 错误退避重试会把整个 prompt 从头重跑，agent 在失败前已执行的 send_message
@@ -1445,6 +1849,7 @@ function writeUsageRecords(opts: {
     outputTokens: number;
     cacheReadInputTokens: number;
     cacheCreationInputTokens: number;
+    reasoningTokens?: number;
     costUSD: number;
     durationMs: number;
     numTurns: number;
@@ -1455,13 +1860,14 @@ function writeUsageRecords(opts: {
         outputTokens: number;
         cacheReadInputTokens: number;
         cacheCreationInputTokens: number;
+        reasoningTokens?: number;
         costUSD: number;
       }
     >;
   };
-}): void {
+}): ReturnType<typeof recordUsageEvent> {
   const { userId, groupFolder, messageId, agentId, source, usage } = opts;
-  recordUsageEvent({
+  return recordUsageEvent({
     userId,
     groupFolder,
     agentId,
@@ -3730,6 +4136,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let streamingAccumulatedText = '';
   let streamingAccumulatedThinking = '';
   let streamInterrupted = false;
+  let streamSteered = false;
   // 本 run 是否已进入 finally 收尾。outputChain 的迟到回调可能在 run resolve
   // 之后才执行（waitForOutputChain 30s 兜底只放行不取消）；此时绝不能再重建
   // 流式卡片——重建出的卡片永远无人 complete，成为僵尸「生成中」卡。
@@ -3744,6 +4151,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // 挂起期间各 turn 的 usage 增量累计，定稿后与最终 turn 的 usage 合并
   // 补到卡片 usage note（否则卡片只显示最后一个 turn 的用量）。
   let heldCardUsage: HeldUsageTotals | null = null;
+  // The runner emits one replay-safe ledger event per Anthropic message ID.
+  // Buffer those siblings and expose one cumulative usage summary to UI/card.
+  let pendingLedgerUsageBatch: HeldUsageTotals | null = null;
   // 定稿后等待最终 usage 事件合并补丁的卡片控制器。usage 事件在 result 之后
   // 到达，而主路径定稿即轮换 session——不留引用的话 usage note 永远打在新空卡
   // 上（no-op）。每条 result 开始时清空，避免打到过期卡。
@@ -3760,11 +4170,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // 挂起序列的异常收口：进程退出/中断/续写放弃时给合并行追加说明注记并广播，
   // 否则 Web 上那条回复会永远停在"…运行中/续写中"的悬空提示上。
   const finalizeHeldDbMessage = async (
-    note: string,
+    note: string | null,
     reason: 'interrupted' | 'truncated',
+    warning = true,
   ): Promise<void> => {
     if (!heldDbTurnId || heldCardParts.length === 0) return;
-    const joined = heldCardParts.join(HELD_TURN_DIVIDER) + `\n\n> ⚠️ ${note}`;
+    const suffix = note ? `\n\n> ${warning ? '⚠️ ' : ''}${note}` : '';
+    const joined = heldCardParts.join(HELD_TURN_DIVIDER) + suffix;
     const tid = heldDbTurnId;
     heldDbTurnId = null;
     await sendMessage(chatJid, joined, {
@@ -4013,6 +4425,32 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       lastProcessed.id,
       async (result) => {
         try {
+          const isInterruptStatus =
+            result.status === 'stream' &&
+            result.streamEvent?.eventType === 'status' &&
+            result.streamEvent.statusText === 'interrupted';
+          const isUsageEvent =
+            result.status === 'stream' &&
+            result.streamEvent?.eventType === 'usage';
+          if (
+            !isInterruptStatus &&
+            !isUsageEvent &&
+            steeringTransitions.shouldSuppressOutput(
+              chatJid,
+              result.turnId || result.streamEvent?.turnId,
+            )
+          ) {
+            logger.info(
+              {
+                chatJid,
+                turnId: result.turnId || result.streamEvent?.turnId,
+                status: result.status,
+                eventType: result.streamEvent?.eventType,
+              },
+              'Superseded turn output suppressed during steer transition',
+            );
+            return;
+          }
           if (result.inputTurnCompleted) {
             healthyInputTurnCompleted = true;
           }
@@ -4042,6 +4480,48 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 }
               }
               return;
+            }
+            // Claude SDK 的 costUSD 只是上游估算。实时 Web/飞书展示前先走
+            // 与账本相同的 Kaboo 计价入口，确保流式金额和最终统计一致。
+            // 后面的持久化调用会被 eventId 幂等去重，并负责关联最终消息。
+            if (
+              result.streamEvent.eventType === 'usage' &&
+              result.streamEvent.usage
+            ) {
+              try {
+                const accounting = writeUsageRecords({
+                  userId:
+                    effectiveGroup.created_by ||
+                    registeredGroups[chatJid]?.created_by ||
+                    'system',
+                  groupFolder: effectiveGroup.folder,
+                  messageId: lastReplyMsgId,
+                  source: chatJid.split(':', 1)[0] || 'unknown',
+                  usage: result.streamEvent.usage,
+                });
+                result.streamEvent.usage.costUSD =
+                  accounting.providerEstimatedCostUSD;
+              } catch (err) {
+                logger.warn(
+                  { err, chatJid },
+                  'Failed to normalize usage cost before stream delivery',
+                );
+              }
+              const ledgerUsage = result.streamEvent.usage;
+              pendingLedgerUsageBatch = mergeHeldUsage(
+                pendingLedgerUsageBatch,
+                ledgerUsage,
+              );
+              const batchIndex = Math.max(0, ledgerUsage.batchIndex || 0);
+              const batchCount = Math.max(1, ledgerUsage.batchCount || 1);
+              if (batchIndex < batchCount - 1) return;
+              result.streamEvent.usage = {
+                ...pendingLedgerUsageBatch,
+                eventId: ledgerUsage.eventId,
+                batchIndex,
+                batchCount,
+              };
+              pendingLedgerUsageBatch = null;
             }
             broadcastStreamEvent(chatJid, result.streamEvent);
 
@@ -4146,17 +4626,28 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               result.streamEvent.eventType === 'status' &&
               result.streamEvent.statusText === 'interrupted'
             ) {
+              const steered = resolveSteeringInterrupt(
+                chatJid,
+                result.streamEvent.turnId || result.turnId,
+              );
               streamInterrupted = true;
-              // 挂起中的回复被用户中断：DB 合并行补注记收口，卡片就地 abort，
-              // session 转 inactive 后下一 turn 由流事件重建路径开新卡。
+              streamSteered ||= steered;
+              // 引导是正常换向：干净收束已有内容；显式停止才显示中性停止状态。
               if (heldCardParts.length > 0) {
-                await finalizeHeldDbMessage('已中断', 'interrupted').catch(
-                  () => {},
-                );
+                const heldText = heldCardParts.join(HELD_TURN_DIVIDER);
+                await finalizeHeldDbMessage(
+                  steered ? null : '已停止',
+                  'interrupted',
+                  false,
+                ).catch(() => {});
                 heldCardParts = [];
                 heldCardUsage = null;
                 if (streamingSession?.isActive()) {
-                  await streamingSession.abort('已中断').catch(() => {});
+                  if (steered) {
+                    await streamingSession.complete(heldText).catch(() => {});
+                  } else {
+                    await streamingSession.abort('已停止').catch(() => {});
+                  }
                 }
               }
               // Skip if shutdown handler already saved this text (prevents duplicates)
@@ -4167,24 +4658,38 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 shutdownSavedJids.has(chatJid) ||
                 shutdownSavedJids.has(inlineWebJid);
               if (!sentReply && !inlineAlreadySaved) {
-                const interruptedText = buildInterruptedReply(
-                  streamingAccumulatedText,
-                  streamingAccumulatedThinking,
-                );
+                const interruptedText = steered
+                  ? buildSteeredReply(streamingAccumulatedText)
+                  : buildStoppedReply(
+                      streamingAccumulatedText,
+                      streamingAccumulatedThinking,
+                    );
                 try {
                   if (streamingSession?.isActive()) {
-                    await streamingSession.abort('已中断').catch(() => {});
+                    if (steered) {
+                      await streamingSession
+                        .complete(streamingAccumulatedText)
+                        .catch(() => {});
+                    } else {
+                      await streamingSession.abort('已停止').catch(() => {});
+                    }
                   }
-                  lastReplyMsgId = await sendMessage(chatJid, interruptedText, {
-                    sendToIM: false,
-                    messageMeta: {
-                      turnId: result.streamEvent.turnId || lastProcessed.id,
-                      sessionId:
-                        result.streamEvent.sessionId || activeSessionId,
-                      sourceKind: 'interrupt_partial',
-                      finalizationReason: 'interrupted',
-                    },
-                  });
+                  if (interruptedText) {
+                    lastReplyMsgId = await sendMessage(
+                      chatJid,
+                      interruptedText,
+                      {
+                        sendToIM: false,
+                        messageMeta: {
+                          turnId: result.streamEvent.turnId || lastProcessed.id,
+                          sessionId:
+                            result.streamEvent.sessionId || activeSessionId,
+                          sourceKind: 'interrupt_partial',
+                          finalizationReason: 'interrupted',
+                        },
+                      },
+                    );
+                  }
                   sentReply = true;
                   clearStreamingSnapshot(chatJid);
                   streamingAccumulatedText = '';
@@ -4774,6 +5279,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
     // ── 检测中断：有累积文本但从未发送回复 ──
     const wasInterrupted = streamInterrupted && !sentReply;
+    const wasSteered = wasInterrupted && streamSteered;
 
     // ── Streaming card cleanup ──
     if (streamingSession) {
@@ -4796,7 +5302,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         } else if (hadError || !output || output.status === 'error') {
           await streamingSession.abort('处理出错').catch(() => {});
         } else if (wasInterrupted) {
-          await streamingSession.abort('已中断').catch(() => {});
+          if (wasSteered) {
+            await streamingSession
+              .complete(streamingAccumulatedText)
+              .catch(() => {});
+          } else {
+            await streamingSession.abort('已停止').catch(() => {});
+          }
         } else if (output.status === 'closed') {
           // closed：容器 drain/_close 中断了 in-flight query（agent-runner 发
           // status:'closed' 而非 interrupt 流事件，streamInterrupted 仍为 false）。
@@ -4852,21 +5364,25 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       shutdownSavedJids.has(webJidForShutdownCheck);
 
     if (wasInterrupted && !alreadySavedByShutdown) {
-      const interruptedText = buildInterruptedReply(
-        streamingAccumulatedText,
-        streamingAccumulatedThinking,
-      );
+      const interruptedText = wasSteered
+        ? buildSteeredReply(streamingAccumulatedText)
+        : buildStoppedReply(
+            streamingAccumulatedText,
+            streamingAccumulatedThinking,
+          );
       try {
-        // sendToIM: false — 飞书卡片已通过 abort() 展示内容，不重复发送
-        lastReplyMsgId = await sendMessage(chatJid, interruptedText, {
-          sendToIM: false,
-          messageMeta: {
-            turnId: lastProcessed.id,
-            sessionId: activeSessionId,
-            sourceKind: 'interrupt_partial',
-            finalizationReason: 'interrupted',
-          },
-        });
+        // sendToIM: false — 飞书卡片已在原卡片上完成收束，不重复发送
+        if (interruptedText) {
+          lastReplyMsgId = await sendMessage(chatJid, interruptedText, {
+            sendToIM: false,
+            messageMeta: {
+              turnId: lastProcessed.id,
+              sessionId: activeSessionId,
+              sourceKind: 'interrupt_partial',
+              finalizationReason: 'interrupted',
+            },
+          });
+        }
         sentReply = true;
       } catch (err) {
         logger.warn({ err, chatJid }, 'Failed to save interrupted text');
@@ -5383,7 +5899,7 @@ async function runAgent(
           );
         }
         if (
-          (output.status === 'success' && output.result !== null) ||
+          output.queryIdle === true ||
           (output.status === 'stream' &&
             output.streamEvent?.eventType === 'status' &&
             output.streamEvent.statusText === 'interrupted')
@@ -5620,25 +6136,6 @@ async function sendMessage(
   options: SendMessageOptions = {},
 ): Promise<string | undefined> {
   return (await sendMessageWithOutcome(jid, text, options)).messageId;
-}
-
-export function buildInterruptedReply(
-  partialText: string,
-  thinkingText?: string,
-): string {
-  const trimmed = partialText.trimEnd();
-  const trimmedThinking = thinkingText?.trimEnd();
-  const parts: string[] = [];
-  if (trimmedThinking) {
-    parts.push(
-      `<details>\n<summary>💭 Reasoning (已中断)</summary>\n\n${trimmedThinking}\n\n</details>`,
-    );
-  }
-  if (trimmed) {
-    parts.push(trimmed);
-  }
-  parts.push('---\n*⚠️ 已中断*');
-  return parts.join('\n\n');
 }
 
 export function buildOverflowPartialReply(partialText: string): string {
@@ -8660,6 +9157,8 @@ async function processAgentConversation(
     : undefined;
   let agentStreamingAccText = '';
   let agentStreamInterrupted = false;
+  let agentStreamSteered = false;
+  let agentInterruptFinalized = false;
   // Mirrors the main session's `output.status === 'closed'` handling: set when
   // the container drained mid-query so the finally block finalizes the card as
   // "reconnecting" instead of leaving a zombie 生成中 card.
@@ -8669,6 +9168,7 @@ async function processAgentConversation(
   // 机制在这里同时修复了"后台任务汇总只入库、飞书永远看不到"的消息丢失。
   let heldAgentParts: string[] = [];
   let heldAgentUsage: HeldUsageTotals | null = null;
+  let pendingAgentLedgerUsageBatch: HeldUsageTotals | null = null;
   // 定稿后等待最终 usage 事件做合并补丁（Sub 路径 session 不轮换，引用即当前卡）
   let heldAgentUsagePatchPending = false;
   // 挂起序列的 DB 合并锚点（全渠道一条回复）：序列内所有 turn 复用同一
@@ -8681,11 +9181,13 @@ async function processAgentConversation(
       : '';
   // 挂起序列异常收口：给合并行追加说明注记并广播（对齐主路径 finalizeHeldDbMessage）
   const finalizeHeldAgentDbMessage = (
-    note: string,
+    note: string | null,
     reason: 'interrupted' | 'truncated',
+    warning = true,
   ): void => {
     if (!heldAgentDbMsgId || heldAgentParts.length === 0) return;
-    const joined = heldAgentParts.join(HELD_TURN_DIVIDER) + `\n\n> ⚠️ ${note}`;
+    const suffix = note ? `\n\n> ${warning ? '⚠️ ' : ''}${note}` : '';
+    const joined = heldAgentParts.join(HELD_TURN_DIVIDER) + suffix;
     const msgId = heldAgentDbMsgId;
     const tid = heldAgentDbTurnId;
     heldAgentDbMsgId = null;
@@ -8812,6 +9314,33 @@ async function processAgentConversation(
     // #547: warm-lifecycle bookkeeping — mark activity, and flag query-idle on
     // a substantive result / interruption so the runner can be kept warm.
     queue.markRunnerActivity(virtualJid);
+    const isInterruptStatus =
+      output.status === 'stream' &&
+      output.streamEvent?.eventType === 'status' &&
+      output.streamEvent.statusText === 'interrupted';
+    const isUsageEvent =
+      output.status === 'stream' && output.streamEvent?.eventType === 'usage';
+    if (
+      !isInterruptStatus &&
+      !isUsageEvent &&
+      steeringTransitions.shouldSuppressOutput(
+        virtualChatJid,
+        output.turnId || output.streamEvent?.turnId,
+      )
+    ) {
+      logger.info(
+        {
+          chatJid,
+          agentId,
+          virtualChatJid,
+          turnId: output.turnId || output.streamEvent?.turnId,
+          status: output.status,
+          eventType: output.streamEvent?.eventType,
+        },
+        'Superseded agent turn output suppressed during steer transition',
+      );
+      return;
+    }
     if (output.ipcReceipts?.length) {
       queue.acknowledgeIpcDeliveries(
         virtualJid,
@@ -8823,7 +9352,7 @@ async function processAgentConversation(
       healthyAgentInputTurnCompleted = true;
     }
     if (
-      (output.status === 'success' && output.result !== null) ||
+      output.queryIdle === true ||
       (output.status === 'stream' &&
         output.streamEvent?.eventType === 'status' &&
         output.streamEvent.statusText === 'interrupted')
@@ -8886,6 +9415,48 @@ async function processAgentConversation(
         }
         return;
       }
+      // Keep live Web/Feishu cost on the same Kaboo ledger authority as the
+      // persisted usage page. The later write is replay-safe on eventId.
+      if (
+        output.streamEvent.eventType === 'usage' &&
+        output.streamEvent.usage
+      ) {
+        try {
+          const accounting = writeUsageRecords({
+            userId:
+              effectiveGroup.created_by ||
+              registeredGroups[chatJid]?.created_by ||
+              'system',
+            groupFolder: effectiveGroup.folder,
+            agentId,
+            messageId: lastAgentReplyMsgId,
+            source: chatJid.split(':', 1)[0] || 'unknown',
+            usage: output.streamEvent.usage,
+          });
+          output.streamEvent.usage.costUSD =
+            accounting.providerEstimatedCostUSD;
+        } catch (err) {
+          logger.warn(
+            { err, chatJid, agentId },
+            'Failed to normalize agent usage cost before stream delivery',
+          );
+        }
+        const ledgerUsage = output.streamEvent.usage;
+        pendingAgentLedgerUsageBatch = mergeHeldUsage(
+          pendingAgentLedgerUsageBatch,
+          ledgerUsage,
+        );
+        const batchIndex = Math.max(0, ledgerUsage.batchIndex || 0);
+        const batchCount = Math.max(1, ledgerUsage.batchCount || 1);
+        if (batchIndex < batchCount - 1) return;
+        output.streamEvent.usage = {
+          ...pendingAgentLedgerUsageBatch,
+          eventId: ledgerUsage.eventId,
+          batchIndex,
+          batchCount,
+        };
+        pendingAgentLedgerUsageBatch = null;
+      }
       broadcastStreamEvent(chatJid, output.streamEvent, agentId);
 
       // ── 累积 text_delta 文本（中断时用于保存已输出内容）──
@@ -8936,63 +9507,92 @@ async function processAgentConversation(
         output.streamEvent.eventType === 'status' &&
         output.streamEvent.statusText === 'interrupted'
       ) {
+        const steered = resolveSteeringInterrupt(
+          virtualChatJid,
+          output.streamEvent.turnId || output.turnId,
+        );
         agentStreamInterrupted = true;
-        // 挂起中的回复被中断：DB 合并行补注记收口，卡片就地 abort
+        agentStreamSteered ||= steered;
+        // 引导是正常换向：干净收束已有内容；显式停止才显示中性停止状态。
         if (heldAgentParts.length > 0) {
-          finalizeHeldAgentDbMessage('已中断', 'interrupted');
+          const heldText = heldAgentParts.join(HELD_TURN_DIVIDER);
+          finalizeHeldAgentDbMessage(
+            steered ? null : '已停止',
+            'interrupted',
+            false,
+          );
           heldAgentParts = [];
           heldAgentUsage = null;
           if (agentStreamingSession?.isActive()) {
-            await agentStreamingSession.abort('已中断').catch(() => {});
+            if (steered) {
+              await agentStreamingSession.complete(heldText).catch(() => {});
+            } else {
+              await agentStreamingSession.abort('已停止').catch(() => {});
+            }
           }
         }
         if (!cursorCommitted) {
-          const interruptedText = buildInterruptedReply(agentStreamingAccText);
+          const interruptedText = steered
+            ? buildSteeredReply(agentStreamingAccText)
+            : buildStoppedReply(agentStreamingAccText);
           try {
             if (agentStreamingSession?.isActive()) {
-              await agentStreamingSession.abort('已中断').catch(() => {});
+              if (steered) {
+                await agentStreamingSession
+                  .complete(agentStreamingAccText)
+                  .catch(() => {});
+              } else {
+                await agentStreamingSession.abort('已停止').catch(() => {});
+              }
             }
-            const msgId = crypto.randomUUID();
-            const timestamp = new Date().toISOString();
-            ensureChatExists(virtualChatJid);
-            const persistedMsgId = storeMessageDirect(
-              msgId,
-              virtualChatJid,
-              'happyclaw-agent',
-              ASSISTANT_NAME,
-              interruptedText,
-              timestamp,
-              true,
-              {
-                meta: {
-                  turnId: output.streamEvent.turnId || lastProcessed.id,
-                  sessionId:
-                    output.streamEvent.sessionId || currentAgentSessionId,
-                  sourceKind: 'interrupt_partial',
-                  finalizationReason: 'interrupted',
-                },
-              },
-            );
-            broadcastNewMessage(
-              virtualChatJid,
-              {
-                id: persistedMsgId,
-                chat_jid: virtualChatJid,
-                sender: 'happyclaw-agent',
-                sender_name: ASSISTANT_NAME,
-                content: interruptedText,
+            if (interruptedText) {
+              const msgId = crypto.randomUUID();
+              const timestamp = new Date().toISOString();
+              ensureChatExists(virtualChatJid);
+              const persistedMsgId = storeMessageDirect(
+                msgId,
+                virtualChatJid,
+                'happyclaw-agent',
+                ASSISTANT_NAME,
+                interruptedText,
                 timestamp,
-                is_from_me: true,
-                turn_id: output.streamEvent.turnId || lastProcessed.id,
-                session_id:
-                  output.streamEvent.sessionId || currentAgentSessionId,
-                sdk_message_uuid: null,
-                source_kind: 'interrupt_partial',
-                finalization_reason: 'interrupted',
-              },
-              agentId,
-            );
+                true,
+                {
+                  meta: {
+                    turnId: output.streamEvent.turnId || lastProcessed.id,
+                    sessionId:
+                      output.streamEvent.sessionId || currentAgentSessionId,
+                    sourceKind: 'interrupt_partial',
+                    finalizationReason: 'interrupted',
+                  },
+                },
+              );
+              broadcastNewMessage(
+                virtualChatJid,
+                {
+                  id: persistedMsgId,
+                  chat_jid: virtualChatJid,
+                  sender: 'happyclaw-agent',
+                  sender_name: ASSISTANT_NAME,
+                  content: interruptedText,
+                  timestamp,
+                  is_from_me: true,
+                  turn_id: output.streamEvent.turnId || lastProcessed.id,
+                  session_id:
+                    output.streamEvent.sessionId || currentAgentSessionId,
+                  sdk_message_uuid: null,
+                  source_kind: 'interrupt_partial',
+                  finalization_reason: 'interrupted',
+                },
+                agentId,
+              );
+            }
+            agentInterruptFinalized = true;
             clearStreamingSnapshot(virtualChatJid);
+            agentStreamingAccText = '';
+            // A deliberate stop/steer owns the superseded input: it must not
+            // be rediscovered from DB history after the warm runner settles.
+            commitCursor();
           } catch (err) {
             logger.warn(
               { err, chatJid, agentId },
@@ -9516,7 +10116,9 @@ async function processAgentConversation(
   } finally {
     if (idleTimer) clearTimeout(idleTimer);
 
-    const wasInterrupted = agentStreamInterrupted && !cursorCommitted;
+    const wasInterrupted =
+      agentStreamInterrupted && !agentInterruptFinalized && !cursorCommitted;
+    const wasSteered = wasInterrupted && agentStreamSteered;
 
     // ── Streaming card cleanup ──
     activeHeldCardFinalizers.delete(virtualChatJid);
@@ -9538,7 +10140,13 @@ async function processAgentConversation(
         } else if (hadError) {
           await agentStreamingSession.abort('处理出错').catch(() => {});
         } else if (wasInterrupted) {
-          await agentStreamingSession.abort('已中断').catch(() => {});
+          if (wasSteered) {
+            await agentStreamingSession
+              .complete(agentStreamingAccText)
+              .catch(() => {});
+          } else {
+            await agentStreamingSession.abort('已停止').catch(() => {});
+          }
         } else if (agentClosed) {
           // Container drained/_closed the in-flight query; the message will be
           // retried, so just finalize the card (区别于"已中断"：系统侧打断重试).
@@ -9583,46 +10191,51 @@ async function processAgentConversation(
 
     // ── 保存中断内容 ──
     if (wasInterrupted) {
-      const interruptedText = buildInterruptedReply(agentStreamingAccText);
+      const interruptedText = wasSteered
+        ? buildSteeredReply(agentStreamingAccText)
+        : buildStoppedReply(agentStreamingAccText);
       try {
-        const msgId = crypto.randomUUID();
-        const timestamp = new Date().toISOString();
-        ensureChatExists(virtualChatJid);
-        const persistedMsgId = storeMessageDirect(
-          msgId,
-          virtualChatJid,
-          'happyclaw-agent',
-          ASSISTANT_NAME,
-          interruptedText,
-          timestamp,
-          true,
-          {
-            meta: {
-              turnId: lastProcessed.id,
-              sessionId: currentAgentSessionId,
-              sourceKind: 'interrupt_partial',
-              finalizationReason: 'interrupted',
-            },
-          },
-        );
-        broadcastNewMessage(
-          virtualChatJid,
-          {
-            id: persistedMsgId,
-            chat_jid: virtualChatJid,
-            sender: 'happyclaw-agent',
-            sender_name: ASSISTANT_NAME,
-            content: interruptedText,
+        if (interruptedText) {
+          const msgId = crypto.randomUUID();
+          const timestamp = new Date().toISOString();
+          ensureChatExists(virtualChatJid);
+          const persistedMsgId = storeMessageDirect(
+            msgId,
+            virtualChatJid,
+            'happyclaw-agent',
+            ASSISTANT_NAME,
+            interruptedText,
             timestamp,
-            is_from_me: true,
-            turn_id: lastProcessed.id,
-            session_id: currentAgentSessionId,
-            sdk_message_uuid: null,
-            source_kind: 'interrupt_partial',
-            finalization_reason: 'interrupted',
-          },
-          agentId,
-        );
+            true,
+            {
+              meta: {
+                turnId: lastProcessed.id,
+                sessionId: currentAgentSessionId,
+                sourceKind: 'interrupt_partial',
+                finalizationReason: 'interrupted',
+              },
+            },
+          );
+          broadcastNewMessage(
+            virtualChatJid,
+            {
+              id: persistedMsgId,
+              chat_jid: virtualChatJid,
+              sender: 'happyclaw-agent',
+              sender_name: ASSISTANT_NAME,
+              content: interruptedText,
+              timestamp,
+              is_from_me: true,
+              turn_id: lastProcessed.id,
+              session_id: currentAgentSessionId,
+              sdk_message_uuid: null,
+              source_kind: 'interrupt_partial',
+              finalization_reason: 'interrupted',
+            },
+            agentId,
+          );
+        }
+        agentInterruptFinalized = true;
       } catch (err) {
         logger.warn(
           { err, chatJid, agentId },
@@ -11391,22 +12004,111 @@ function isSenderAllowedInGroup(chatJid: string, senderImId?: string): boolean {
   return allowlist.includes(senderImId);
 }
 
+function handleIncomingFollowUp(input: {
+  targetJid: string;
+  sourceJid: string;
+  messageId: string;
+  senderImId: string;
+  requestedMode?: FollowUpMode;
+  repliedToActiveCard: boolean;
+}): import('./types.js').FollowUpDisposition {
+  const activeRunId = queue.getActiveQueryId(input.targetJid);
+  if (!activeRunId) return { disposition: 'started' };
+  const mode = resolveFeishuFollowUpMode(
+    input.requestedMode,
+    input.repliedToActiveCard,
+  );
+  setMessageFollowUp(input.targetJid, input.messageId, {
+    mode,
+    status: 'queued',
+    runId: activeRunId,
+  });
+  if (mode === 'steer') {
+    const result = promoteFollowUp(
+      input.targetJid,
+      input.messageId,
+      activeRunId,
+    );
+    if (result.ok) {
+      return { disposition: 'steered', runId: activeRunId };
+    }
+  }
+  const position =
+    listQueuedFollowUps(input.targetJid).findIndex(
+      (item) => item.id === input.messageId,
+    ) + 1;
+  return {
+    disposition: 'queued',
+    runId: activeRunId,
+    position: Math.max(position, 1),
+  };
+}
+
+async function handleFollowUpCardAction(input: {
+  sourceJid: string;
+  targetJid: string;
+  messageId: string;
+  action: import('./types.js').FollowUpAction;
+  expectedRunId: string;
+  operatorImId: string;
+}): Promise<FollowUpActionResult> {
+  const item = getQueuedFollowUp(input.targetJid, input.messageId);
+  if (!item) return { ok: false, message: '这条排队消息已被处理或取消。' };
+  if (
+    !input.operatorImId ||
+    item.sender !== input.operatorImId ||
+    !isSenderAllowedInGroup(input.sourceJid, input.operatorImId)
+  ) {
+    return { ok: false, message: '只有这条消息的发送者可以操作它。' };
+  }
+  if (input.action === 'cancel') {
+    return cancelFollowUp(input.targetJid, input.messageId);
+  }
+  if (input.action === 'steer') {
+    return promoteFollowUp(
+      input.targetJid,
+      input.messageId,
+      input.expectedRunId,
+    );
+  }
+  return interruptAndRunFollowUp(
+    input.targetJid,
+    input.messageId,
+    input.expectedRunId,
+  );
+}
+
 /**
  * 飞书流式卡片按钮中断回调。
  * 仅由飞书卡片按钮触发，不涉及自动关键词检测。
  */
-function handleCardInterrupt(chatJid: string): void {
-  const interrupted = queue.interruptQuery(chatJid);
-  if (interrupted) {
-    logger.info({ chatJid }, 'Card interrupt: query interrupted');
+function handleCardInterrupt(
+  chatJid: string,
+  operatorImId: string,
+): FollowUpActionResult {
+  if (!operatorImId) {
+    return { ok: false, message: '无法验证操作者身份，未执行中断。' };
   }
+  const sourceChatJid = channelConversationJid(stripVirtualJidSuffix(chatJid));
+  if (
+    getChannelType(sourceChatJid) === 'feishu' &&
+    !isSenderAllowedInGroup(sourceChatJid, operatorImId)
+  ) {
+    return { ok: false, message: '你没有中断这个会话的权限。' };
+  }
+  const interrupted = queue.interruptQuery(chatJid);
+  if (!interrupted) {
+    return { ok: false, message: '当前回复已经结束，无需中断。' };
+  }
+  logger.info({ chatJid, operatorImId }, 'Card interrupt: query interrupted');
 
   const session = getStreamingSession(chatJid);
   if (session?.isActive()) {
-    session.abort('用户中断').catch((err) => {
+    session.abort('已停止').catch((err) => {
       logger.debug({ err, chatJid }, 'Failed to abort streaming card');
     });
   }
+  return { ok: true, state: 'interrupting', message: '已停止当前回复。' };
 }
 
 function resolveChannelAccountWorkspace(account: ChannelAccount): {
@@ -11502,6 +12204,8 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
           shouldProcessGroupMessage,
           isGroupOwnerMessage,
           isSenderAllowedInGroup,
+          onFollowUpMessage: handleIncomingFollowUp,
+          onFollowUpCardAction: handleFollowUpCardAction,
           onCardInterrupt: handleCardInterrupt,
           onP2pSender: (senderOpenId: string) => {
             // First valid DM claims this bot. Never let a later arbitrary DM
@@ -12402,6 +13106,8 @@ async function main(): Promise<void> {
             shouldProcessGroupMessage,
             isGroupOwnerMessage,
             isSenderAllowedInGroup,
+            onFollowUpMessage: handleIncomingFollowUp,
+            onFollowUpCardAction: handleFollowUpCardAction,
             onCardInterrupt: handleCardInterrupt,
             onP2pSender: onReloadP2pSender,
           },
@@ -12770,6 +13476,11 @@ async function main(): Promise<void> {
     applyAutoIsolateContext: (userId: string, enable: boolean) =>
       applyAutoIsolateContext(userId, enable),
     resolveEffectiveGroup,
+    promoteFollowUp,
+    cancelFollowUp,
+    editFollowUp,
+    reorderFollowUp,
+    interruptAndRunFollowUp,
   });
 
   // Clean expired sessions every hour
@@ -12866,6 +13577,9 @@ async function main(): Promise<void> {
   await ensureDockerRunning();
 
   queue.setProcessMessagesFn(processGroupMessages);
+  queue.setOnQueryIdle((chatJid) => {
+    dispatchQueuedFollowUpFamily(chatJid);
+  });
   queue.setHostModeChecker((groupJid: string) => {
     const baseJid = stripVirtualJidSuffix(groupJid);
 
@@ -12993,6 +13707,10 @@ async function main(): Promise<void> {
       );
     },
   );
+  // A restart has no live query that can emit an idle transition. Release one
+  // durable item per chat into the normal cold-start path; the remaining items
+  // stay queued and are promoted one-by-one after each completed query.
+  recoverDurableFollowUps();
   const schedulerDeps: import('./task-scheduler.js').SchedulerDependencies = {
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,

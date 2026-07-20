@@ -17,14 +17,18 @@ import {
 } from './im-downloader.js';
 import { createDedupCache } from './im-utils.js';
 import { notifyNewImMessage } from './message-notifier.js';
-import { broadcastNewMessage } from './web.js';
+import { broadcastFollowUpUpdate, broadcastNewMessage } from './web.js';
 import { detectImageMimeType } from './image-detector.js';
 import {
   resolveJidByMessageId,
   getStreamingSession,
 } from './feishu-streaming-card.js';
 import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
-import { buildAgentReplyCard } from './feishu-cards/builder.js';
+import {
+  buildAgentReplyCard,
+  buildFollowUpActionResultCard,
+  buildQueuedFollowUpCard,
+} from './feishu-cards/builder.js';
 import {
   evaluateMentionGate,
   isBotMentioned,
@@ -32,7 +36,13 @@ import {
 } from './feishu-mention-gate.js';
 import { ProcessingLock, isStale } from './im-safety/index.js';
 import { resolveAdmittedChannelRoute } from './channel-admission.js';
-import type { FeishuMessageMeta } from './types.js';
+import type {
+  FeishuMessageMeta,
+  FollowUpAction,
+  FollowUpActionResult,
+  FollowUpDisposition,
+  FollowUpMode,
+} from './types.js';
 
 // ─── FeishuConnection Interface ────────────────────────────────
 
@@ -73,6 +83,24 @@ export interface ConnectOptions {
   } | null;
   /** 当 IM 消息被路由到 conversation agent 后调用 */
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  /** Decide whether an inbound message starts now, queues, or steers. */
+  onFollowUpMessage?: (input: {
+    targetJid: string;
+    sourceJid: string;
+    messageId: string;
+    senderImId: string;
+    requestedMode?: FollowUpMode;
+    repliedToActiveCard: boolean;
+  }) => FollowUpDisposition;
+  /** Handle buttons on the compact queued-message card. */
+  onFollowUpCardAction?: (input: {
+    sourceJid: string;
+    targetJid: string;
+    messageId: string;
+    action: FollowUpAction;
+    expectedRunId: string;
+    operatorImId: string;
+  }) => Promise<FollowUpActionResult> | FollowUpActionResult;
   /** Bot 被添加到群聊时调用（自动注册群组） */
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   /** Bot 被移出群聊或群被解散时调用（自动解绑 IM 绑定） */
@@ -84,7 +112,10 @@ export interface ConnectOptions {
   /** 发言者白名单：命令处理之后、mention 门控之前调用；返回 false 则丢弃 */
   isSenderAllowedInGroup?: (chatJid: string, senderImId?: string) => boolean;
   /** 飞书流式卡片按钮中断回调 */
-  onCardInterrupt?: (chatJid: string) => void;
+  onCardInterrupt?: (
+    chatJid: string,
+    operatorImId: string,
+  ) => FollowUpActionResult;
   /** P2P（私聊）消息到达时调用，用于自动检测 bot owner 的 open_id */
   onP2pSender?: (senderOpenId: string) => void;
   normalizeIncomingJid?: (jid: string) => string;
@@ -965,6 +996,7 @@ export function createFeishuConnection(
       resolveGroupFolder,
       resolveEffectiveChatJid,
       onAgentMessage,
+      onFollowUpMessage,
       shouldProcessGroupMessage,
       isGroupOwnerMessage,
       isSenderAllowedInGroup,
@@ -1064,9 +1096,27 @@ export function createFeishuConnection(
       // ── 斜杠指令：拦截已知 /xxx 命令，不进入消息流 ──
       // 群聊中 @机器人 后跟斜杠命令，mention 替换后文本为 "@botname /cmd"，
       // 需要先 strip 掉开头的 @mention 前缀再匹配
-      const textForSlash = text?.trim().replace(/^@\S+\s+/, '') ?? '';
+      let textForSlash = text?.trim().replace(/^@\S+\s+/, '') ?? '';
+      let requestedFollowUpMode: FollowUpMode | undefined;
+      const followUpModeMatch = textForSlash.match(
+        /^\/(queue|steer)(?:\s+([\s\S]+))?$/i,
+      );
+      if (followUpModeMatch) {
+        const modeContent = followUpModeMatch[2]?.trim();
+        if (!modeContent) {
+          await sendTextToChat(
+            messageRouteTarget.raw,
+            `请在 /${followUpModeMatch[1].toLowerCase()} 后输入消息内容。`,
+          );
+          return;
+        }
+        requestedFollowUpMode =
+          followUpModeMatch[1].toLowerCase() === 'steer' ? 'steer' : 'queue';
+        text = modeContent;
+        textForSlash = modeContent;
+      }
       const slashMatch = textForSlash.match(/^\/(\S+)(.*)$/);
-      if (slashMatch && onCommand) {
+      if (slashMatch && onCommand && !requestedFollowUpMode) {
         const cmdBody = (slashMatch[1] + slashMatch[2]).trim();
         logger.info(
           { chatJid, cmd: slashMatch[1], cmdBody },
@@ -1427,6 +1477,33 @@ export function createFeishuConnection(
         false,
         { attachments: attachmentsJson, sourceJid: routeSourceJid },
       );
+      const followUp = onFollowUpMessage?.({
+        targetJid,
+        sourceJid: routeSourceJid,
+        messageId,
+        senderImId: senderOpenId,
+        requestedMode: requestedFollowUpMode,
+        repliedToActiveCard: !!parentId && !!resolveJidByMessageId(parentId),
+      }) ?? { disposition: 'started' as const };
+      const deliveryFields =
+        followUp.disposition === 'queued'
+          ? {
+              delivery_mode: 'queue' as const,
+              delivery_status: 'queued' as const,
+              delivery_run_id: followUp.runId ?? null,
+              delivery_updated_at: timestamp,
+            }
+          : followUp.disposition === 'steered'
+            ? {
+                delivery_mode: 'steer' as const,
+                // Steering is a durable hand-off: the row stays queued until
+                // the interrupted SDK query reports idle, then starts as the
+                // next turn in the same session.
+                delivery_status: 'queued' as const,
+                delivery_run_id: followUp.runId ?? null,
+                delivery_updated_at: timestamp,
+              }
+            : {};
       broadcastNewMessage(
         targetJid,
         {
@@ -1438,9 +1515,35 @@ export function createFeishuConnection(
           content: text,
           timestamp,
           attachments: attachmentsJson,
+          ...deliveryFields,
         },
         targetAgentId ?? undefined,
       );
+      if (followUp.disposition === 'queued') {
+        broadcastFollowUpUpdate(targetJid);
+        const position = followUp.position ?? 1;
+        if (followUp.runId) {
+          await sendToFeishu(
+            messageRouteTarget.raw,
+            'interactive',
+            JSON.stringify(
+              buildQueuedFollowUpCard({
+                content: text,
+                position,
+                sourceJid: chatJid,
+                targetJid,
+                messageId,
+                expectedRunId: followUp.runId,
+              }),
+            ),
+          );
+        }
+        logger.info(
+          { chatJid, targetJid, messageId, position },
+          'Feishu message queued behind active query',
+        );
+        return;
+      }
       notifyNewImMessage();
 
       if (agentRouting && agentRouting.agentId) {
@@ -1796,33 +1899,71 @@ export function createFeishuConnection(
         },
         'card.action.trigger': async (data: any) => {
           try {
-            const action = data?.action?.value?.action;
-            const messageId = data?.context?.open_message_id;
-            if (action !== 'interrupt_stream' || !messageId) return;
+            const value = data?.action?.value ?? {};
+            const action = value.action;
+            const cardMessageId = data?.context?.open_message_id;
+            const operatorImId =
+              data?.operator?.open_id ?? data?.operator?.openId ?? '';
+            if (!cardMessageId || !action) return;
 
-            const chatJid = resolveJidByMessageId(messageId);
-            if (!chatJid) {
-              logger.debug(
-                { messageId },
-                'Card action: no mapping for messageId',
-              );
-              return;
+            let result: FollowUpActionResult | undefined;
+            if (action === 'interrupt_stream') {
+              const chatJid = resolveJidByMessageId(cardMessageId);
+              if (!chatJid) {
+                logger.debug(
+                  { cardMessageId },
+                  'Card action: no mapping for messageId',
+                );
+                return;
+              }
+              result = connectOptions?.onCardInterrupt?.(chatJid, operatorImId);
+            } else if (
+              action === 'steer_queued' ||
+              action === 'cancel_queued' ||
+              action === 'interrupt_and_run'
+            ) {
+              const mappedAction: FollowUpAction =
+                action === 'steer_queued'
+                  ? 'steer'
+                  : action === 'cancel_queued'
+                    ? 'cancel'
+                    : 'interrupt_and_run';
+              if (
+                typeof value.sourceJid !== 'string' ||
+                typeof value.targetJid !== 'string' ||
+                typeof value.messageId !== 'string' ||
+                typeof value.expectedRunId !== 'string'
+              ) {
+                return;
+              }
+              result = await connectOptions?.onFollowUpCardAction?.({
+                sourceJid: value.sourceJid,
+                targetJid: value.targetJid,
+                messageId: value.messageId,
+                action: mappedAction,
+                expectedRunId: value.expectedRunId,
+                operatorImId,
+              });
             }
 
-            const session = getStreamingSession(chatJid);
-            if (!session?.isActive()) {
-              logger.debug(
-                { chatJid, messageId },
-                'Card action: session not active',
-              );
-              return;
+            if (!result) return;
+            if (!result.ok) {
+              return {
+                toast: {
+                  type: 'warning',
+                  content: result.message,
+                },
+              };
             }
-
-            logger.info(
-              { chatJid, messageId },
-              'Card action: interrupt via button',
-            );
-            connectOptions?.onCardInterrupt?.(chatJid);
+            if (!client) return;
+            await client.im.v1.message.patch({
+              path: { message_id: cardMessageId },
+              data: {
+                content: JSON.stringify(
+                  buildFollowUpActionResultCard(result.message, result.ok),
+                ),
+              },
+            });
           } catch (err) {
             logger.error({ err }, 'Error handling card action trigger');
           }

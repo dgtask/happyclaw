@@ -87,7 +87,9 @@ describe('settings information architecture', () => {
     const security = read('web/src/components/settings/SecuritySection.tsx');
 
     expect(profile).not.toMatch(/密码|default_require_mention|桌面通知/);
-    expect(preferences).toMatch(/当前设备|桌面通知|恢复上次页面/);
+    expect(preferences).toMatch(
+      /当前设备|运行中的后续消息|排队|引导|桌面通知|恢复上次页面/,
+    );
     expect(channels).toMatch(
       /新群默认响应方式|已接入会话|default_require_mention/,
     );

@@ -52,7 +52,13 @@ import {
 } from './db.js';
 import { getUserDingTalkConfig } from './runtime-config.js';
 import { logger } from './logger.js';
-import type { ChannelMessageMeta } from './types.js';
+import type {
+  ChannelMessageMeta,
+  FollowUpAction,
+  FollowUpActionResult,
+  FollowUpDisposition,
+  FollowUpMode,
+} from './types.js';
 import {
   channelConversationJid,
   extractProviderTarget,
@@ -143,12 +149,31 @@ export interface ConnectFeishuOptions {
     sourceJid?: string;
   } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  onFollowUpMessage?: (input: {
+    targetJid: string;
+    sourceJid: string;
+    messageId: string;
+    senderImId: string;
+    requestedMode?: FollowUpMode;
+    repliedToActiveCard: boolean;
+  }) => FollowUpDisposition;
+  onFollowUpCardAction?: (input: {
+    sourceJid: string;
+    targetJid: string;
+    messageId: string;
+    action: FollowUpAction;
+    expectedRunId: string;
+    operatorImId: string;
+  }) => Promise<FollowUpActionResult> | FollowUpActionResult;
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   onBotRemovedFromGroup?: (chatJid: string) => void;
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
   isSenderAllowedInGroup?: (chatJid: string, senderImId?: string) => boolean;
-  onCardInterrupt?: (chatJid: string) => void;
+  onCardInterrupt?: (
+    chatJid: string,
+    operatorImId: string,
+  ) => FollowUpActionResult;
   onP2pSender?: (senderOpenId: string) => void;
 }
 
@@ -341,6 +366,33 @@ export class IMConnectionManager {
             },
           }
         : {}),
+      ...(opts.onFollowUpMessage
+        ? {
+            onFollowUpMessage: (
+              input: Parameters<
+                NonNullable<IMChannelConnectOpts['onFollowUpMessage']>
+              >[0],
+            ) =>
+              inboundAllowed()
+                ? opts.onFollowUpMessage!(input)
+                : { disposition: 'queued' as const },
+          }
+        : {}),
+      ...(opts.onFollowUpCardAction
+        ? {
+            onFollowUpCardAction: (
+              input: Parameters<
+                NonNullable<IMChannelConnectOpts['onFollowUpCardAction']>
+              >[0],
+            ) =>
+              inboundAllowed()
+                ? opts.onFollowUpCardAction!(input)
+                : {
+                    ok: false,
+                    message: '当前连接已停用，无法执行操作。',
+                  },
+          }
+        : {}),
       ...(opts.onBotAddedToGroup
         ? {
             onBotAddedToGroup: (jid: string, name: string) => {
@@ -387,9 +439,10 @@ export class IMConnectionManager {
         : {}),
       ...(opts.onCardInterrupt
         ? {
-            onCardInterrupt: (jid: string) => {
-              if (inboundAllowed()) opts.onCardInterrupt!(scope(jid));
-            },
+            onCardInterrupt: (jid: string, operatorImId: string) =>
+              inboundAllowed()
+                ? opts.onCardInterrupt!(scope(jid), operatorImId)
+                : { ok: false, message: '当前连接已停用，无法执行操作。' },
           }
         : {}),
       ...(opts.onP2pSender
@@ -987,6 +1040,8 @@ export class IMConnectionManager {
         resolveGroupFolder: options?.resolveGroupFolder,
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
+        onFollowUpMessage: options?.onFollowUpMessage,
+        onFollowUpCardAction: options?.onFollowUpCardAction,
         onBotAddedToGroup: options?.onBotAddedToGroup,
         onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
         shouldProcessGroupMessage: options?.shouldProcessGroupMessage,

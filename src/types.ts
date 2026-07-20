@@ -253,6 +253,52 @@ export interface NewMessage {
   source_kind?: MessageSourceKind | null;
   finalization_reason?: MessageFinalizationReason | null;
   task_id?: string | null;
+  delivery_mode?: FollowUpMode | null;
+  delivery_status?: FollowUpStatus | null;
+  delivery_run_id?: string | null;
+  delivery_priority?: number | null;
+  delivery_updated_at?: string | null;
+}
+
+export type FollowUpMode = 'queue' | 'steer';
+
+export type FollowUpStatus = 'queued' | 'promoting' | 'released' | 'cancelled';
+
+export interface QueuedFollowUp {
+  id: string;
+  chat_jid: string;
+  source_jid?: string;
+  sender: string;
+  sender_name: string;
+  content: string;
+  timestamp: string;
+  attachments?: string;
+  delivery_mode: FollowUpMode;
+  delivery_status: 'queued' | 'promoting';
+  delivery_run_id?: string | null;
+  delivery_priority: number;
+}
+
+export interface FollowUpTransition {
+  id: string;
+  delivery_status: 'released' | 'cancelled';
+  delivery_run_id?: string | null;
+  delivery_updated_at: string;
+}
+
+export interface FollowUpDisposition {
+  disposition: 'started' | 'queued' | 'steered';
+  runId?: string;
+  position?: number;
+}
+
+export type FollowUpAction = 'steer' | 'cancel' | 'interrupt_and_run';
+
+export interface FollowUpActionResult {
+  ok: boolean;
+  state?: 'steered' | 'cancelled' | 'interrupting' | 'queued';
+  message: string;
+  item?: QueuedFollowUp;
 }
 
 export type MessageSourceKind =
@@ -609,6 +655,13 @@ export interface ImContextBinding {
   updated_at: string;
 }
 
+export interface ActiveRunSnapshot {
+  chatJid: string;
+  runId: string | null;
+  startedAt: string;
+  phase: 'queued' | 'preparing' | 'running';
+}
+
 // WebSocket message types
 export type WsMessageOut =
   | {
@@ -654,6 +707,24 @@ export type WsMessageOut =
       type: 'runner_state';
       chatJid: string;
       state: 'idle' | 'running';
+    }
+  | {
+      type: 'run_started';
+      chatJid: string;
+      runId: string;
+      startedAt: string;
+      phase: 'preparing';
+    }
+  | {
+      type: 'active_run_snapshot';
+      runs: ActiveRunSnapshot[];
+    }
+  | {
+      type: 'follow_up_update';
+      chatJid: string;
+      items: QueuedFollowUp[];
+      agentId?: string;
+      transition?: FollowUpTransition;
     }
   | {
       type: 'task_state';
@@ -756,6 +827,7 @@ export type WsMessageIn =
       content: string;
       attachments?: MessageAttachment[];
       agentId?: string;
+      followUpBehavior?: FollowUpMode;
     }
   | { type: 'terminal_start'; chatJid: string; cols: number; rows: number }
   | { type: 'terminal_input'; chatJid: string; data: string }

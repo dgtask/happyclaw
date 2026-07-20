@@ -47,7 +47,13 @@ import {
   type WhatsAppConnectionState,
 } from './whatsapp.js';
 import { logger } from './logger.js';
-import type { ChannelMessageMeta } from './types.js';
+import type {
+  ChannelMessageMeta,
+  FollowUpAction,
+  FollowUpActionResult,
+  FollowUpDisposition,
+  FollowUpMode,
+} from './types.js';
 import {
   StreamingCardController,
   type StreamingCardOptions,
@@ -102,6 +108,22 @@ export interface IMChannelConnectOpts {
   } | null;
   /** 当 IM 消息被路由到 conversation agent 后调用，触发 agent 处理 */
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  onFollowUpMessage?: (input: {
+    targetJid: string;
+    sourceJid: string;
+    messageId: string;
+    senderImId: string;
+    requestedMode?: FollowUpMode;
+    repliedToActiveCard: boolean;
+  }) => FollowUpDisposition;
+  onFollowUpCardAction?: (input: {
+    sourceJid: string;
+    targetJid: string;
+    messageId: string;
+    action: FollowUpAction;
+    expectedRunId: string;
+    operatorImId: string;
+  }) => Promise<FollowUpActionResult> | FollowUpActionResult;
   /** Bot 被添加到群聊时调用 */
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   /** Bot 被移出群聊或群被解散时调用 */
@@ -117,7 +139,10 @@ export interface IMChannelConnectOpts {
     jid: string,
   ) => { activation_mode?: string } | undefined;
   /** 飞书流式卡片按钮中断回调 */
-  onCardInterrupt?: (chatJid: string) => void;
+  onCardInterrupt?: (
+    chatJid: string,
+    operatorImId: string,
+  ) => FollowUpActionResult;
   /** P2P（私聊）消息到达时调用，用于自动检测 owner open_id（仅飞书） */
   onP2pSender?: (senderOpenId: string) => void;
   /** Canonicalize an inbound provider JID before persistence/callbacks. */
@@ -216,6 +241,8 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         resolveGroupFolder: opts.resolveGroupFolder,
         resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
         onAgentMessage: opts.onAgentMessage,
+        onFollowUpMessage: opts.onFollowUpMessage,
+        onFollowUpCardAction: opts.onFollowUpCardAction,
         onBotAddedToGroup: opts.onBotAddedToGroup,
         onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
         shouldProcessGroupMessage: opts.shouldProcessGroupMessage,

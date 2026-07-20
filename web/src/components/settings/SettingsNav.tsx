@@ -1,5 +1,4 @@
 import {
-  Bell,
   CreditCard,
   Gauge,
   Info,
@@ -9,6 +8,7 @@ import {
   ShieldCheck,
   Bot,
   ServerCog,
+  Settings2,
   ListTodo,
   SlidersHorizontal,
   User,
@@ -35,8 +35,8 @@ const accountItems: NavItem[] = [
   { key: 'profile', label: '个人资料', icon: <User className="size-4" /> },
   {
     key: 'preferences',
-    label: '外观与通知',
-    icon: <Bell className="size-4" />,
+    label: '常规',
+    icon: <Settings2 className="size-4" />,
   },
   {
     key: 'my-channels',

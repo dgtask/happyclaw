@@ -169,10 +169,14 @@ export interface StreamEvent {
   usage?: {
     /** Stable logical run ID used to make analytics and billing idempotent. */
     eventId?: string;
+    /** Position inside one result's per-message ledger batch (0-based). */
+    batchIndex?: number;
+    batchCount?: number;
     inputTokens: number;
     outputTokens: number;
     cacheReadInputTokens: number;
     cacheCreationInputTokens: number;
+    reasoningTokens: number;
     costUSD: number;
     durationMs: number;
     numTurns: number;
@@ -183,6 +187,7 @@ export interface StreamEvent {
         outputTokens: number;
         cacheReadInputTokens: number;
         cacheCreationInputTokens: number;
+        reasoningTokens: number;
         costUSD: number;
       }
     >;

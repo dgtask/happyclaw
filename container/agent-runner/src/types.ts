@@ -80,6 +80,10 @@ export interface ContainerOutput {
   /** This SDK result durably completed the user-input turn associated with it.
    * False/absent for truncated, background-pending, interrupted, and error paths. */
   inputTurnCompleted?: boolean;
+  /** True only when the completed SDK input turn left no accepted steer turns
+   * waiting in the same streaming query. Hosts use this—not merely a result—to
+   * release the next durable queued follow-up. */
+  queryIdle?: boolean;
   ipcReceipts?: Array<{
     deliveryId: string;
     chatJid: string;

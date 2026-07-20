@@ -6,6 +6,7 @@ export interface UsageSummary {
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+  reasoningTokens: number;
   totalTokens: number;
   providerEstimatedCostUSD: number;
   billedCostUSD: number | null;
@@ -18,6 +19,7 @@ export interface UsageSummary {
   totalOutputTokens: number;
   totalCacheReadTokens: number;
   totalCacheCreationTokens: number;
+  totalReasoningTokens: number;
   totalCostUSD: number;
   totalMessages: number;
   totalActiveDays: number;
@@ -36,6 +38,7 @@ export interface UsageBreakdown {
   output_tokens: number;
   cache_read_tokens: number;
   cache_creation_tokens: number;
+  reasoning_tokens: number;
   provider_estimated_cost_usd: number;
   billed_cost_usd: number | null;
   run_count: number;
@@ -51,6 +54,7 @@ export interface UsageDailyBucket {
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+  reasoningTokens: number;
   totalTokens: number;
   providerEstimatedCostUSD: number;
   billedCostUSD: number | null;
@@ -100,6 +104,7 @@ export interface UsageAttributionItem {
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+  reasoningTokens: number;
   totalTokens: number;
   providerEstimatedCostUSD: number;
   billedCostUSD: number | null;
@@ -126,6 +131,7 @@ interface RawUsageSummary {
   outputTokens?: number;
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
+  reasoningTokens?: number;
   totalTokens?: number;
   providerEstimatedCostUSD?: number;
   billedCostUSD?: number | null;
@@ -136,6 +142,7 @@ interface RawUsageSummary {
   totalOutputTokens?: number;
   totalCacheReadTokens?: number;
   totalCacheCreationTokens?: number;
+  totalReasoningTokens?: number;
   totalCostUSD?: number;
   totalMessages?: number;
   totalActiveDays?: number;
@@ -154,6 +161,7 @@ interface RawUsageBreakdown {
   output_tokens?: number;
   cache_read_tokens?: number;
   cache_creation_tokens?: number;
+  reasoning_tokens?: number;
   provider_estimated_cost_usd?: number;
   billed_cost_usd?: number | null;
   run_count?: number;
@@ -239,6 +247,7 @@ function normalizeBreakdown(row: RawUsageBreakdown): UsageBreakdown {
     output_tokens: finiteNumber(row.output_tokens),
     cache_read_tokens: finiteNumber(row.cache_read_tokens),
     cache_creation_tokens: finiteNumber(row.cache_creation_tokens),
+    reasoning_tokens: finiteNumber(row.reasoning_tokens),
     provider_estimated_cost_usd: estimatedCost,
     billed_cost_usd:
       typeof row.billed_cost_usd === 'number' ? row.billed_cost_usd : null,
@@ -254,14 +263,20 @@ function normalizeDailyBucket(row: RawUsageBreakdown): UsageDailyBucket {
   const outputTokens = finiteNumber(row.output_tokens);
   const cacheReadTokens = finiteNumber(row.cache_read_tokens);
   const cacheCreationTokens = finiteNumber(row.cache_creation_tokens);
+  const reasoningTokens = finiteNumber(row.reasoning_tokens);
   return {
     date: row.date,
     inputTokens,
     outputTokens,
     cacheReadTokens,
     cacheCreationTokens,
+    reasoningTokens,
     totalTokens:
-      inputTokens + outputTokens + cacheReadTokens + cacheCreationTokens,
+      inputTokens +
+      outputTokens +
+      cacheReadTokens +
+      cacheCreationTokens +
+      reasoningTokens,
     providerEstimatedCostUSD: finiteNumber(
       row.provider_estimated_cost_usd ?? row.cost_usd,
     ),
@@ -281,6 +296,7 @@ function normalizeAttributionItem(item: unknown): UsageAttributionItem | null {
       outputTokens: 0,
       cacheReadTokens: 0,
       cacheCreationTokens: 0,
+      reasoningTokens: 0,
       totalTokens: 0,
       providerEstimatedCostUSD: 0,
       billedCostUSD: null,
@@ -299,6 +315,7 @@ function normalizeAttributionItem(item: unknown): UsageAttributionItem | null {
     outputTokens: finiteNumber(record.outputTokens),
     cacheReadTokens: finiteNumber(record.cacheReadTokens),
     cacheCreationTokens: finiteNumber(record.cacheCreationTokens),
+    reasoningTokens: finiteNumber(record.reasoningTokens),
     totalTokens: finiteNumber(record.totalTokens),
     providerEstimatedCostUSD: finiteNumber(record.providerEstimatedCostUSD),
     billedCostUSD:
@@ -334,6 +351,7 @@ function aggregateSummary(
       acc.output += row.output_tokens;
       acc.cacheRead += row.cache_read_tokens;
       acc.cacheCreation += row.cache_creation_tokens;
+      acc.reasoning += row.reasoning_tokens;
       acc.estimatedCost += row.provider_estimated_cost_usd;
       if (row.billed_cost_usd !== null) {
         acc.hasBilledCost = true;
@@ -349,6 +367,7 @@ function aggregateSummary(
       output: 0,
       cacheRead: 0,
       cacheCreation: 0,
+      reasoning: 0,
       estimatedCost: 0,
       billedCost: 0,
       hasBilledCost: false,
@@ -376,13 +395,18 @@ function aggregateSummary(
         ? totals.billedCost
         : null;
   const totalTokens =
-    totals.input + totals.output + totals.cacheRead + totals.cacheCreation;
+    totals.input +
+    totals.output +
+    totals.cacheRead +
+    totals.cacheCreation +
+    totals.reasoning;
 
   return {
     inputTokens: totals.input,
     outputTokens: totals.output,
     cacheReadTokens: totals.cacheRead,
     cacheCreationTokens: totals.cacheCreation,
+    reasoningTokens: totals.reasoning,
     totalTokens,
     providerEstimatedCostUSD: totals.estimatedCost,
     billedCostUSD: billedCost,
@@ -394,6 +418,7 @@ function aggregateSummary(
     totalOutputTokens: totals.output,
     totalCacheReadTokens: totals.cacheRead,
     totalCacheCreationTokens: totals.cacheCreation,
+    totalReasoningTokens: totals.reasoning,
     totalCostUSD: totals.estimatedCost,
     totalMessages: runCount,
     totalActiveDays: totals.dates.size,
@@ -434,7 +459,7 @@ export function normalizeUsageResponse(
             ? raw.billing.applicable
             : raw.billing.enabled === true,
         providerCostSemantics:
-          raw.billing.providerCostSemantics || 'sdk-estimate',
+          raw.billing.providerCostSemantics || 'kaboo-utc-30m-rounded-estimate',
         billedCostSemantics: raw.billing.billedCostSemantics || 'actual-charge',
       }
     : null;

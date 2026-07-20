@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
 
 import {
+  getRecordedUsageEventCost,
+  getUsagePricingBucketTotals,
   getUserById,
   recordUsageEventBatch,
   type UsageModelRecordInput,
@@ -10,6 +12,11 @@ import {
   getUserEffectivePlan,
   isBillingEnabled,
 } from './billing.js';
+import {
+  estimateKabooModelCostCents,
+  kabooCostCentsToUSD,
+  priceKabooUsageByModel,
+} from './kaboo-pricing.js';
 
 export interface UsagePayload {
   eventId?: string;
@@ -17,6 +24,7 @@ export interface UsagePayload {
   outputTokens: number;
   cacheReadInputTokens: number;
   cacheCreationInputTokens: number;
+  reasoningTokens?: number;
   costUSD: number;
   durationMs: number;
   numTurns: number;
@@ -27,6 +35,7 @@ export interface UsagePayload {
       outputTokens: number;
       cacheReadInputTokens: number;
       cacheCreationInputTokens: number;
+      reasoningTokens?: number;
       costUSD: number;
     }
   >;
@@ -48,6 +57,34 @@ function safe(value: number | undefined): number {
   return Number.isFinite(value) ? Math.max(0, value || 0) : 0;
 }
 
+function usageIdentityPayload(usage: UsagePayload): Record<string, unknown> {
+  const modelUsage = Object.fromEntries(
+    Object.entries(usage.modelUsage || {})
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([model, value]) => [
+        model,
+        {
+          inputTokens: value.inputTokens,
+          outputTokens: value.outputTokens,
+          cacheReadInputTokens: value.cacheReadInputTokens,
+          cacheCreationInputTokens: value.cacheCreationInputTokens,
+          reasoningTokens: value.reasoningTokens || 0,
+        },
+      ]),
+  );
+  return {
+    eventId: usage.eventId,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    cacheReadInputTokens: usage.cacheReadInputTokens,
+    cacheCreationInputTokens: usage.cacheCreationInputTokens,
+    reasoningTokens: usage.reasoningTokens || 0,
+    durationMs: usage.durationMs,
+    numTurns: usage.numTurns,
+    modelUsage,
+  };
+}
+
 /**
  * Compatibility fallback for integrations that have not started sending a
  * runner event ID yet. It is deterministic for the same message + payload,
@@ -65,7 +102,9 @@ export function deriveUsageEventId(options: RecordUsageEventOptions): string {
         agentId: options.agentId || null,
         messageId: options.messageId || null,
         source: options.source || 'agent',
-        usage: options.usage,
+        // SDK dollar estimates are deliberately excluded: they are neither an
+        // accounting authority nor part of a logical event's identity.
+        usage: usageIdentityPayload(options.usage),
       }),
     )
     .digest('hex')}`;
@@ -86,8 +125,23 @@ export function recordUsageEvent(options: RecordUsageEventOptions): {
   billedCostUSD: number;
 } {
   const eventId = deriveUsageEventId(options);
+  const existing = getRecordedUsageEventCost(eventId);
+  if (existing) {
+    return { eventId, inserted: false, ...existing };
+  }
   const usage = options.usage;
-  const providerEstimatedCostUSD = safe(usage.costUSD);
+  const source = options.source?.trim() || 'agent';
+  const createdAt = options.createdAt || new Date().toISOString();
+  const priced = priceKabooUsageByModel(
+    {
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheReadInputTokens: usage.cacheReadInputTokens,
+      cacheCreationInputTokens: usage.cacheCreationInputTokens,
+      reasoningTokens: usage.reasoningTokens || 0,
+    },
+    usage.modelUsage,
+  );
   const user = getUserById(options.userId);
   const effective = user ? getUserEffectivePlan(options.userId) : null;
   const shouldCharge =
@@ -95,65 +149,55 @@ export function recordUsageEvent(options: RecordUsageEventOptions): {
     user?.role !== 'admin' &&
     isBillingEnabled() &&
     Boolean(effective);
-  const billedCostUSD = shouldCharge
-    ? providerEstimatedCostUSD * (effective?.plan.rate_multiplier ?? 1)
+  const rateMultiplier = shouldCharge
+    ? safe(effective?.plan.rate_multiplier ?? 1)
     : 0;
-
-  const modelEntries = Object.entries(usage.modelUsage || {});
-  const rawModels = modelEntries.length
-    ? modelEntries
-    : [
-        [
-          'unknown',
-          {
-            inputTokens: usage.inputTokens,
-            outputTokens: usage.outputTokens,
-            cacheReadInputTokens: usage.cacheReadInputTokens,
-            cacheCreationInputTokens: usage.cacheCreationInputTokens,
-            costUSD: usage.costUSD,
-          },
-        ] as const,
-      ];
-  const modelEstimatedTotal = rawModels.reduce(
-    (sum, [, model]) => sum + safe(model.costUSD),
-    0,
-  );
-  const modelTokenTotal = rawModels.reduce(
-    (sum, [, model]) =>
-      sum +
-      safe(model.inputTokens) +
-      safe(model.outputTokens) +
-      safe(model.cacheReadInputTokens) +
-      safe(model.cacheCreationInputTokens),
-    0,
-  );
-  const models: UsageModelRecordInput[] = rawModels.map(([model, value]) => {
-    const rawEstimated = safe(value.costUSD);
-    const modelTokens =
-      safe(value.inputTokens) +
-      safe(value.outputTokens) +
-      safe(value.cacheReadInputTokens) +
-      safe(value.cacheCreationInputTokens);
-    // The root SDK cost is the event authority. Some providers omit per-model
-    // costs; distribute the residual deterministically so analytics always
-    // reconciles to the amount used by billing.
-    const share =
-      modelEstimatedTotal > 0
-        ? rawEstimated / modelEstimatedTotal
-        : modelTokenTotal > 0
-          ? modelTokens / modelTokenTotal
-          : 1 / rawModels.length;
-    const estimated = providerEstimatedCostUSD * share;
+  const models: UsageModelRecordInput[] = priced.models.map((model) => {
+    const previous = getUsagePricingBucketTotals({
+      userId: options.userId,
+      groupFolder: options.groupFolder,
+      source,
+      model: model.model,
+      createdAt,
+    });
+    const previousCostCents = estimateKabooModelCostCents(
+      model.model,
+      previous,
+    );
+    const nextCostCents = estimateKabooModelCostCents(model.model, {
+      inputTokens: previous.inputTokens + model.inputTokens,
+      outputTokens: previous.outputTokens + model.outputTokens,
+      cacheReadInputTokens:
+        previous.cacheReadInputTokens + model.cacheReadInputTokens,
+      cacheCreationInputTokens:
+        previous.cacheCreationInputTokens + model.cacheCreationInputTokens,
+      reasoningTokens: previous.reasoningTokens + model.reasoningTokens,
+    });
+    // Store this event's increment to the raw-model/UTC-half-hour headline.
+    // Summing all increments in the bucket equals Kaboo's single rounded cent
+    // value, including the sub-cent carry between small API calls.
+    const incrementalCostUSD = kabooCostCentsToUSD(
+      Math.max(0, nextCostCents - previousCostCents),
+    );
     return {
-      model,
-      inputTokens: safe(value.inputTokens),
-      outputTokens: safe(value.outputTokens),
-      cacheReadInputTokens: safe(value.cacheReadInputTokens),
-      cacheCreationInputTokens: safe(value.cacheCreationInputTokens),
-      providerEstimatedCostUSD: estimated,
-      billedCostUSD: billedCostUSD * share,
+      model: model.model,
+      inputTokens: model.inputTokens,
+      outputTokens: model.outputTokens,
+      cacheReadInputTokens: model.cacheReadInputTokens,
+      cacheCreationInputTokens: model.cacheCreationInputTokens,
+      reasoningTokens: model.reasoningTokens,
+      providerEstimatedCostUSD: incrementalCostUSD,
+      billedCostUSD: incrementalCostUSD * rateMultiplier,
     };
   });
+  const providerEstimatedCostUSD = models.reduce(
+    (sum, model) => sum + model.providerEstimatedCostUSD,
+    0,
+  );
+  const billedCostUSD = models.reduce(
+    (sum, model) => sum + model.billedCostUSD,
+    0,
+  );
 
   const result = recordUsageEventBatch({
     eventId,
@@ -161,16 +205,17 @@ export function recordUsageEvent(options: RecordUsageEventOptions): {
     groupFolder: options.groupFolder,
     agentId: options.agentId,
     messageId: options.messageId,
-    inputTokens: safe(usage.inputTokens),
-    outputTokens: safe(usage.outputTokens),
-    cacheReadInputTokens: safe(usage.cacheReadInputTokens),
-    cacheCreationInputTokens: safe(usage.cacheCreationInputTokens),
+    inputTokens: priced.usage.inputTokens,
+    outputTokens: priced.usage.outputTokens,
+    cacheReadInputTokens: priced.usage.cacheReadInputTokens,
+    cacheCreationInputTokens: priced.usage.cacheCreationInputTokens,
+    reasoningTokens: priced.usage.reasoningTokens,
     providerEstimatedCostUSD,
     billedCostUSD,
     durationMs: safe(usage.durationMs),
     numTurns: safe(usage.numTurns),
-    source: options.source,
-    createdAt: options.createdAt,
+    source,
+    createdAt,
     models,
     trackBillingUsage: Boolean(user),
     chargeBalance: shouldCharge,

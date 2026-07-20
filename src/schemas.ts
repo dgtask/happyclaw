@@ -207,8 +207,10 @@ const MAX_MESSAGE_CONTENT_LENGTH = 64 * 1024;
 export const MessageCreateSchema = z
   .object({
     chatJid: z.string().min(1).max(512),
+    agentId: z.string().uuid().optional(),
     content: z.string().max(MAX_MESSAGE_CONTENT_LENGTH).optional().default(''),
     attachments: z.array(MessageAttachmentSchema).max(10).optional(),
+    followUpBehavior: z.enum(['queue', 'steer']).optional().default('queue'),
   })
   .superRefine((data, ctx) => {
     const hasContent = data.content.trim().length > 0;

@@ -17,6 +17,7 @@ export interface DailyUsagePoint {
   inputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+  reasoningTokens: number;
   outputTokens: number;
   totalTokens: number;
   providerEstimatedCostUSD: number;
@@ -30,6 +31,7 @@ const TOKEN_LABELS: Record<string, string> = {
   cacheReadTokens: '缓存读取',
   cacheCreationTokens: '缓存写入',
   outputTokens: '输出',
+  reasoningTokens: '推理',
 };
 
 function formatCost(value: number): string {
@@ -58,7 +60,7 @@ export function UsageTrendChart({
       role="img"
       aria-label={
         metric === 'tokens'
-          ? '每日 Token 趋势图，按普通输入、缓存读取、缓存写入和输出堆叠展示'
+          ? '每日 Token 趋势图，按普通输入、缓存读取、缓存写入、输出和推理堆叠展示'
           : metric === 'cost'
             ? '每日模型估算费用趋势图'
             : '每日 Agent 运行次数趋势图'
@@ -135,6 +137,11 @@ export function UsageTrendChart({
                 dataKey="outputTokens"
                 stackId="tokens"
                 fill="var(--chart-4)"
+              />
+              <Bar
+                dataKey="reasoningTokens"
+                stackId="tokens"
+                fill="var(--chart-5)"
                 radius={[3, 3, 0, 0]}
               />
             </>

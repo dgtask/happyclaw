@@ -294,6 +294,8 @@ export interface ContainerOutput {
    * >0 时主进程把流式卡片保持在「后台任务运行中」而非定稿。 */
   pendingBgTasks?: number;
   inputTurnCompleted?: boolean;
+  /** The streaming SDK query has no accepted user turn left to process. */
+  queryIdle?: boolean;
   ipcReceipts?: Array<{
     deliveryId: string;
     chatJid: string;

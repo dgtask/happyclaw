@@ -81,6 +81,8 @@ import {
   getUserById,
   updateAgentContextInfo,
   updateChatName,
+  listQueuedFollowUps,
+  setMessageFollowUp,
 } from './db.js';
 import { getGroupAllowedUserIds } from './group-broadcast-acl.js';
 import { markdownToPlainText } from './im-utils.js';
@@ -88,6 +90,9 @@ import { isSessionExpired } from './auth.js';
 import type {
   AgentStatus,
   NewMessage,
+  FollowUpMode,
+  FollowUpTransition,
+  QueuedFollowUp,
   WsMessageOut,
   WsMessageIn,
   AuthUser,
@@ -273,7 +278,8 @@ app.post('/api/messages', authMiddleware, async (c) => {
     );
   }
 
-  const { chatJid, content, attachments } = validation.data;
+  const { chatJid, agentId, content, attachments, followUpBehavior } =
+    validation.data;
   const group = getRegisteredGroup(chatJid);
   if (!group) return c.json({ error: 'Group not found' }, 404);
   const authUser = c.get('user') as AuthUser;
@@ -285,6 +291,13 @@ app.post('/api/messages', authMiddleware, async (c) => {
       { error: 'Insufficient permissions for host execution mode' },
       403,
     );
+  }
+
+  if (agentId) {
+    const agent = getAgent(agentId);
+    if (!agent || agent.kind !== 'conversation' || agent.chat_jid !== chatJid) {
+      return c.json({ error: 'Agent not found' }, 404);
+    }
   }
 
   // /clear: reset session without entering message pipeline.
@@ -302,12 +315,17 @@ app.post('/api/messages', authMiddleware, async (c) => {
     }
     if (!deps) return c.json({ error: 'Server not initialized' }, 500);
     try {
-      await executeSessionReset(chatJid, group.folder, {
-        queue: deps.queue,
-        sessions: deps.getSessions(),
-        broadcast: broadcastNewMessage,
-        setLastAgentTimestamp: deps.setLastAgentTimestamp,
-      });
+      await executeSessionReset(
+        chatJid,
+        group.folder,
+        {
+          queue: deps.queue,
+          sessions: deps.getSessions(),
+          broadcast: broadcastNewMessage,
+          setLastAgentTimestamp: deps.setLastAgentTimestamp,
+        },
+        agentId,
+      );
       return c.json({ success: true, cleared: true });
     } catch (err) {
       logger.error({ chatJid, err }, '/clear command failed');
@@ -336,19 +354,132 @@ app.post('/api/messages', authMiddleware, async (c) => {
     }
   }
 
+  if (agentId) {
+    const result = await handleAgentConversationMessage(
+      chatJid,
+      agentId,
+      content.trim(),
+      authUser.id,
+      authUser.display_name || authUser.username,
+      attachments,
+      followUpBehavior,
+    );
+    if (!result.ok) return c.json({ error: result.error }, result.status);
+    return c.json({ success: true, ...result });
+  }
+
   const result = await handleWebUserMessage(
     chatJid,
     content.trim(),
     attachments,
     authUser.id,
     authUser.display_name || authUser.username,
+    followUpBehavior,
   );
   if (!result.ok) return c.json({ error: result.error }, result.status);
   return c.json({
     success: true,
     messageId: result.messageId,
     timestamp: result.timestamp,
+    disposition: result.disposition,
+    runId: result.runId,
   });
+});
+
+app.get('/api/follow-ups', authMiddleware, async (c) => {
+  if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+  const chatJid = c.req.query('chatJid')?.trim();
+  if (!chatJid) return c.json({ error: 'chatJid is required' }, 400);
+  const baseJid = chatJid.includes('#agent:')
+    ? chatJid.slice(0, chatJid.indexOf('#agent:'))
+    : chatJid;
+  const group = getRegisteredGroup(baseJid);
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup(authUser, group)) {
+    return c.json({ error: 'Access denied' }, 403);
+  }
+  return c.json({ items: listQueuedFollowUps(chatJid) });
+});
+
+app.post('/api/follow-ups/:messageId/action', authMiddleware, async (c) => {
+  if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+  const messageId = c.req.param('messageId');
+  const body = (await c.req.json().catch(() => ({}))) as {
+    chatJid?: string;
+    action?:
+      | 'steer'
+      | 'cancel'
+      | 'edit'
+      | 'move_up'
+      | 'move_down'
+      | 'interrupt_and_run';
+    expectedRunId?: string;
+    content?: string;
+  };
+  const chatJid = body.chatJid?.trim();
+  if (!chatJid || !body.action) {
+    return c.json({ error: 'chatJid and action are required' }, 400);
+  }
+  const baseJid = chatJid.includes('#agent:')
+    ? chatJid.slice(0, chatJid.indexOf('#agent:'))
+    : chatJid;
+  const group = getRegisteredGroup(baseJid);
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup(authUser, group)) {
+    return c.json({ error: 'Access denied' }, 403);
+  }
+
+  let result;
+  if (body.action === 'cancel') {
+    result = deps.cancelFollowUp?.(chatJid, messageId);
+  } else if (body.action === 'edit') {
+    const content = body.content?.trim();
+    if (!content || content.length > 64 * 1024) {
+      return c.json(
+        { error: 'content must be between 1 and 65536 characters' },
+        400,
+      );
+    }
+    result = deps.editFollowUp?.(chatJid, messageId, content);
+  } else if (body.action === 'move_up' || body.action === 'move_down') {
+    result = deps.reorderFollowUp?.(
+      chatJid,
+      messageId,
+      body.action === 'move_up' ? 'up' : 'down',
+    );
+  } else if (body.action === 'steer') {
+    const currentRunId = deps.queue.getActiveQueryId(chatJid);
+    const targetRunId = currentRunId ?? body.expectedRunId;
+    if (!targetRunId) {
+      return c.json({ error: 'expectedRunId is required' }, 400);
+    }
+    result = await deps.promoteFollowUp?.(chatJid, messageId, targetRunId);
+  } else {
+    if (
+      !canModifyGroup(
+        { id: authUser.id, role: authUser.role },
+        { ...group, jid: baseJid },
+      )
+    ) {
+      return c.json(
+        { error: 'Only the workspace owner can interrupt it' },
+        403,
+      );
+    }
+    if (!body.expectedRunId) {
+      return c.json({ error: 'expectedRunId is required' }, 400);
+    }
+    result = deps.interruptAndRunFollowUp?.(
+      chatJid,
+      messageId,
+      body.expectedRunId,
+    );
+  }
+  if (!result) return c.json({ error: 'Follow-up action unavailable' }, 503);
+  if (!result.ok) return c.json({ ...result, error: result.message }, 409);
+  return c.json(result, 200);
 });
 
 // --- handleWebUserMessage ---
@@ -359,11 +490,14 @@ async function handleWebUserMessage(
   attachments?: Array<{ type: 'image'; data: string; mimeType?: string }>,
   userId = 'web-user',
   displayName = 'Web',
+  followUpBehavior: FollowUpMode = 'queue',
 ): Promise<
   | {
       ok: true;
       messageId: string;
       timestamp: string;
+      disposition: 'started' | 'queued' | 'steered';
+      runId?: string;
     }
   | {
       ok: false;
@@ -397,6 +531,13 @@ async function handleWebUserMessage(
     normalizedAttachments.length > 0
       ? JSON.stringify(normalizedAttachments)
       : undefined;
+  const activeRunId = deps.queue.getActiveQueryId(chatJid);
+  const effectiveFollowUpBehavior: FollowUpMode = followUpBehavior;
+  // Both queue and steer remain durable until the active query reaches idle.
+  // A steer requests a controlled interrupt below; it must not be released
+  // early and injected into Claude as a best-effort queued_command attachment.
+  const queueForLater = !!activeRunId;
+  const deliveryStatus = activeRunId ? 'queued' : null;
   storeMessageDirect(
     messageId,
     chatJid,
@@ -405,7 +546,17 @@ async function handleWebUserMessage(
     content,
     timestamp,
     false,
-    { attachments: attachmentsStr },
+    {
+      attachments: attachmentsStr,
+      meta: activeRunId
+        ? {
+            deliveryMode: effectiveFollowUpBehavior,
+            deliveryStatus,
+            deliveryRunId: activeRunId,
+            deliveryUpdatedAt: timestamp,
+          }
+        : undefined,
+    },
   );
 
   broadcastNewMessage(chatJid, {
@@ -417,6 +568,10 @@ async function handleWebUserMessage(
     timestamp,
     is_from_me: false,
     attachments: attachmentsStr,
+    delivery_mode: activeRunId ? effectiveFollowUpBehavior : null,
+    delivery_status: deliveryStatus,
+    delivery_run_id: activeRunId,
+    delivery_updated_at: activeRunId ? timestamp : null,
   });
 
   if (group.created_by) {
@@ -424,6 +579,23 @@ async function handleWebUserMessage(
     if (owner && owner.role !== 'admin') {
       const accessResult = checkBillingAccess(group.created_by, owner.role);
       if (!accessResult.allowed) {
+        if (queueForLater) {
+          const deliveryUpdatedAt = new Date().toISOString();
+          setMessageFollowUp(chatJid, messageId, {
+            mode: effectiveFollowUpBehavior,
+            // This input received a terminal billing response, so it belongs
+            // in the transcript immediately before that response rather than
+            // behaving like a user-cancelled queued message.
+            status: 'released',
+            runId: activeRunId,
+          });
+          broadcastFollowUpUpdate(chatJid, {
+            id: messageId,
+            delivery_status: 'released',
+            delivery_run_id: activeRunId,
+            delivery_updated_at: deliveryUpdatedAt,
+          });
+        }
         const sysMsg = formatBillingAccessDeniedMessage(accessResult);
         const sysMsgId = `sys_quota_${Date.now()}`;
         const sysTimestamp = new Date().toISOString();
@@ -450,9 +622,35 @@ async function handleWebUserMessage(
           id: messageId,
         });
         deps.advanceGlobalCursor({ timestamp, id: messageId });
-        return { ok: true, messageId, timestamp };
+        return { ok: true, messageId, timestamp, disposition: 'started' };
       }
     }
+  }
+
+  if (queueForLater) {
+    broadcastFollowUpUpdate(chatJid);
+    deps.advanceGlobalCursor({ timestamp, id: messageId });
+    if (effectiveFollowUpBehavior === 'steer') {
+      const steerResult = await deps.promoteFollowUp?.(
+        chatJid,
+        messageId,
+        activeRunId!,
+      );
+      return {
+        ok: true,
+        messageId,
+        timestamp,
+        disposition: steerResult?.ok ? 'steered' : 'queued',
+        runId: activeRunId!,
+      };
+    }
+    return {
+      ok: true,
+      messageId,
+      timestamp,
+      disposition: 'queued',
+      runId: activeRunId,
+    };
   }
 
   // Plugin command expander (DMI commands).
@@ -526,7 +724,13 @@ async function handleWebUserMessage(
         const replyCursor = { timestamp, id: messageId };
         completeWebOutOfBandMessage(deps, chatJid, replyCursor);
         deps.advanceGlobalCursor(replyCursor);
-        return { ok: true, messageId, timestamp };
+        return {
+          ok: true,
+          messageId,
+          timestamp,
+          disposition: activeRunId ? 'steered' : 'started',
+          runId: activeRunId ?? undefined,
+        };
       }
       if (expansion.kind === 'expanded') {
         sendContent = expansion.prompt;
@@ -627,7 +831,13 @@ async function handleWebUserMessage(
     deps.advanceNextPullCursorOnly(chatJid, { timestamp, id: messageId });
   }
   deps.advanceGlobalCursor({ timestamp, id: messageId });
-  return { ok: true, messageId, timestamp };
+  return {
+    ok: true,
+    messageId,
+    timestamp,
+    disposition: activeRunId ? 'steered' : 'started',
+    runId: activeRunId ?? undefined,
+  };
 }
 
 // --- Auto-title for conversations ---
@@ -657,8 +867,20 @@ async function handleAgentConversationMessage(
   userId: string,
   displayName: string,
   attachments?: Array<{ type: 'image'; data: string; mimeType?: string }>,
-): Promise<void> {
-  if (!deps) return;
+  followUpBehavior: FollowUpMode = 'queue',
+): Promise<
+  | {
+      ok: true;
+      messageId: string;
+      timestamp: string;
+      disposition: 'started' | 'queued' | 'steered';
+      runId?: string;
+    }
+  | { ok: false; status: 404 | 500; error: string }
+> {
+  if (!deps) {
+    return { ok: false, status: 500, error: 'Server not initialized' };
+  }
 
   const agent = getAgent(agentId);
   if (!agent || agent.kind !== 'conversation' || agent.chat_jid !== chatJid) {
@@ -666,7 +888,7 @@ async function handleAgentConversationMessage(
       { chatJid, agentId },
       'Agent conversation message rejected: agent not found or not a conversation',
     );
-    return;
+    return { ok: false, status: 404, error: 'Agent not found' };
   }
 
   const virtualChatJid = `${chatJid}#agent:${agentId}`;
@@ -686,6 +908,12 @@ async function handleAgentConversationMessage(
     normalizedAttachments.length > 0
       ? JSON.stringify(normalizedAttachments)
       : undefined;
+  const activeRunId = deps.queue.getActiveQueryId(virtualChatJid);
+  const effectiveFollowUpBehavior: FollowUpMode = followUpBehavior;
+  // Keep steering durable across the SDK interrupt boundary, exactly like the
+  // workspace chat path above.
+  const queueForLater = !!activeRunId;
+  const deliveryStatus = activeRunId ? 'queued' : null;
 
   ensureChatExists(virtualChatJid);
   storeMessageDirect(
@@ -696,7 +924,17 @@ async function handleAgentConversationMessage(
     content,
     timestamp,
     false,
-    { attachments: attachmentsStr },
+    {
+      attachments: attachmentsStr,
+      meta: activeRunId
+        ? {
+            deliveryMode: effectiveFollowUpBehavior,
+            deliveryStatus,
+            deliveryRunId: activeRunId,
+            deliveryUpdatedAt: timestamp,
+          }
+        : undefined,
+    },
   );
   updateAgentContextInfo(agentId, { last_active_at: timestamp });
 
@@ -730,9 +968,38 @@ async function handleAgentConversationMessage(
       timestamp,
       is_from_me: false,
       attachments: attachmentsStr,
+      delivery_mode: activeRunId ? effectiveFollowUpBehavior : null,
+      delivery_status: deliveryStatus,
+      delivery_run_id: activeRunId,
+      delivery_updated_at: activeRunId ? timestamp : null,
     },
     agentId,
   );
+
+  if (queueForLater) {
+    broadcastFollowUpUpdate(virtualChatJid);
+    if (effectiveFollowUpBehavior === 'steer') {
+      const steerResult = await deps.promoteFollowUp?.(
+        virtualChatJid,
+        messageId,
+        activeRunId!,
+      );
+      return {
+        ok: true,
+        messageId,
+        timestamp,
+        disposition: steerResult?.ok ? 'steered' : 'queued',
+        runId: activeRunId!,
+      };
+    }
+    return {
+      ok: true,
+      messageId,
+      timestamp,
+      disposition: 'queued',
+      runId: activeRunId,
+    };
+  }
 
   // Plugin command expander (DMI commands).
   //
@@ -799,7 +1066,13 @@ async function handleAgentConversationMessage(
           // same-millisecond batches and re-fire the reply.
           const replyCursor = { timestamp, id: messageId };
           completeWebOutOfBandMessage(deps, virtualChatJid, replyCursor);
-          return;
+          return {
+            ok: true,
+            messageId,
+            timestamp,
+            disposition: activeRunId ? 'steered' : 'started',
+            runId: activeRunId ?? undefined,
+          };
         }
         if (expansion.kind === 'expanded') {
           agentSendContent = expansion.prompt;
@@ -898,6 +1171,13 @@ async function handleAgentConversationMessage(
     }
   }
   // 'sent' needs no further action
+  return {
+    ok: true,
+    messageId,
+    timestamp,
+    disposition: activeRunId ? 'steered' : 'started',
+    runId: activeRunId ?? undefined,
+  };
 }
 
 // --- Static Files ---
@@ -1137,23 +1417,57 @@ function setupWebSocket(server: any): WebSocketServer {
       }
     }
 
-    // Push runner_state: 'running' for all active groups on WS connect.
-    // This prevents a race where a late-arriving new_message clears
-    // waiting=false after snapshot restore, blocking all subsequent
-    // stream events. The runner_state event resets waiting=true.
+    // Push an authoritative logical-run snapshot on every connection. A warm
+    // agent process may be active while no query is running, so process
+    // lifecycle (`active`) is not sufficient for restoring the composer and
+    // stream card after a reconnect.
     if (connSession && deps) {
       const userId = connSession.user_id;
       const queueStatus = deps.queue.getStatus();
+      const runs: Array<{
+        chatJid: string;
+        runId: string | null;
+        startedAt: string;
+        phase: 'queued' | 'preparing' | 'running';
+      }> = [];
       for (const g of queueStatus.groups) {
-        if (!g.active) continue;
-        const jid = normalizeHomeJid(g.jid);
-        const allowed = getGroupAllowedUserIds(g.jid);
+        if (!g.queryInFlight && !g.pendingMessages) continue;
+        const baseJid = stripRuntimeJidSuffix(g.jid);
+        const jid = normalizeRuntimeJid(g.jid);
+        const allowed = getGroupAllowedUserIds(baseJid);
         if (allowed === null || !allowed.has(userId)) continue;
+        const hasStreamSnapshot = streamingSnapshots.has(jid);
+        runs.push({
+          chatJid: jid,
+          runId: g.queryId,
+          startedAt: new Date(g.queryStartedAt ?? Date.now()).toISOString(),
+          phase: g.queryInFlight
+            ? hasStreamSnapshot
+              ? 'running'
+              : 'preparing'
+            : 'queued',
+        });
+      }
+      try {
+        ws.send(
+          JSON.stringify({
+            type: 'active_run_snapshot',
+            runs,
+          } satisfies WsMessageOut),
+        );
+      } catch {
+        /* client not ready */
+      }
+
+      // Keep the established runner_state event for older clients and sidebar
+      // indicators. Unlike the old implementation, only logical work (not a
+      // merely warm process) is reported as running.
+      for (const run of runs) {
         try {
           ws.send(
             JSON.stringify({
               type: 'runner_state',
-              chatJid: jid,
+              chatJid: run.chatJid,
               state: 'running',
             } satisfies WsMessageOut),
           );
@@ -1222,6 +1536,7 @@ function setupWebSocket(server: any): WebSocketServer {
             chatJid: msg.chatJid,
             content: msg.content,
             attachments: msg.attachments,
+            followUpBehavior: msg.followUpBehavior,
           });
           if (!wsValidation.success) {
             sendWsError('消息格式无效', msg.chatJid);
@@ -1234,7 +1549,8 @@ function setupWebSocket(server: any): WebSocketServer {
             );
             return;
           }
-          const { chatJid, content, attachments } = wsValidation.data;
+          const { chatJid, content, attachments, followUpBehavior } =
+            wsValidation.data;
           const agentId = (msg as { agentId?: string }).agentId;
 
           // 群组访问权限检查
@@ -1386,6 +1702,7 @@ function setupWebSocket(server: any): WebSocketServer {
               session.user_id,
               session.display_name || session.username,
               attachments,
+              followUpBehavior,
             );
             return;
           }
@@ -1396,6 +1713,7 @@ function setupWebSocket(server: any): WebSocketServer {
             attachments,
             session.user_id,
             session.display_name || session.username,
+            followUpBehavior,
           );
           if (!result.ok) {
             logger.warn(
@@ -1788,6 +2106,20 @@ function normalizeHomeJid(chatJid: string): string {
   return chatJid;
 }
 
+function stripRuntimeJidSuffix(chatJid: string): string {
+  const markerIndex = chatJid.indexOf('#agent:');
+  return markerIndex >= 0 ? chatJid.slice(0, markerIndex) : chatJid;
+}
+
+/** Normalize the workspace part of a virtual conversation JID without losing
+ * its #agent suffix. */
+function normalizeRuntimeJid(chatJid: string): string {
+  const markerIndex = chatJid.indexOf('#agent:');
+  if (markerIndex < 0) return normalizeHomeJid(chatJid);
+  const baseJid = chatJid.slice(0, markerIndex);
+  return `${normalizeHomeJid(baseJid)}${chatJid.slice(markerIndex)}`;
+}
+
 export function broadcastToWebClients(chatJid: string, text: string): void {
   const timestamp = new Date().toISOString();
   const jid = normalizeHomeJid(chatJid);
@@ -1823,6 +2155,30 @@ export function broadcastNewMessage(
     ...(source ? { source } : {}),
   };
   safeBroadcast(wsMsg, isHostGroupJid(baseChatJid), allowedUserIds);
+}
+
+export function broadcastFollowUpUpdate(
+  chatJid: string,
+  transition?: FollowUpTransition,
+): void {
+  let baseChatJid = chatJid;
+  let agentId: string | undefined;
+  if (chatJid.includes('#agent:')) {
+    const parts = chatJid.split('#agent:');
+    baseChatJid = parts[0];
+    agentId = parts[1];
+  }
+  const jid = normalizeHomeJid(baseChatJid);
+  const allowedUserIds = getGroupAllowedUserIds(baseChatJid);
+  const items = listQueuedFollowUps(chatJid);
+  const msg: WsMessageOut = {
+    type: 'follow_up_update',
+    chatJid: jid,
+    items,
+    ...(agentId ? { agentId } : {}),
+    ...(transition ? { transition } : {}),
+  };
+  safeBroadcast(msg, isHostGroupJid(baseChatJid), allowedUserIds);
 }
 
 export function broadcastTyping(chatJid: string, isTyping: boolean): void {
@@ -2480,14 +2836,15 @@ export function broadcastRunnerState(
   chatJid: string,
   state: 'idle' | 'running',
 ): void {
-  const jid = normalizeHomeJid(chatJid);
-  const allowedUserIds = getGroupAllowedUserIds(chatJid);
+  const baseJid = stripRuntimeJidSuffix(chatJid);
+  const jid = normalizeRuntimeJid(chatJid);
+  const allowedUserIds = getGroupAllowedUserIds(baseJid);
   const msg: WsMessageOut = {
     type: 'runner_state',
     chatJid: jid,
     state,
   };
-  safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
+  safeBroadcast(msg, isHostGroupJid(baseJid), allowedUserIds);
 
   // Clear streaming snapshots when runner goes idle (main + all agent snapshots)
   if (state === 'idle') {
@@ -2517,6 +2874,27 @@ export function broadcastRunnerState(
     // 新 run 启动，恢复快照写入
     snapshotTombstones.delete(jid);
   }
+}
+
+export function broadcastRunStarted(
+  chatJid: string,
+  runId: string,
+  startedAt: number,
+): void {
+  const baseJid = stripRuntimeJidSuffix(chatJid);
+  const jid = normalizeRuntimeJid(chatJid);
+  const allowedUserIds = getGroupAllowedUserIds(baseJid);
+  safeBroadcast(
+    {
+      type: 'run_started',
+      chatJid: jid,
+      runId,
+      startedAt: new Date(startedAt).toISOString(),
+      phase: 'preparing',
+    },
+    isHostGroupJid(baseJid),
+    allowedUserIds,
+  );
 }
 
 export function broadcastDockerBuildLog(line: string): void {
@@ -2638,6 +3016,7 @@ export function startWebServer(webDeps: WebDeps): void {
 
   // Register runner state change callback for sidebar indicators
   webDeps.queue.setOnRunnerStateChange(broadcastRunnerState);
+  webDeps.queue.setOnQueryStart(broadcastRunStarted);
 
   // Broadcast status every 5 seconds
   if (statusInterval) clearInterval(statusInterval);

@@ -3,6 +3,7 @@ import {
   Bell,
   BellOff,
   CheckCircle2,
+  ListTodo,
   Monitor,
   Moon,
   Palette,
@@ -23,6 +24,11 @@ import {
   isRouteRestoreEnabled,
   setRouteRestoreEnabled,
 } from '../../utils/routeRestore';
+import {
+  getDefaultFollowUpMode,
+  setDefaultFollowUpMode,
+  type FollowUpPreference,
+} from '../../lib/follow-up-preferences';
 import { SettingsCard as Section } from './SettingsCard';
 
 const THEME_OPTIONS: { value: Theme; label: string; icon: typeof Sun }[] = [
@@ -190,6 +196,63 @@ function RouteRestoreSection() {
   );
 }
 
+function FollowUpBehaviorSection() {
+  const [mode, setMode] = useState<FollowUpPreference>(() =>
+    getDefaultFollowUpMode(),
+  );
+  const isMac =
+    typeof navigator !== 'undefined' &&
+    /Mac|iPhone|iPad/.test(navigator.userAgent);
+  const alternateShortcut = isMac ? '⌘⇧Enter' : 'Ctrl+Shift+Enter';
+
+  const handleChange = (next: FollowUpPreference) => {
+    setMode(next);
+    setDefaultFollowUpMode(next);
+  };
+
+  return (
+    <Section
+      icon={ListTodo}
+      title="运行中的后续消息"
+      desc="当前设备：选择 Agent 正在运行时发送新消息的默认行为"
+    >
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+        <OptionButton
+          active={mode === 'queue'}
+          onClick={() => handleChange('queue')}
+          className="p-3 text-left"
+        >
+          <span className="block text-sm font-medium text-foreground">
+            排队
+          </span>
+          <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+            等待当前回复完成，再作为下一轮消息发送。
+          </span>
+        </OptionButton>
+        <OptionButton
+          active={mode === 'steer'}
+          onClick={() => handleChange('steer')}
+          className="p-3 text-left"
+        >
+          <span className="block text-sm font-medium text-foreground">
+            引导
+          </span>
+          <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+            中断当前回复，把新消息作为下一轮优先执行。
+          </span>
+        </OptionButton>
+      </div>
+      <p className="text-xs leading-5 text-muted-foreground">
+        发送时按{' '}
+        <kbd className="rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-[11px] text-foreground">
+          {alternateShortcut}
+        </kbd>{' '}
+        可临时使用另一种行为，不会修改默认设置。
+      </p>
+    </Section>
+  );
+}
+
 export function PreferencesSection() {
   const {
     theme,
@@ -202,6 +265,8 @@ export function PreferencesSection() {
 
   return (
     <div className="space-y-4">
+      <FollowUpBehaviorSection />
+
       <Section
         icon={Palette}
         title="界面外观"

@@ -136,8 +136,57 @@ describe('/api/usage contract and isolation', () => {
   test('member model options never expose another user models', async () => {
     process.env.USAGE_TEST_USER = 'user-a';
     process.env.USAGE_TEST_ROLE = 'member';
-    const response = await usage.request(`/models?from=${today}&to=${today}`);
+    const response = await usage.request(
+      `/models?from=${today}&to=${today}&userId=user-b&role=admin`,
+    );
     expect(await response.json()).toEqual({ models: ['private-model-a'] });
+  });
+
+  test('member filter options and user picker remain self-scoped', async () => {
+    process.env.USAGE_TEST_USER = 'user-a';
+    process.env.USAGE_TEST_ROLE = 'member';
+
+    const filters = await usage.request(
+      `/filters?from=${today}&to=${today}&userId=user-b`,
+    );
+    const filterBody = await filters.json();
+    expect(filterBody.models).toEqual([
+      expect.objectContaining({ key: 'private-model-a' }),
+    ]);
+    expect(filterBody.agents).toEqual([
+      expect.objectContaining({ key: 'agent-user-a' }),
+    ]);
+    expect(filterBody.workspaces).toEqual([
+      expect.objectContaining({ key: 'workspace-user-a' }),
+    ]);
+    expect(JSON.stringify(filterBody)).not.toContain('user-b');
+
+    const users = await usage.request('/users');
+    expect(await users.json()).toEqual({
+      users: [{ id: 'user-a', username: 'user-a' }],
+    });
+  });
+
+  test('member cannot use a foreign workspace or agent filter as an oracle', async () => {
+    process.env.USAGE_TEST_USER = 'user-a';
+    process.env.USAGE_TEST_ROLE = 'member';
+
+    const response = await usage.request(
+      `/stats?from=${today}&to=${today}&userId=user-b&groupFolder=workspace-user-b&agentId=agent-user-b`,
+    );
+    const body = await response.json();
+    expect(body.scope).toMatchObject({
+      userId: 'user-a',
+      groupFolder: 'workspace-user-b',
+      agentId: 'agent-user-b',
+    });
+    expect(body.summary).toMatchObject({
+      totalTokens: 0,
+      runCount: 0,
+      modelCallCount: 0,
+    });
+    expect(body.breakdown).toEqual([]);
+    expect(body.daily).toEqual([]);
   });
 
   test('main HappyClaw attribution has a filterable stable sentinel', async () => {
@@ -167,6 +216,36 @@ describe('/api/usage contract and isolation', () => {
     ]);
   });
 
+  test('admin can deliberately scope every usage endpoint to another user', async () => {
+    process.env.USAGE_TEST_USER = 'admin';
+    process.env.USAGE_TEST_ROLE = 'admin';
+    const query = `from=${today}&to=${today}&userId=user-b`;
+
+    const stats = await usage.request(`/stats?${query}`);
+    const statsBody = await stats.json();
+    expect(statsBody.scope.userId).toBe('user-b');
+    expect(statsBody.summary.runCount).toBe(1);
+    expect(statsBody.breakdown).toEqual([
+      expect.objectContaining({
+        user_id: 'user-b',
+        model: 'private-model-b',
+      }),
+    ]);
+
+    const models = await usage.request(`/models?${query}`);
+    expect(await models.json()).toEqual({ models: ['private-model-b'] });
+
+    const records = await usage.request(`/records?${query}`);
+    const recordsBody = await records.json();
+    expect(recordsBody.total).toBe(1);
+    expect(recordsBody.records).toEqual([
+      expect.objectContaining({
+        userId: 'user-b',
+        model: 'private-model-b',
+      }),
+    ]);
+  });
+
   test('admin self scope marks billed cost as not applicable', async () => {
     process.env.USAGE_TEST_USER = 'admin';
     process.env.USAGE_TEST_ROLE = 'admin';
@@ -179,20 +258,29 @@ describe('/api/usage contract and isolation', () => {
     });
   });
 
-  test('records are paginated and CSV export remains member-scoped', async () => {
+  test('records and CSV ignore a member-supplied foreign userId', async () => {
     process.env.USAGE_TEST_USER = 'user-a';
     process.env.USAGE_TEST_ROLE = 'member';
     const records = await usage.request(
-      `/records?from=${today}&to=${today}&page=1&pageSize=1`,
+      `/records?from=${today}&to=${today}&userId=user-b&page=1&pageSize=1`,
     );
-    expect(await records.json()).toMatchObject({
+    const recordsBody = await records.json();
+    expect(recordsBody).toMatchObject({
       total: 1,
       page: 1,
       pageSize: 1,
       totalPages: 1,
     });
+    expect(recordsBody.records).toEqual([
+      expect.objectContaining({
+        userId: 'user-a',
+        model: 'private-model-a',
+      }),
+    ]);
 
-    const csv = await usage.request(`/export.csv?from=${today}&to=${today}`);
+    const csv = await usage.request(
+      `/export.csv?from=${today}&to=${today}&userId=user-b`,
+    );
     expect(csv.headers.get('content-type')).toContain('text/csv');
     const text = await csv.text();
     expect(text).toContain('private-model-a');

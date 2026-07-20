@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { toast } from 'sonner';
-import { useChatStore } from '../../stores/chat';
+import {
+  useChatStore,
+  type FollowUpMode,
+  type QueuedFollowUp,
+} from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { MessageList } from './MessageList';
 import { MessageInput } from './MessageInput';
@@ -58,6 +62,7 @@ const TERMINAL_MAX_RATIO = 0.7;
 
 // Stable empty references to avoid infinite re-render loops in Zustand selectors
 const EMPTY_AGENTS: import('../../types').AgentInfo[] = [];
+const EMPTY_FOLLOW_UPS: QueuedFollowUp[] = [];
 
 interface ChatViewProps {
   groupJid: string;
@@ -124,6 +129,15 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     (s) => s.activeAgentTab[groupJid] ?? null,
   );
   const setActiveAgentTab = useChatStore((s) => s.setActiveAgentTab);
+  const followUpChatJid = activeAgentTab
+    ? `${groupJid}#agent:${activeAgentTab}`
+    : groupJid;
+  const queuedFollowUps = useChatStore(
+    (s) => s.followUps[followUpChatJid] ?? EMPTY_FOLLOW_UPS,
+  );
+  const loadFollowUps = useChatStore((s) => s.loadFollowUps);
+  const handleFollowUpUpdate = useChatStore((s) => s.handleFollowUpUpdate);
+  const actOnFollowUp = useChatStore((s) => s.actOnFollowUp);
 
   // URL `?agent=` is the source of truth for the active sub-conversation tab.
   // Refresh, browser back/forward, route restore, and direct deep-links all
@@ -307,6 +321,13 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     () =>
       agents
         .filter((a) => a.kind === 'conversation')
+        .map((agent) => {
+          const queryActive =
+            !!agentWaiting[agent.id] || !!agentStreaming[agent.id];
+          return agent.status === 'running' && !queryActive
+            ? { ...agent, status: 'idle' as const }
+            : agent;
+        })
         .slice()
         .sort((a, b) => {
           const aTs =
@@ -315,7 +336,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
             b.last_active_at || b.latest_message?.timestamp || b.created_at;
           return new Date(bTs).getTime() - new Date(aTs).getTime();
         }),
-    [agents],
+    [agents, agentStreaming, agentWaiting],
   );
   const mainConversationLabel = group?.is_my_home ? '直接对话' : '当前对话';
   const currentContextName =
@@ -450,33 +471,70 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         handleStreamSnapshot(groupJid, data.snapshot, snapshotAgentId);
       }
     });
+    const unsub5 = wsManager.on('follow_up_update', (data: any) => {
+      if (data.chatJid !== groupJid || !Array.isArray(data.items)) return;
+      const targetJid = data.agentId
+        ? `${groupJid}#agent:${data.agentId}`
+        : groupJid;
+      handleFollowUpUpdate(targetJid, data.items, data.transition);
+    });
     // agent_status 已提升到 AppLayout 全局监听
     return () => {
       unsub1();
       unsub2();
       unsub3();
       unsub4();
+      unsub5();
     };
-  }, [groupJid, handleStreamEvent, handleWsNewMessage, handleStreamSnapshot]);
+  }, [
+    groupJid,
+    handleStreamEvent,
+    handleWsNewMessage,
+    handleStreamSnapshot,
+    handleFollowUpUpdate,
+  ]);
+
+  useEffect(() => {
+    void loadFollowUps(followUpChatJid);
+    const unsub = wsManager.on('connected', () => {
+      void loadFollowUps(followUpChatJid);
+    });
+    return () => {
+      unsub();
+    };
+  }, [followUpChatJid, loadFollowUps]);
 
   const [scrollTrigger, setScrollTrigger] = useState(0);
 
   const handleSend = async (
     content: string,
     attachments?: Array<{ data: string; mimeType: string }>,
+    followUpBehavior?: FollowUpMode,
   ) => {
-    const ok = await sendMessage(groupJid, content, attachments);
+    const ok = await sendMessage(
+      groupJid,
+      content,
+      attachments,
+      followUpBehavior,
+    );
     // 只有发送成功时才触发滚动；失败时保留当前视图位置，避免用户上下文切换。
     if (ok) setScrollTrigger((n) => n + 1);
     return ok;
   };
 
-  const handleActiveAgentSend = (
+  const handleActiveAgentSend = async (
     content: string,
     attachments?: Array<{ data: string; mimeType: string }>,
+    followUpBehavior?: FollowUpMode,
   ) => {
     if (!activeAgentTab) return false;
-    const ok = sendAgentMessage(groupJid, activeAgentTab, content, attachments);
+    const ok = await sendAgentMessage(
+      groupJid,
+      activeAgentTab,
+      content,
+      attachments,
+      followUpBehavior,
+    );
     if (ok) setScrollTrigger((value) => value + 1);
     return ok;
   };
@@ -921,16 +979,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                   }
                   scrollTrigger={scrollTrigger}
                   groupJid={groupJid}
-                  isWaiting={
-                    !!agentWaiting[activeAgentTab] ||
-                    !!agentStreaming[activeAgentTab]
-                  }
-                  onInterrupt={
-                    agentStreaming[activeAgentTab]?.interrupted
-                      ? undefined
-                      : () =>
-                          interruptQuery(`${groupJid}#agent:${activeAgentTab}`)
-                  }
+                  isWaiting={currentContextWaiting}
                   agentId={activeAgentTab}
                   contextLabel={currentContextName}
                   agentName={agentProfileLabel}
@@ -945,6 +994,23 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                   onSend={handleActiveAgentSend}
                   groupJid={groupJid}
                   contextLabel={currentContextName}
+                  isRunning={currentContextWaiting}
+                  onStop={
+                    agentStreaming[activeAgentTab]?.interrupted
+                      ? undefined
+                      : () =>
+                          interruptQuery(`${groupJid}#agent:${activeAgentTab}`)
+                  }
+                  queuedFollowUps={queuedFollowUps}
+                  onFollowUpAction={(item, action, content) =>
+                    actOnFollowUp(
+                      followUpChatJid,
+                      item.id,
+                      action,
+                      item.delivery_run_id,
+                      content,
+                    )
+                  }
                   onResetSession={
                     canModifyWorkspaceConfig
                       ? () => {
@@ -970,14 +1036,25 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                   agentAvatarUrl={group?.agent_profile_avatar_url}
                   agentAvatarEmoji={group?.agent_profile_avatar_emoji}
                   agentAvatarColor={group?.agent_profile_avatar_color}
-                  onInterrupt={
-                    mainInterrupted ? undefined : () => interruptQuery(groupJid)
-                  }
                   onSend={(content) => handleSend(content)}
                 />
                 <MessageInput
                   onSend={handleSend}
                   groupJid={groupJid}
+                  isRunning={currentContextWaiting}
+                  onStop={
+                    mainInterrupted ? undefined : () => interruptQuery(groupJid)
+                  }
+                  queuedFollowUps={queuedFollowUps}
+                  onFollowUpAction={(item, action, content) =>
+                    actOnFollowUp(
+                      followUpChatJid,
+                      item.id,
+                      action,
+                      item.delivery_run_id,
+                      content,
+                    )
+                  }
                   onResetSession={
                     canModifyWorkspaceConfig
                       ? () => {

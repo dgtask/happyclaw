@@ -164,7 +164,7 @@ export function buildStreamingAgentCard(
   };
   const interruptBtn = {
     tag: 'button',
-    text: { tag: 'plain_text', content: '⏹ 中断回复' },
+    text: { tag: 'plain_text', content: '⏹ 停止回复' },
     type: 'danger',
     value: { action: 'interrupt_stream' },
     element_id: CARD_ELEMENT_IDS.INTERRUPT_BTN,
@@ -245,4 +245,81 @@ export function buildStreamingAgentCard(
       ],
     },
   };
+}
+
+export interface QueuedFollowUpCardInput {
+  content: string;
+  position: number;
+  sourceJid: string;
+  targetJid: string;
+  messageId: string;
+  expectedRunId: string;
+}
+
+/** Compact action card shown only when a message is durably queued. */
+export function buildQueuedFollowUpCard(
+  input: QueuedFollowUpCardInput,
+): FeishuCardV2 {
+  const preview = optimizeMarkdownStyle(input.content.trim(), 2).slice(0, 300);
+  const actionValue = {
+    sourceJid: input.sourceJid,
+    targetJid: input.targetJid,
+    messageId: input.messageId,
+    expectedRunId: input.expectedRunId,
+  };
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      enable_forward: false,
+      width_mode: 'fill',
+      summary: { content: `消息已排队 · 第 ${input.position} 位` },
+    },
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: `消息已排队 · 第 ${input.position} 位`,
+      },
+      template: 'grey',
+    },
+    body: {
+      direction: 'vertical',
+      vertical_spacing: 'small',
+      elements: [
+        {
+          tag: 'markdown',
+          content: preview || '（空消息）',
+        },
+        {
+          tag: 'markdown',
+          content:
+            "<font color='grey'>默认会在当前回复结束后发送。点击立即发送，会先停止当前回复，再优先处理这条消息。</font>",
+          text_size: 'notation',
+        },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '↪ 立即发送' },
+          type: 'primary',
+          value: { ...actionValue, action: 'steer_queued' },
+        },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '删除' },
+          type: 'default',
+          value: { ...actionValue, action: 'cancel_queued' },
+        },
+      ],
+    },
+  };
+}
+
+export function buildFollowUpActionResultCard(
+  message: string,
+  ok: boolean,
+): FeishuCardV2 {
+  return buildAgentReplyCard({
+    status: ok ? 'done' : 'warning',
+    title: ok ? '操作已完成' : '操作未执行',
+    text: message,
+  });
 }

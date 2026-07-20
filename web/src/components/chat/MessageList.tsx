@@ -17,7 +17,6 @@ import {
   ChevronUp,
   ChevronDown,
   AlertTriangle,
-  Square,
   Code2,
   Zap,
   BookOpen,
@@ -25,6 +24,11 @@ import {
 } from 'lucide-react';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { resolveSystemMessage } from '../../lib/system-message-registry';
+import { getPresentedMessageContent } from '../../lib/message-presentation';
+import {
+  getMessageDisplayTimestamp,
+  orderMessagesForTimeline,
+} from '../../lib/message-timeline';
 import { resolveAgentDisplayIdentity } from '../../utils/agent-identity';
 import { useAuthStore } from '../../stores/auth';
 
@@ -39,8 +43,6 @@ interface MessageListProps {
   groupJid?: string;
   /** Whether the agent is currently processing */
   isWaiting?: boolean;
-  /** Callback to interrupt the current agent query */
-  onInterrupt?: () => void;
   /** If set, this MessageList is showing a sub-agent's messages */
   agentId?: string;
   /** Human-readable name of the active conversation for empty-state clarity */
@@ -84,7 +86,6 @@ export function MessageList({
   scrollTrigger,
   groupJid,
   isWaiting,
-  onInterrupt,
   agentId,
   contextLabel,
   agentName,
@@ -127,11 +128,15 @@ export function MessageList({
         ? appearance.aiAvatarColor
         : undefined,
   });
+  const timelineMessages = useMemo(
+    () => orderMessagesForTimeline(messages),
+    [messages],
+  );
   const parentRef = useRef<HTMLDivElement>(null);
   const scrollStateRef = useRef({ autoScroll: true, atTop: false });
   const [autoScroll, setAutoScroll] = useState(true);
   const [atTop, setAtTop] = useState(false);
-  const prevMessageCount = useRef(messages.length);
+  const prevMessageCount = useRef(timelineMessages.length);
   // Window during which the scroll handler ignores updates and the streaming
   // RAF skips its catch-up scroll, so a user-initiated smooth scroll can run
   // uninterrupted (≈500ms browser default + 100ms slack).
@@ -163,9 +168,11 @@ export function MessageList({
 
   // Compute flatMessages (with date headers) before virtualizer
   const flatMessages = useMemo<FlatItem[]>(() => {
-    const grouped = messages.reduce(
+    const grouped = timelineMessages.reduce(
       (acc, msg) => {
-        const date = DATE_LABEL_FORMATTER.format(new Date(msg.timestamp));
+        const date = DATE_LABEL_FORMATTER.format(
+          new Date(getMessageDisplayTimestamp(msg)),
+        );
         if (!acc[date]) acc[date] = [];
         acc[date].push(msg);
         return acc;
@@ -177,6 +184,14 @@ export function MessageList({
     Object.entries(grouped).forEach(([date, msgs]) => {
       items.push({ type: 'date', content: date });
       msgs.forEach((msg) => {
+        if (
+          msg.source_kind === 'interrupt_partial' &&
+          msg.finalization_reason === 'interrupted' &&
+          !getPresentedMessageContent(msg).trim() &&
+          !msg.attachments
+        ) {
+          return;
+        }
         if (msg.sender === '__system__') {
           if (msg.content.startsWith('context_overflow:')) {
             items.push({ type: 'message', content: msg });
@@ -196,7 +211,7 @@ export function MessageList({
       });
     });
     return items;
-  }, [messages]);
+  }, [timelineMessages]);
 
   // Chat always starts at bottom — no scroll position restoration.
   // key={...} on <MessageList> guarantees a fresh mount on group/tab switch.
@@ -288,7 +303,7 @@ export function MessageList({
 
   // 新消息自动滚到底部
   useEffect(() => {
-    if (autoScroll && messages.length > prevMessageCount.current) {
+    if (autoScroll && timelineMessages.length > prevMessageCount.current) {
       requestAnimationFrame(() => {
         const parent = parentRef.current;
         if (!parent) return;
@@ -297,8 +312,8 @@ export function MessageList({
         scheduleSmoothCatchUp();
       });
     }
-    prevMessageCount.current = messages.length;
-  }, [messages.length, autoScroll, scheduleSmoothCatchUp]);
+    prevMessageCount.current = timelineMessages.length;
+  }, [timelineMessages.length, autoScroll, scheduleSmoothCatchUp]);
 
   // 外部触发滚到底部（发送消息后）
   useEffect(() => {
@@ -321,7 +336,7 @@ export function MessageList({
   useLayoutEffect(() => {
     if (!initialScrollDone.current && flatMessages.length > 0) {
       initialScrollDone.current = true;
-      prevMessageCount.current = messages.length;
+      prevMessageCount.current = timelineMessages.length;
       virtualizer.scrollToIndex(flatMessages.length - 1, { align: 'end' });
       if (parentRef.current) {
         parentRef.current.scrollTop = parentRef.current.scrollHeight;
@@ -340,7 +355,7 @@ export function MessageList({
       correct(0);
       return () => cancelAnimationFrame(handle);
     }
-  }, [flatMessages.length, virtualizer, messages.length]);
+  }, [flatMessages.length, virtualizer, timelineMessages.length]);
 
   // Safety net: initialOffset relies on estimated sizes which may be inaccurate.
   // After mount (or when messages load asynchronously), verify we're actually at
@@ -432,7 +447,7 @@ export function MessageList({
     scheduleSmoothCatchUp();
   }, [scheduleSmoothCatchUp]);
 
-  const showScrollButtons = messages.length > 0;
+  const showScrollButtons = timelineMessages.length > 0;
 
   return (
     <div className="relative flex-1 overflow-hidden overflow-x-hidden">
@@ -601,7 +616,7 @@ export function MessageList({
             })}
           </div>
 
-          {messages.length === 0 && !loading && (
+          {timelineMessages.length === 0 && !loading && (
             <div
               data-hc-empty-state
               className="absolute inset-x-0 top-0 bottom-0 flex justify-center px-6 pt-[clamp(4.5rem,14vh,9rem)]"
@@ -697,22 +712,6 @@ export function MessageList({
             ))}
         </div>
       </div>
-
-      {/* Floating interrupt button — positioned outside scroll content to avoid
-          layout shift when textarea height changes (container resize would
-          briefly hide the button if it lived inside scroll content). */}
-      {isWaiting && onInterrupt && (
-        <div className="absolute bottom-2 left-1/2 -translate-x-1/2 z-10">
-          <button
-            type="button"
-            onClick={onInterrupt}
-            className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs text-muted-foreground hover:text-red-600 dark:hover:text-red-400 bg-card/90 backdrop-blur-sm hover:bg-red-50 dark:hover:bg-red-950/40 rounded-full border border-border shadow-sm transition-colors cursor-pointer"
-          >
-            <Square className="w-3 h-3" />
-            中断
-          </button>
-        </div>
-      )}
 
       {/* Floating scroll buttons */}
       {showScrollButtons && (

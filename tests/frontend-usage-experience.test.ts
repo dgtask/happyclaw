@@ -99,7 +99,7 @@ function enhancedResponse(days: number, inputTokens: number) {
     billing: {
       enabled: false,
       applicable: false,
-      providerCostSemantics: 'sdk-estimate',
+      providerCostSemantics: 'kaboo-utc-30m-rounded-estimate',
       billedCostSemantics: 'actual-charge',
     },
   };

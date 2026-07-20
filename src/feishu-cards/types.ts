@@ -25,6 +25,7 @@ export interface CardMeta {
   cacheReadInputTokens?: number;
   /** Prompt tokens written to cache this turn. */
   cacheCreationInputTokens?: number;
+  reasoningTokens?: number;
   costUSD?: number;
   numTurns?: number;
   /** Per-tool aggregated counts. Takes precedence over `toolCount`. */

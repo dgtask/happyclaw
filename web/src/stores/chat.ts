@@ -1,6 +1,5 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
-import { wsManager } from '../api/ws';
 import { useFileStore } from './files';
 import { useAuthStore } from './auth';
 import {
@@ -17,6 +16,7 @@ import {
   saveAgentMessageSnapshot,
 } from '../utils/messageSnapshotCache';
 import type { GroupInfo, AgentInfo, AvailableImGroup } from '../types';
+import { applyFollowUpTransition } from '../lib/message-timeline';
 
 export type { GroupInfo, AgentInfo };
 
@@ -41,6 +41,41 @@ export interface Message {
     | 'legacy'
     | null;
   finalization_reason?: 'completed' | 'interrupted' | 'error' | null;
+  delivery_mode?: FollowUpMode | null;
+  delivery_status?: 'queued' | 'promoting' | 'released' | 'cancelled' | null;
+  delivery_run_id?: string | null;
+  delivery_updated_at?: string | null;
+}
+
+export type FollowUpMode = 'queue' | 'steer';
+
+export type FollowUpQueueAction =
+  | 'steer'
+  | 'cancel'
+  | 'edit'
+  | 'move_up'
+  | 'move_down';
+
+export interface QueuedFollowUp {
+  id: string;
+  chat_jid: string;
+  source_jid?: string;
+  sender: string;
+  sender_name: string;
+  content: string;
+  timestamp: string;
+  attachments?: string;
+  delivery_mode: FollowUpMode;
+  delivery_status: 'queued' | 'promoting';
+  delivery_run_id?: string | null;
+  delivery_priority: number;
+}
+
+export interface FollowUpTransition {
+  id: string;
+  delivery_status: 'released' | 'cancelled';
+  delivery_run_id?: string | null;
+  delivery_updated_at: string;
 }
 
 // Streaming event types (canonical source: shared/stream-event.ts)
@@ -118,6 +153,13 @@ export interface StreamSnapshotData {
   turnId?: string;
 }
 
+export interface ActiveRunSnapshotData {
+  chatJid: string;
+  runId: string | null;
+  startedAt: string;
+  phase: 'queued' | 'preparing' | 'running';
+}
+
 export interface StreamingState {
   turnId?: string;
   sessionId?: string;
@@ -167,7 +209,11 @@ function mergeMessagesChronologically(
       old.session_id !== m.session_id ||
       old.sdk_message_uuid !== m.sdk_message_uuid ||
       old.source_kind !== m.source_kind ||
-      old.finalization_reason !== m.finalization_reason
+      old.finalization_reason !== m.finalization_reason ||
+      old.delivery_mode !== m.delivery_mode ||
+      old.delivery_status !== m.delivery_status ||
+      old.delivery_run_id !== m.delivery_run_id ||
+      old.delivery_updated_at !== m.delivery_updated_at
     ) {
       byId.set(m.id, m);
     }
@@ -243,6 +289,7 @@ interface ChatState {
   currentGroup: string | null;
   messages: Record<string, Message[]>;
   waiting: Record<string, boolean>;
+  followUps: Record<string, QueuedFollowUp[]>;
   hasMore: Record<string, boolean>;
   loading: boolean;
   error: string | null;
@@ -285,6 +332,20 @@ interface ChatState {
     jid: string,
     content: string,
     attachments?: Array<{ data: string; mimeType: string }>,
+    followUpBehavior?: FollowUpMode,
+  ) => Promise<boolean>;
+  loadFollowUps: (chatJid: string) => Promise<void>;
+  handleFollowUpUpdate: (
+    chatJid: string,
+    items: QueuedFollowUp[],
+    transition?: FollowUpTransition,
+  ) => void;
+  actOnFollowUp: (
+    chatJid: string,
+    messageId: string,
+    action: FollowUpQueueAction,
+    expectedRunId?: string | null,
+    content?: string,
   ) => Promise<boolean>;
   stopGroup: (jid: string) => Promise<boolean>;
   interruptQuery: (jid: string) => Promise<boolean>;
@@ -362,10 +423,13 @@ interface ChatState {
     agentId: string,
     content: string,
     attachments?: Array<{ data: string; mimeType: string }>,
-  ) => boolean;
+    followUpBehavior?: FollowUpMode,
+  ) => Promise<boolean>;
   refreshAgentMessages: (jid: string, agentId: string) => Promise<void>;
   // Runner state sync
   handleRunnerState: (chatJid: string, state: string) => void;
+  handleRunStarted: (chatJid: string, runId?: string | null) => void;
+  handleActiveRunSnapshot: (runs: ActiveRunSnapshotData[]) => void;
   // IM binding actions
   loadAvailableImGroups: (jid: string) => Promise<AvailableImGroup[]>;
   bindImGroup: (
@@ -431,16 +495,11 @@ function freezeStreamingState(
   state: StreamingState | undefined,
 ): StreamingState | null {
   if (!state) return null;
-  const hasData =
-    state.partialText ||
-    state.thinkingText ||
-    state.activeTools.length > 0 ||
-    state.activeHook ||
-    state.systemStatus ||
-    state.recentEvents.length > 0 ||
-    state.traceEvents.length > 0 ||
-    Object.keys(state.taskStates).length > 0 ||
-    (state.todos && state.todos.length > 0);
+  // A tool/status-only shell is not useful after Stop and looks like the
+  // agent is still running. Preserve the card only when the user has already
+  // seen actual answer/reasoning text; the terminal DB message will replace it
+  // as soon as it arrives.
+  const hasData = state.partialText || state.thinkingText;
   if (!hasData) return null;
   // Preserve any in-flight thinking duration so the interrupted card still shows "已思考 Xs".
   const thinkingDurationMs =
@@ -1407,6 +1466,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   currentGroup: null,
   messages: {},
   waiting: {},
+  followUps: {},
   hasMore: {},
   loading: false,
   error: null,
@@ -1629,6 +1689,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     jid: string,
     content: string,
     attachments?: Array<{ data: string; mimeType: string }>,
+    followUpBehavior: FollowUpMode = 'queue',
   ) => {
     try {
       // streaming 状态由以下 3 条路径正确清理，sendMessage 不应无条件清空：
@@ -1640,7 +1701,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         chatJid: string;
         content: string;
         attachments?: Array<{ type: 'image'; data: string; mimeType: string }>;
-      } = { chatJid: jid, content };
+        followUpBehavior: FollowUpMode;
+      } = { chatJid: jid, content, followUpBehavior };
       if (attachments && attachments.length > 0) {
         body.attachments = attachments.map((att) => ({
           type: 'image',
@@ -1651,7 +1713,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
       type ClearedResponse = { success: true; cleared: true };
       type MessageCreateResponse =
         | ClearedResponse
-        | { success: true; messageId: string; timestamp: string }
+        | {
+            success: true;
+            messageId: string;
+            timestamp: string;
+            disposition: 'started' | 'queued' | 'steered';
+            runId?: string;
+          }
         | { success: false };
       const isClearedResponse = (
         d: MessageCreateResponse,
@@ -1687,6 +1755,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
         attachments: body.attachments
           ? JSON.stringify(body.attachments)
           : undefined,
+        delivery_mode:
+          data.disposition === 'queued'
+            ? 'queue'
+            : data.disposition === 'steered'
+              ? 'steer'
+              : null,
+        delivery_status:
+          data.disposition === 'started'
+            ? null
+            : data.disposition === 'queued'
+              ? 'queued'
+              : 'queued',
+        delivery_run_id: data.runId ?? null,
+        delivery_updated_at:
+          data.disposition === 'started' ? null : data.timestamp,
       };
       set((s) => {
         const existing = s.messages[jid] || [];
@@ -1711,6 +1794,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
           error: null,
         };
       });
+      if (data.disposition !== 'started') {
+        void get().loadFollowUps(jid);
+      }
       return true;
     } catch (err) {
       // 弱网/断网/后端 500 等场景：记录错误并给用户可见的 toast，
@@ -1718,6 +1804,74 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const message = err instanceof Error ? err.message : String(err);
       set({ error: message });
       showToast('发送失败', '消息未发送，输入已保留，请检查网络后重试');
+      return false;
+    }
+  },
+
+  loadFollowUps: async (chatJid) => {
+    try {
+      const data = await api.get<{ items: QueuedFollowUp[] }>(
+        `/api/follow-ups?${new URLSearchParams({ chatJid })}`,
+      );
+      set((s) => ({
+        followUps: { ...s.followUps, [chatJid]: data.items },
+      }));
+    } catch (err) {
+      console.warn('[follow-ups] failed to load queue', err);
+    }
+  },
+
+  handleFollowUpUpdate: (chatJid, items, transition) => {
+    set((s) => {
+      const next: Partial<ChatState> = {
+        followUps: { ...s.followUps, [chatJid]: items },
+      };
+      if (!transition) return next;
+
+      const agentMarker = '#agent:';
+      const markerIndex = chatJid.indexOf(agentMarker);
+      if (markerIndex >= 0) {
+        const agentId = chatJid.slice(markerIndex + agentMarker.length);
+        const existing = s.agentMessages[agentId] || [];
+        const updated = applyFollowUpTransition(existing, transition);
+        if (updated !== existing) {
+          next.agentMessages = {
+            ...s.agentMessages,
+            [agentId]: updated,
+          };
+        }
+      } else {
+        const existing = s.messages[chatJid] || [];
+        const updated = applyFollowUpTransition(existing, transition);
+        if (updated !== existing) {
+          next.messages = { ...s.messages, [chatJid]: updated };
+        }
+      }
+      return next;
+    });
+  },
+
+  actOnFollowUp: async (chatJid, messageId, action, expectedRunId, content) => {
+    try {
+      const result = await api.post<{ ok: boolean; message: string }>(
+        `/api/follow-ups/${encodeURIComponent(messageId)}/action`,
+        {
+          chatJid,
+          action,
+          ...(expectedRunId ? { expectedRunId } : {}),
+          ...(content !== undefined ? { content } : {}),
+        },
+      );
+      await get().loadFollowUps(chatJid);
+      if (!result.ok) showToast('操作未执行', result.message);
+      return result.ok;
+    } catch (err) {
+      const message =
+        typeof err === 'object' && err && 'message' in err
+          ? String(err.message)
+          : '操作失败，请稍后重试';
+      showToast('操作未执行', message);
+      await get().loadFollowUps(chatJid);
       return false;
     }
   },
@@ -2499,6 +2653,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         outputTokens: usage.outputTokens,
         cacheReadInputTokens: usage.cacheReadInputTokens,
         cacheCreationInputTokens: usage.cacheCreationInputTokens,
+        reasoningTokens: usage.reasoningTokens,
         costUSD: usage.costUSD,
         durationMs: usage.durationMs,
         numTurns: usage.numTurns,
@@ -2586,6 +2741,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       sdk_message_uuid: wsMsg.sdk_message_uuid ?? null,
       source_kind: wsMsg.source_kind ?? null,
       finalization_reason: wsMsg.finalization_reason ?? null,
+      delivery_mode: wsMsg.delivery_mode ?? null,
+      delivery_status: wsMsg.delivery_status ?? null,
+      delivery_run_id: wsMsg.delivery_run_id ?? null,
+      delivery_updated_at: wsMsg.delivery_updated_at ?? null,
     };
 
     // Route to agentMessages if this is a conversation agent message
@@ -2602,20 +2761,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
           msg.sender !== '__system__' &&
           msg.source_kind !== 'sdk_send_message';
 
-        // interrupt_partial 到达时，如果流式卡片已冻结（interrupted=true），
-        // 不清除 agentStreaming——保留冻结的富内容，10s 兜底计时器做最终清理。
-        const isFrozen = !!s.agentStreaming[agentId]?.interrupted;
-        const interruptPartialWhileFrozen =
-          msg.source_kind === 'interrupt_partial' && isFrozen;
-
-        const nextAgentStreaming =
-          isAgentReply && !interruptPartialWhileFrozen
-            ? (() => {
-                const n = { ...s.agentStreaming };
-                delete n[agentId];
-                return n;
-              })()
-            : s.agentStreaming;
+        const nextAgentStreaming = isAgentReply
+          ? (() => {
+              const n = { ...s.agentStreaming };
+              delete n[agentId];
+              return n;
+            })()
+          : s.agentStreaming;
 
         // For user messages (non-reply), set agentWaiting=true so subsequent
         // streaming events are accepted.  This handles messages injected from
@@ -2671,15 +2823,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         source !== 'scheduled_task' &&
         msg.source_kind !== 'sdk_send_message';
       const isSystemError = isTerminalSystemMessage(msg);
-      // interrupt_partial 到达时，如果流式卡片已冻结（interrupted=true），
-      // 不清除 streaming——保留冻结的富内容（thinking、工具、任务进度）。
-      // 消息仍会添加到列表（走下方普通消息分支），10s 兜底计时器做最终清理。
-      const interruptPartialWhileFrozen =
-        msg.source_kind === 'interrupt_partial' &&
-        s.streaming[chatJid]?.interrupted;
       const shouldFinalizeAssistant =
         isAgentReply &&
-        !interruptPartialWhileFrozen &&
         (msg.source_kind === 'sdk_final' ||
           msg.source_kind === 'interrupt_partial' ||
           msg.source_kind === null ||
@@ -2742,9 +2887,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
         };
       }
 
-      // 普通消息（如其他用户发送的消息，或显式 sdk_send_message）：只添加到列表
+      // A direct human message is also the earliest cross-tab/IM signal that a
+      // new logical run is about to start. Do not wait for the first Claude
+      // stream event: warm runners can spend noticeable time preparing context
+      // and previously left secondary tabs looking idle during that window.
+      const startsDirectRun =
+        !msg.is_from_me &&
+        msg.delivery_status !== 'queued' &&
+        msg.delivery_status !== 'promoting' &&
+        msg.delivery_status !== 'cancelled';
       return {
         messages: { ...s.messages, [chatJid]: updated },
+        ...(startsDirectRun
+          ? { waiting: { ...s.waiting, [chatJid]: true } }
+          : {}),
       };
     });
 
@@ -3212,33 +3368,43 @@ export const useChatStore = create<ChatState>((set, get) => ({
     });
   },
 
-  sendAgentMessage: (jid, agentId, content, attachments?) => {
-    // Send via WebSocket with agentId.
-    // NOTE: 先尝试 ws.send，成功后再清 agentStreaming / 置 agentWaiting，
-    // 避免失败时 UI 进入"等待中但消息没发出"的不一致状态。
+  sendAgentMessage: async (
+    jid,
+    agentId,
+    content,
+    attachments?,
+    followUpBehavior = 'queue',
+  ) => {
     const normalizedAttachments =
       attachments && attachments.length > 0
         ? attachments.map((att) => ({ type: 'image' as const, ...att }))
         : undefined;
-    const sent = wsManager.send({
-      type: 'send_message',
-      chatJid: jid,
-      content,
-      agentId,
-      attachments: normalizedAttachments,
-    });
-    if (!sent) {
-      showToast('发送失败', 'WebSocket 未连接，输入已保留，请稍后重试');
+    try {
+      // Conversation sends use the acknowledged HTTP path, just like the
+      // main chat. WebSocket remains the push channel for the stored message
+      // and stream events; a successful return now means the server really
+      // persisted and classified this message as started/queued/steered.
+      await api.post<{
+        success: true;
+        messageId: string;
+        timestamp: string;
+        disposition: 'started' | 'queued' | 'steered';
+        runId?: string;
+      }>('/api/messages', {
+        chatJid: jid,
+        agentId,
+        content,
+        attachments: normalizedAttachments,
+        followUpBehavior,
+      });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : '服务器未确认消息';
+      showToast('发送失败', `${detail}，输入已保留，请稍后重试`);
       return false;
     }
-    set((s) => {
-      const nextAgentStreaming = { ...s.agentStreaming };
-      delete nextAgentStreaming[agentId];
-      return {
-        agentStreaming: nextAgentStreaming,
-        agentWaiting: { ...s.agentWaiting, [agentId]: true },
-      };
-    });
+    set((s) => ({
+      agentWaiting: { ...s.agentWaiting, [agentId]: true },
+    }));
     return true;
   },
 
@@ -3379,9 +3545,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
           jid: string;
           active: boolean;
           pendingMessages?: boolean;
+          queryInFlight?: boolean;
         }>;
       }>('/api/status');
       const knownJids = new Set(data.groups.map((g) => g.jid));
+      const activeAgentIds = new Set(
+        data.groups
+          .map((g) => {
+            const marker = '#agent:';
+            const markerIndex = g.jid.indexOf(marker);
+            return markerIndex >= 0
+              ? g.jid.slice(markerIndex + marker.length)
+              : null;
+          })
+          .filter((agentId): agentId is string => !!agentId),
+      );
 
       // 关键：对 active 群组先 refreshMessages 同步本地与后端真相，再做推断。
       // 否则 ws 断开期间漏接 agent 完成的 new_message 时，本地最新仍是用户消息，
@@ -3399,6 +3577,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set((s) => {
         const nextWaiting = { ...s.waiting };
         const nextStreaming = { ...s.streaming };
+        const nextAgentWaiting = { ...s.agentWaiting };
+        const nextAgentStreaming = { ...s.agentStreaming };
 
         // 清除后端不可见的 JID 的 waiting/streaming（进程已死）
         // （主服务重启后 queue 为空，所有 JID 都不在集合中）。
@@ -3409,9 +3589,30 @@ export const useChatStore = create<ChatState>((set, get) => ({
             clearStreamingFromSession(jid);
           }
         }
+        for (const agentId of Object.keys(nextAgentWaiting)) {
+          if (!activeAgentIds.has(agentId)) {
+            delete nextAgentWaiting[agentId];
+            delete nextAgentStreaming[agentId];
+          }
+        }
 
         for (const g of data.groups) {
-          if (g.pendingMessages) {
+          const agentMarker = '#agent:';
+          const agentMarkerIndex = g.jid.indexOf(agentMarker);
+          if (agentMarkerIndex >= 0) {
+            const agentId = g.jid.slice(agentMarkerIndex + agentMarker.length);
+            // A conversation runner intentionally stays alive between turns.
+            // Only queryInFlight/pendingMessages means the user is waiting;
+            // `active` by itself is merely a warm idle process.
+            if (g.queryInFlight || g.pendingMessages) {
+              nextAgentWaiting[agentId] = true;
+            } else {
+              delete nextAgentWaiting[agentId];
+              delete nextAgentStreaming[agentId];
+            }
+            continue;
+          }
+          if (g.queryInFlight || g.pendingMessages) {
             nextWaiting[g.jid] = true;
             continue;
           }
@@ -3445,7 +3646,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
             clearStreamingFromSession(g.jid);
           }
         }
-        return { waiting: nextWaiting, streaming: nextStreaming };
+        return {
+          waiting: nextWaiting,
+          streaming: nextStreaming,
+          agentWaiting: nextAgentWaiting,
+          agentStreaming: nextAgentStreaming,
+        };
       });
     } catch {
       // 静默失败
@@ -3499,6 +3705,26 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   // Runner 状态同步：idle 时清理残留状态，running 时重新启用 stream event 接收
   handleRunnerState: (chatJid, state) => {
+    const agentMarker = '#agent:';
+    const agentMarkerIndex = chatJid.indexOf(agentMarker);
+    if (agentMarkerIndex >= 0) {
+      const agentId = chatJid.slice(agentMarkerIndex + agentMarker.length);
+      set((s) => {
+        const nextAgentWaiting = { ...s.agentWaiting };
+        const nextAgentStreaming = { ...s.agentStreaming };
+        if (state === 'running') {
+          nextAgentWaiting[agentId] = true;
+        } else {
+          nextAgentWaiting[agentId] = false;
+          delete nextAgentStreaming[agentId];
+        }
+        return {
+          agentWaiting: nextAgentWaiting,
+          agentStreaming: nextAgentStreaming,
+        };
+      });
+      return;
+    }
     if (state === 'idle') {
       // 冻结的中断状态不清除：等 new_message 或 fallback 定时器处理
       if (get().streaming[chatJid]?.interrupted) return;
@@ -3530,6 +3756,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
           streaming: nextStreaming,
         };
       });
+    }
+  },
+
+  handleRunStarted: (chatJid) => {
+    // Query lifecycle is independent from process lifecycle: a conversation
+    // agent can stay warm and begin another turn without spawning a runner.
+    get().handleRunnerState(chatJid, 'running');
+  },
+
+  handleActiveRunSnapshot: (runs) => {
+    // Snapshot activation is intentionally additive. Final messages and the
+    // HTTP status reconciliation own cleanup, which avoids an empty reconnect
+    // snapshot racing a just-submitted HTTP message and clearing its spinner.
+    for (const run of runs) {
+      get().handleRunStarted(run.chatJid, run.runId);
     }
   },
 
